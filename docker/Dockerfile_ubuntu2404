@@ -217,12 +217,6 @@ ENV LANG=ja_JP.UTF-8
 ENV LC_ALL=ja_JP.UTF-8
 ENV LC_CTYPE=ja_JP.UTF-8
 
-# NVEncC の libplacebo/Vulkan 系フィルタには graphics capability が必要。
-# compose.yml 側で未指定でも NVIDIA Container Toolkit が Vulkan ICD を注入できるようにする。
-ENV NVIDIA_VISIBLE_DEVICES=all
-ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics
-ENV VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_egl_icd.json
-
 ENV QSVENCC_VER=8.07
 ENV NVENCC_VER=9.13
 ENV VCEENCC_VER=9.05
@@ -278,11 +272,8 @@ RUN apt-get update && apt-get install -y \
         zlib1g \
         mkvtoolnix \
         opus-tools \
-        libvulkan1 \
-        libplacebo-dev \
-        vulkan-tools \
         intel-media-va-driver-non-free intel-opencl-icd libigfxcmrt7 libmfx1 libmfx-gen1.2 libva-drm2 libva-x11-2 ocl-icd-opencl-dev \
-        cuda-nvrtc-12-5 cuda-nvrtc-dev-12-5 libnpp-12-5 \
+        cuda-nvrtc-12-5 libnpp-12-5 \
     && wget https://github.com/rigaya/QSVEnc/releases/download/${QSVENCC_VER}/qsvencc_${QSVENCC_VER}_${ARCH}.deb -O qsvencc.deb \
         && apt-get install -y ./qsvencc.deb \
         && rm ./qsvencc.deb \
@@ -315,30 +306,6 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean \
     && apt-get autoremove -y
-
-# NVIDIA Container Toolkit が注入する nvidia_icd.json は libGLX_nvidia.so.0 を
-# 参照する環境があり、ヘッドレスコンテナでは Vulkan ICD として初期化できない場合がある。
-# libEGL_nvidia.so.0 参照の ICD を用意し、NVEncC/libplacebo ではこちらを使う。
-RUN mkdir -p /etc/vulkan/icd.d \
-    && printf '%s\n' '{"file_format_version":"1.0.1","ICD":{"library_path":"libEGL_nvidia.so.0","api_version":"1.3.0"}}' \
-      > /etc/vulkan/icd.d/nvidia_egl_icd.json
-
-# NVEncC の --vpp-colorspace / --vpp-libplacebo-* は Vulkan、libplacebo、NVRTC を実行時に使う。
-# cuda-nvrtc-dev が通常は非バージョン付き symlink を提供するが、念のため補完する。
-RUN set -eux; \
-    CUDA_LIB="/usr/local/cuda/targets/x86_64-linux/lib"; \
-    if [ -d "$CUDA_LIB" ]; then \
-        if [ ! -e "$CUDA_LIB/libnvrtc.so" ]; then \
-            found="$(find "$CUDA_LIB" -maxdepth 1 -name 'libnvrtc.so.*' -print -quit)"; \
-            if [ -n "$found" ]; then ln -s "$(basename "$found")" "$CUDA_LIB/libnvrtc.so"; fi; \
-        fi; \
-        if [ ! -e "$CUDA_LIB/libnvrtc-builtins.so" ]; then \
-            found="$(find "$CUDA_LIB" -maxdepth 1 -name 'libnvrtc-builtins.so.*' -print -quit)"; \
-            if [ -n "$found" ]; then ln -s "$(basename "$found")" "$CUDA_LIB/libnvrtc-builtins.so"; fi; \
-        fi; \
-    fi; \
-    ldconfig; \
-    ldconfig -p | grep -E 'libvulkan|libplacebo|libnvrtc' || true
 
 # タイムゾーンを確実に JST へ固定
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
