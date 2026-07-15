@@ -76,6 +76,7 @@ static void printHelp(const tchar* bin) {
         "  --mp4box <パス>     mp4boxへのパス（MP4で字幕処理する場合に必要）[mp4box.exe]\n"
         "  --mkvmerge <パス>   mkvmergeへのパス（--use-mkv-when-sub-exists使用時に必要）[mkvmerge.exe]\n"
         "  --tsreplace-remove-typed  tsreplace実行時に--remove-typedを指定する\n"
+        "  --mux-ts-temp        tsreplace時に入力TSの一時コピーを作成してmuxを高速化する\n"
         "  -f|--filter <パス>  フィルタAvisynthスクリプトへのパス[]\n"
         "  -pf|--postfilter <パス>  ポストフィルタAvisynthスクリプトへのパス[]\n"
         "  --mpeg2decoder <デコーダ>  MPEG2用デコーダ[default]\n"
@@ -137,6 +138,7 @@ static void printHelp(const tchar* bin) {
         "                      ORも可 例) 15: すべて出力\n"
         "  --no-remove-tmp     一時ファイルを削除せずに残す\n"
         "                      デフォルトは60fpsタイミングで生成\n"
+        "  --resume-dir <パス> 保存済み一時フォルダを再利用する\n"
         "  --timefactor <数値>  x265やNVEncで疑似VFRレートコントロールするときの時間レートファクター[0.25]\n"
         "  --pmt-cut <数値>:<数値>  PMT変更でCM認識するときの最大CM認識時間割合。全再生時間に対する割合で指定する。\n"
         "                      例えば 0.1:0.2 とすると開始10%%までにPMT変更があった場合はそのPMT変更までをCM認識する。\n"
@@ -264,6 +266,7 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
     conf.parallelLogoAnalysis = false;
     conf.numParallelLogoAnalysis = 0;
     conf.tsreplaceRemoveTypeD = false;
+    conf.muxTsTemp = false;
     conf.useMKVWhenSubExist = false;
     conf.outputChapter = false;
     bool nicojk = false;
@@ -378,6 +381,8 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
             }
         } else if (key == _T("--tsreplace-remove-typed")) {
             conf.tsreplaceRemoveTypeD = true;
+        } else if (key == _T("--mux-ts-temp")) {
+            conf.muxTsTemp = true;
         } else if (key == _T("--use-mkv-when-sub-exists")) {
             conf.useMKVWhenSubExist = true;
         } else if (key == _T("--chapter")) {
@@ -498,6 +503,8 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
             conf.psisiarcPath = pathNormalize(getParam(argc, argv, i++));
         } else if (key == _T("--trimavs")) {
             conf.trimavsPath = pathNormalize(getParam(argc, argv, i++));
+        } else if (key == _T("--resume-dir")) {
+            conf.resumeDir = pathNormalize(getParam(argc, argv, i++));
         } else if (key == _T("--copy-trimavs")) {
             conf.copyTrimAVS = true;
         } else if (key == _T("--nicoass")) {

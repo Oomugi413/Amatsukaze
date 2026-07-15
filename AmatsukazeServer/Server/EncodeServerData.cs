@@ -295,6 +295,9 @@ namespace Amatsukaze.Server
         public bool TsreplaceRemoveTypeD { get; set; }
 
         [DataMember]
+        public bool TsreplaceMuxTsTempFile { get; set; }
+
+        [DataMember]
         public bool TSReplaceVideo { get; set; }
 
         [DataMember]
@@ -738,6 +741,7 @@ namespace Amatsukaze.Server
                 ? string.Format("{0}:{1}", profile.PmtCutHeadRate, profile.PmtCutTailRate) : "なし");
             keyValue("ロゴ最長フェードフレーム数指定", profile.EnableMaxFadeLength ? profile.MaxFadeLength.ToString() : "なし");
             keyValueBool("tsreplaceでTypeDを削除する", profile.TsreplaceRemoveTypeD);
+            keyValueBool("tsreplaceでts一時ファイルを作成しmuxを高速化", profile.TsreplaceMuxTsTempFile);
             keyValueBool("tsreplaceでビデオを置換する", profile.TSReplaceVideo);
             keyValueBool("JoinLogoScpオプションを有効にする", profile.EnableJLSOption);
             keyValueBool("エンコードアフィニティを無視する", profile.IgnoreEncodeAffinity);
@@ -1233,6 +1237,10 @@ namespace Amatsukaze.Server
 
         [DataMember]
         public List<string> Tags { get; set; }
+
+        // カット調整後に再利用するCM解析タスクの一時フォルダ
+        [DataMember]
+        public string ResumeDir { get; set; }
 
         [DataMember]
         public AutoLogoResultState AutoLogoResult { get; set; }

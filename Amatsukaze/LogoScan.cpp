@@ -31,6 +31,7 @@
 #include <iomanip>
 #include <cassert>
 #include <algorithm>
+#include <cmath>
 #include <libavutil/error.h>
 #if defined(__GLIBC__)
 #include <malloc.h>
@@ -2681,6 +2682,77 @@ namespace {
         static constexpr int kScanEdgeMargin = 16;
         // fg値をkHistBins個のbinに分割してサンプル蓄積する
         static constexpr int kHistBins = 32;
+        // 時間方向の低パーセンタイル計測用。局所的に浮いた時間p5を score gain とデバッグ出力に使う。
+        static constexpr int kTemporalHistBins = 256;
+        static constexpr float kTemporalLowPercentile = 0.05f;
+        static constexpr int kTemporalLocalMedianRadius = 8;
+        static constexpr float kTemporalLiftNormalizePercentile = 0.995f;
+        static constexpr float kTemporalLiftScaleEps = 1.0e-6f;
+        // w=1.0/0.4 の全数回帰で、静止テロップ再浮上(q70)と塊状パーツ脱落(q65)の
+        // デグレを確認したため無効化。コードは実験記録として保持する。
+        static constexpr bool kEnableTemporalLiftGain = false;
+        // 時間p5の局所liftが強い画素を、既存base scoreの形を保ったまま持ち上げる。
+        static constexpr float kTemporalLiftGainWeight = 0.4f;
+        // v2/v3/v3b の全数回帰で「勝ち(q152/q168正解化)と負け(閾値押し上げデグレ)が
+        // どちらも rescue 質量による閾値シフトから出る」と確定したため score 注入は無効化。
+        // temporalLiftMap の活用は rect stage の候補生成+出現検証 (提案1) 側で行う。
+        static constexpr bool kEnableTemporalLiftRescue = false;
+        static constexpr float kTemporalLiftRescueWeight = 0.6f;
+        static constexpr float kTemporalLiftRescueBaseScalePercentile = 0.99f;
+        // v2 で、孤立した全面静止テキストの成分化と rescue 質量による閾値押し上げを確認。
+        // 既存base正画素の近傍だけを補完対象にし、temporal rescue は閾値分布から除外する。
+        // ただし v3 回帰でアンカー制限は勝ちケース (q152/q168 のロゴ復活) も殺すと判明。
+        // 切り分けのため閾値保護と独立に無効化できるようにしてある (v3b 実験)。
+        static constexpr bool kEnableTemporalLiftRescueAnchor = false;
+        static constexpr int kTemporalLiftRescueAnchorRadius = 6;
+        static constexpr bool kEnableLiftCandidateShadow = true;
+        // temporal lift は score に直接混ぜず、独立候補として pass2 相関で測る。
+        static constexpr float kLiftCandidateThresholdRatio = 0.35f;
+        static constexpr int kLiftCandidateMinArea = 40;
+        static constexpr float kLiftCandidateMaxAreaRatio = 0.25f;
+        static constexpr int kLiftCandidateMinWidth = 8;
+        static constexpr int kLiftCandidateMinHeight = 8;
+        // 持続静止構造の細い枠線(1-2px)を先に切り、文字ロゴとの膨張融合を防ぐ。
+        // 面積/bboxは erode 前の元マスクで評価し、opening は連結判定だけに使う。
+        static constexpr int kLiftCandidateErodeRadius = 1;
+        // TOKYO MX 1 のような文字ロゴはグリフごとに lift 成分が切れやすい。
+        // 候補生成では連結判定だけ膨張し、面積/bboxは元マスクで評価する。
+        static constexpr int kLiftCandidateDilateRadius = 3;
+        static constexpr int kLiftCandidateMax = 2;
+        // 枠誤りは pass1 が本物ロゴの一部に重なった矩形へロックする形が多く (q101: IoU≈0.52,
+        // q152: ≈0.70)、0.50 では救済対象の lift 候補自体が重複除外されてしまう。
+        static constexpr double kLiftCandidatePass1DuplicateIou = 0.85;
+        static constexpr double kLiftCandidateAreaScoreWeight = 1.30;
+        static constexpr double kLiftCandidateRightTopScoreWeight = 0.35;
+        static constexpr double kLiftCandidateRightPriorXWeight = 0.60;
+        static constexpr double kLiftCandidateTopPriorYWeight = 0.40;
+        // 時間ON/OFF混合で希釈されたαを、セグメント別の有意な正αから回復する。
+        // 机上検証では q101/q13 で真値方向へ戻るため、多数決ではなく有意正α優先にする。
+        static constexpr bool kEnableSegmentConsensus = true;
+        static constexpr int kSegmentConsensusK = 8;
+        static constexpr int kSegmentConsensusMinSamples = 40;
+        static constexpr float kSegmentConsensusMinAlpha = 0.06f;
+        // Sigma=2.0 では背景の擬似コンセンサス (帯状ノイズの成分化: q56/q162等) が出たため
+        // 3.0 へ強化。logoY 域も既存 logoGain の感覚 (>0.45) に揃えて締める。
+        static constexpr float kSegmentConsensusSigma = 3.0f;
+        static constexpr float kSegmentConsensusLogoYMin = 0.45f;
+        static constexpr float kSegmentConsensusLogoYMax = 1.25f;
+        // 合算後の総サンプル数の下限。少数セグメントの偶然の有意超えを弾く。
+        static constexpr int kSegmentConsensusMinUnionSamples = 120;
+        // ON/OFF切替の証拠として要求する「きれいなゼロセグメント」の判定条件。
+        static constexpr float kSegmentConsensusZeroAlphaMax = 0.04f;
+        static constexpr float kSegmentConsensusZeroSeMax = 0.03f;
+        // 空間コヒーレンス: ロゴは数百画素が一貫したαで固まる。近傍に同傾向の採用画素が
+        // 一定数ない散発的な採用は、シーン内容の擬似コンセンサスとして棄却する。
+        static constexpr int kSegmentConsensusNeighborRadius = 5;
+        static constexpr int kSegmentConsensusMinNeighbors = 12;
+        static constexpr float kSegmentConsensusNeighborAlphaTol = 0.08f;
+        // temporalLiftMap ゲート: 持続オーバーレイの床上げがある画素に限定する。
+        // シーン内容はシーン転換で時間p5が落ちるため lift が立たず、ここで弾かれる
+        // (常時静止シーンは lift が立つが「ゼロセグメント」条件側で弾かれる)。
+        static constexpr float kSegmentConsensusLiftGateRatio = 0.25f;
+        // 差し替えは「元の全混合線のαが希釈で死んでいる画素」に限定する。
+        static constexpr float kSegmentConsensusMaxFullAlpha = 0.10f;
         static constexpr bool kEnableTwoPassFrameGate = true;
         static constexpr bool kEnablePruneBinaryByAnchor = true;
         // 時間枠をずらす frameGate retry は現状では改善効果が薄く、失敗時の挙動も追いづらくなるため無効化しておく。
@@ -2768,6 +2840,26 @@ namespace {
             BinAccum() : count(0), sum_fg(0.0), sum_bg(0.0), sum_weight(0.0), sum_weighted_fg(0.0), sum_weighted_bg(0.0) {}
         };
 
+        // pass1初回走査の時間セグメント別モーメント。
+        // ON/OFF混合で薄まったαを、時間層ごとの有意な正αだけから回復するために使う。
+        struct SegmentConsensusMoment {
+            float sumF;
+            float sumB;
+            float sumF2;
+            float sumB2;
+            float sumFB;
+            float sumW;
+            int n;
+            SegmentConsensusMoment() : sumF(0.0f), sumB(0.0f), sumF2(0.0f), sumB2(0.0f), sumFB(0.0f), sumW(0.0f), n(0) {}
+        };
+
+        struct SegmentConsensusLine {
+            bool valid = false;
+            float A = 0.0f;
+            float B = 0.0f;
+            float alpha = 0.0f;
+        };
+
         // 空間edge時系列統計の蓄積バッファ (画素ごと)
         struct SpatialEdgeAccum {
             float sumEdge;   // 正方向 corrected edge の和
@@ -2820,6 +2912,8 @@ namespace {
         static constexpr int kRoiCacheFramesPerSlab = 64;
         RoiCacheBackend roiCacheBackend = RoiCacheBackend::None;
         bool roiCacheCaptureActive = false;
+        bool temporalHistCaptureActive = false;
+        bool segmentConsensusCaptureActive = false;
         int roiCacheFrameBytes = 0;
         int roiCacheStoredFrames = 0;
         std::vector<std::vector<uint8_t>> roiCacheRamSlabs;
@@ -2832,6 +2926,17 @@ namespace {
         std::vector<AutoDetectStats> debugStats;
         std::vector<TraceSampleRecord> debugTraceRecords;
         std::vector<TraceBinRepresentativeRecord> debugTraceBinRepresentatives;
+        std::vector<uint16_t> temporalHistBuf;
+        std::vector<float> temporalP5Map;
+        std::vector<float> temporalLiftMap;
+        float temporalLiftP995 = 0.0f;
+        std::vector<SegmentConsensusMoment> segmentConsensusBuf;
+        std::vector<uint8_t> segmentConsensusValid;
+        std::vector<float> segmentConsensusA;
+        std::vector<float> segmentConsensusB;
+        std::vector<float> segmentConsensusAlpha;
+        std::vector<float> segmentConsensusConsistency;
+        std::vector<float> segmentConsensusStdDiff;
         std::vector<uint8_t> provisionalLineValid;
         std::vector<float> provisionalLineA;
         std::vector<float> provisionalLineB;
@@ -2864,6 +2969,7 @@ namespace {
             std::vector<float> mapBgGain;
             std::vector<float> mapExtremeGain;
             std::vector<float> mapTemporalGain;
+            std::vector<float> mapTemporalLiftGain;
             std::vector<float> mapOpaquePenalty;
             std::vector<float> mapOpaqueStaticPenalty;
             std::vector<float> mapLineFitGain;
@@ -2881,6 +2987,11 @@ namespace {
             std::vector<float> mapEdgeMean;
             std::vector<float> mapEdgeVar;
             std::vector<float> mapRescueScore;
+            std::vector<float> mapTemporalP5;
+            std::vector<float> mapTemporalLift;
+            std::vector<float> mapTemporalLiftRescue;
+            std::vector<uint8_t> mapSegmentConsensus;
+            std::vector<float> mapSegmentConsensusAlpha;
             // rescue score 中間ゲインマップ (診断用)
             std::vector<float> mapPresenceGain;  // 存在率ゲイン
             std::vector<float> mapMagGain;        // 大きさゲイン
@@ -2918,6 +3029,7 @@ namespace {
                 mapBgGain.assign(n, 0.0f);
                 mapExtremeGain.assign(n, 0.0f);
                 mapTemporalGain.assign(n, 0.0f);
+                mapTemporalLiftGain.assign(n, 1.0f);
                 mapOpaquePenalty.assign(n, 0.0f);
                 mapOpaqueStaticPenalty.assign(n, 0.0f);
                 mapLineFitGain.assign(n, 0.0f);
@@ -2934,6 +3046,11 @@ namespace {
                 mapEdgeMean.assign(n, 0.0f);
                 mapEdgeVar.assign(n, 0.0f);
                 mapRescueScore.assign(n, 0.0f);
+                mapTemporalP5.assign(n, 0.0f);
+                mapTemporalLift.assign(n, 0.0f);
+                mapTemporalLiftRescue.assign(n, 0.0f);
+                mapSegmentConsensus.assign(n, 0);
+                mapSegmentConsensusAlpha.assign(n, 0.0f);
                 mapPresenceGain.assign(n, 0.0f);
                 mapMagGain.assign(n, 0.0f);
                 mapUpperGate.assign(n, 0.0f);
@@ -2985,6 +3102,7 @@ namespace {
             std::string bgGain;
             std::string extremeGain;
             std::string temporalGain;
+            std::string temporalLiftGain;
             std::string opaquePenalty;
             std::string opaqueStaticPenalty;
             std::string lineFitGain;
@@ -2997,6 +3115,11 @@ namespace {
             std::string edgeMean;
             std::string edgeVar;
             std::string rescueScore;
+            std::string pctP5;
+            std::string pctLift;
+            std::string pctRescue;
+            std::string consensus;
+            std::string consensusAlpha;
             // rescue score 中間ゲインデバッグパス (診断用)
             std::string presenceGain;
             std::string magGain;
@@ -3201,6 +3324,19 @@ namespace {
             int area;
             bool requireClusterSupport = false;
         };
+
+        struct LiftCandidateMetric {
+            int candidateId = 0;
+            std::string source;
+            AutoDetectRect rect{ 0, 0, 0, 0 };
+            double compScore = 0.0;
+            double presenceRate = 0.0;
+            double unknownRate = 0.0;
+            double medianCorrOnPresent = 0.0;
+            double medianCorrAll = 0.0;
+            double maxOnBlockRatio = 0.0;
+        };
+        std::vector<LiftCandidateMetric> liftCandidateMetrics;
 
         struct RectMergeEval {
             int overlapW = 0;
@@ -3484,9 +3620,13 @@ namespace {
                 resetAccumulationState(&pass1Stats, nullptr);
                 // 2) pass1: 全フレームで score/binary/rect を推定
                 roiCacheCaptureActive = true;
+                temporalHistCaptureActive = true;
+                segmentConsensusCaptureActive = kEnableSegmentConsensus;
                 runFramePassWithProgress(srcpath, 1, 0.0f, 0.5f, 0.0f, 0.15f,
                     [&](AVStream *videoStream, AVFrame* frame) { processFirstFrame(videoStream, frame, &pass1Stats, nullptr); },
                     [&](AVFrame* frame) { return processFrame(frame, &pass1Stats, nullptr); });
+                temporalHistCaptureActive = false;
+                segmentConsensusCaptureActive = false;
                 roiCacheCaptureActive = false;
                 if (readFrames <= 0 || scanw <= 0 || scanh <= 0) {
                     THROW(RuntimeException, "No frame decoded");
@@ -3495,7 +3635,9 @@ namespace {
                 // まずは純粋な binAccum+Gompertz だけで provisional line を作り、
                 // その線から外れる別枝サンプルを 2回目の走査で弱める。
                 convertBinAccumToStats(pass1Stats);
-                prepareResidualReweightMaps(pass1Stats);
+                computeTemporalPercentileMaps();
+                computeSegmentConsensusLines();
+                prepareResidualReweightMaps(pass1Stats, true);
                 setProgressPlan(1, 0.5f, 0.5f, 0.15f, 0.15f);
                 rerunResidualWeightedPass(srcpath, pass1Stats, nullptr);
                 if (readFrames <= 0) {
@@ -3513,6 +3655,7 @@ namespace {
                 debugPass2 = debugPass1;
                 const AutoDetectRect pass1RectAbs = rectAbs;
                 const AutoDetectRect pass1RectLocal = rectLocal;
+                runLiftCandidateShadow(srcpath, pass1RectLocal);
 
                 // 3) pass2: pass1で得たロゴ近傍のみで「ロゴあり」フレームを再抽出
                 Pass2Buffers pass2{};
@@ -3812,10 +3955,26 @@ namespace {
             provisionalLineB.clear();
             provisionalLineConsistency.clear();
             provisionalLineStdDiff.clear();
+            temporalHistBuf.clear();
+            temporalHistBuf.shrink_to_fit();
+            temporalHistCaptureActive = false;
+            temporalP5Map.clear();
+            temporalLiftMap.clear();
+            temporalLiftP995 = 0.0f;
+            segmentConsensusCaptureActive = false;
+            segmentConsensusBuf.clear();
+            segmentConsensusBuf.shrink_to_fit();
+            segmentConsensusValid.clear();
+            segmentConsensusA.clear();
+            segmentConsensusB.clear();
+            segmentConsensusAlpha.clear();
+            segmentConsensusConsistency.clear();
+            segmentConsensusStdDiff.clear();
             lowBgLeftReweightEligible.clear();
             sampleResidualReweightActive = false;
             debugScore = ScoreStageBuffers{};
             debugBinary.clear();
+            liftCandidateMetrics.clear();
             debugPass1 = DebugStageSnapshot{};
             debugPass2 = DebugStageSnapshot{};
             debugPass2Prepare.clear();
@@ -3848,6 +4007,510 @@ namespace {
                 }
             }
             return maxValue;
+        }
+
+        void accumulateTemporalHistSample(const int off, const float rawValue, const float invMaxv) {
+            if (!temporalHistCaptureActive) {
+                return;
+            }
+            const int pixelCount = scanw * scanh;
+            if (off < 0 || off >= pixelCount || temporalHistBuf.size() != (size_t)pixelCount * kTemporalHistBins) {
+                return;
+            }
+            // bitDepth に依存しないよう invMaxv で 0..1 に正規化して 256bin へ入れる。
+            const int binIdx = ClampInt((int)(rawValue * invMaxv * kTemporalHistBins), 0, kTemporalHistBins - 1);
+            uint16_t& count = temporalHistBuf[(size_t)off * kTemporalHistBins + binIdx];
+            if (count < std::numeric_limits<uint16_t>::max()) {
+                count++;
+            }
+        }
+
+        void computeTemporalPercentileMaps() {
+            const int pixelCount = scanw * scanh;
+            if (pixelCount <= 0 || temporalHistBuf.size() != (size_t)pixelCount * kTemporalHistBins) {
+                temporalP5Map.clear();
+                temporalLiftMap.clear();
+                temporalLiftP995 = 0.0f;
+                return;
+            }
+
+            temporalP5Map.assign(pixelCount, 0.0f);
+            temporalLiftMap.assign(pixelCount, 0.0f);
+            temporalLiftP995 = 0.0f;
+            for (int i = 0; i < pixelCount; i++) {
+                const uint16_t* hist = temporalHistBuf.data() + (size_t)i * kTemporalHistBins;
+                int total = 0;
+                for (int b = 0; b < kTemporalHistBins; b++) {
+                    total += hist[b];
+                }
+                if (total <= 0) {
+                    continue;
+                }
+                const int target = std::max(1, (int)std::ceil(total * kTemporalLowPercentile));
+                int accum = 0;
+                int binIdx = 0;
+                for (; binIdx < kTemporalHistBins; binIdx++) {
+                    accum += hist[binIdx];
+                    if (accum >= target) {
+                        break;
+                    }
+                }
+                temporalP5Map[i] = binIdx / (float)(kTemporalHistBins - 1);
+            }
+
+            std::vector<float> localValues;
+            const int localWindowSize = kTemporalLocalMedianRadius * 2 + 1;
+            localValues.reserve(localWindowSize * localWindowSize);
+            for (int y = 0; y < scanh; y++) {
+                for (int x = 0; x < scanw; x++) {
+                    localValues.clear();
+                    for (int dy = -kTemporalLocalMedianRadius; dy <= kTemporalLocalMedianRadius; dy++) {
+                        const int yy = ClampInt(y + dy, 0, scanh - 1);
+                        for (int dx = -kTemporalLocalMedianRadius; dx <= kTemporalLocalMedianRadius; dx++) {
+                            const int xx = ClampInt(x + dx, 0, scanw - 1);
+                            localValues.push_back(temporalP5Map[xx + yy * scanw]);
+                        }
+                    }
+                    const size_t medianIdx = localValues.size() / 2;
+                    std::nth_element(localValues.begin(), localValues.begin() + medianIdx, localValues.end());
+                    const int off = x + y * scanw;
+                    temporalLiftMap[off] = std::max(0.0f, temporalP5Map[off] - localValues[medianIdx]);
+                }
+            }
+            std::vector<float> liftValues = temporalLiftMap;
+            for (auto& v : liftValues) {
+                v = std::isfinite(v) ? std::max(v, 0.0f) : 0.0f;
+            }
+            std::sort(liftValues.begin(), liftValues.end());
+            temporalLiftP995 = PercentileOfSorted(liftValues, kTemporalLiftNormalizePercentile);
+
+            // 以降はデバッグ画像用のマップだけ保持すればよいので、大きいヒストグラムは解放する。
+            temporalHistBuf.clear();
+            temporalHistBuf.shrink_to_fit();
+            debugScore.mapTemporalP5 = temporalP5Map;
+            debugScore.mapTemporalLift = temporalLiftMap;
+        }
+
+        void copyTemporalDebugMaps(ScoreStageBuffers& scoreStage) const {
+            const int pixelCount = scanw * scanh;
+            if ((int)temporalP5Map.size() == pixelCount) {
+                scoreStage.mapTemporalP5 = temporalP5Map;
+            }
+            if ((int)temporalLiftMap.size() == pixelCount) {
+                scoreStage.mapTemporalLift = temporalLiftMap;
+            }
+        }
+
+        int getSegmentConsensusIndex() const {
+            if (searchFrames <= 0) {
+                return 0;
+            }
+            const int segment = (int)(((int64_t)readFrames * kSegmentConsensusK) / std::max(1, searchFrames));
+            return ClampInt(segment, 0, kSegmentConsensusK - 1);
+        }
+
+        void accumulateSegmentConsensusSample(const int off, const int segment, const double fg, const double bg) {
+            if (!segmentConsensusCaptureActive || !kEnableSegmentConsensus) {
+                return;
+            }
+            const int pixelCount = scanw * scanh;
+            if (off < 0 || off >= pixelCount || segment < 0 || segment >= kSegmentConsensusK
+                || segmentConsensusBuf.size() != (size_t)pixelCount * kSegmentConsensusK) {
+                return;
+            }
+            auto& m = segmentConsensusBuf[(size_t)off * kSegmentConsensusK + segment];
+            m.sumF += (float)fg;
+            m.sumB += (float)bg;
+            m.sumF2 += (float)(fg * fg);
+            m.sumB2 += (float)(bg * bg);
+            m.sumFB += (float)(fg * bg);
+            m.sumW += 1.0f;
+            m.n++;
+        }
+
+        static bool tryFitSegmentConsensusMoment(const SegmentConsensusMoment& m, SegmentConsensusLine& line, float& seAlpha) {
+            line = SegmentConsensusLine{};
+            seAlpha = std::numeric_limits<float>::infinity();
+            if (m.n < kSegmentConsensusMinSamples) {
+                return false;
+            }
+            float A = 0.0f;
+            float B = 0.0f;
+            const double n = (double)m.n;
+            if (!TryGetABFromMoments(n, m.sumF, m.sumB, m.sumF2, m.sumB2, m.sumFB, A, B)) {
+                return false;
+            }
+            float alpha = 0.0f;
+            float logoY = 0.0f;
+            if (!TryGetAlphaLogo(A, B, alpha, logoY)) {
+                return false;
+            }
+            const double invN = 1.0 / n;
+            const double meanF = (double)m.sumF * invN;
+            const double meanB = (double)m.sumB * invN;
+            const double varF = std::max(0.0, (double)m.sumF2 * invN - meanF * meanF);
+            const double varB = std::max(0.0, (double)m.sumB2 * invN - meanB * meanB);
+            const double varResid = std::max(0.0, varB - (double)A * (double)A * varF);
+            const double fgStd = std::sqrt(varF);
+            if (fgStd <= 1e-8 || std::abs(A) <= 1e-8f) {
+                return false;
+            }
+            const double se = std::sqrt(varResid) / (std::sqrt(n) * fgStd * (double)A * (double)A);
+            if (!std::isfinite(se)) {
+                return false;
+            }
+            line.valid = true;
+            line.A = A;
+            line.B = B;
+            line.alpha = alpha;
+            seAlpha = (float)se;
+            return std::isfinite(logoY);
+        }
+
+        static bool isSegmentConsensusLineSignificant(const SegmentConsensusLine& line, const float seAlpha) {
+            if (!line.valid) {
+                return false;
+            }
+            float alpha = 0.0f;
+            float logoY = 0.0f;
+            if (!TryGetAlphaLogo(line.A, line.B, alpha, logoY)) {
+                return false;
+            }
+            const float alphaThreshold = std::max(kSegmentConsensusMinAlpha, kSegmentConsensusSigma * seAlpha);
+            return alpha >= alphaThreshold
+                && logoY >= kSegmentConsensusLogoYMin
+                && logoY <= kSegmentConsensusLogoYMax;
+        }
+
+        // 「きれいな α≈0 セグメント」= ロゴ非表示期間の証拠。
+        // ロゴ画素は OFF 期間に fg≈bg のゼロ線を精度良く示す (オーバーレイ物理)。
+        // シーン内の一時的な明部は他セグメントが乱雑でゼロ線にならないため、
+        // これを要求することで擬似コンセンサス (q162 のシーン物体発火) を弾く。
+        static bool isSegmentConsensusLineCleanZero(const SegmentConsensusLine& line, const float seAlpha) {
+            if (!line.valid) {
+                return false;
+            }
+            const float alpha = 1.0f - 1.0f / std::max(1e-6f, line.A);
+            return std::abs(alpha) <= kSegmentConsensusZeroAlphaMax
+                && seAlpha <= kSegmentConsensusZeroSeMax;
+        }
+
+        static void addSegmentConsensusMoment(SegmentConsensusMoment& dst, const SegmentConsensusMoment& src) {
+            dst.sumF += src.sumF;
+            dst.sumB += src.sumB;
+            dst.sumF2 += src.sumF2;
+            dst.sumB2 += src.sumB2;
+            dst.sumFB += src.sumFB;
+            dst.sumW += src.sumW;
+            dst.n += src.n;
+        }
+
+        static bool calcSegmentConsensusDiffStats(const SegmentConsensusMoment& m, float& stdDiff, float& consistency) {
+            if (m.n <= 0) {
+                stdDiff = 0.0f;
+                consistency = 0.0f;
+                return false;
+            }
+            const double invN = 1.0 / (double)m.n;
+            const double meanF = (double)m.sumF * invN;
+            const double meanB = (double)m.sumB * invN;
+            const double meanDiff = meanF - meanB;
+            const double diff2 = ((double)m.sumF2 - 2.0 * (double)m.sumFB + (double)m.sumB2) * invN;
+            const double varDiff = std::max(0.0, diff2 - meanDiff * meanDiff);
+            const double sd = std::sqrt(varDiff);
+            const double cons = std::abs(meanDiff) / (sd + 1e-6);
+            if (!std::isfinite(sd) || !std::isfinite(cons)) {
+                return false;
+            }
+            stdDiff = (float)sd;
+            consistency = (float)cons;
+            return true;
+        }
+
+        void computeSegmentConsensusLines() {
+            const int pixelCount = scanw * scanh;
+            segmentConsensusValid.assign(pixelCount, 0);
+            segmentConsensusA.assign(pixelCount, 0.0f);
+            segmentConsensusB.assign(pixelCount, 0.0f);
+            segmentConsensusAlpha.assign(pixelCount, 0.0f);
+            segmentConsensusConsistency.assign(pixelCount, 0.0f);
+            segmentConsensusStdDiff.assign(pixelCount, 0.0f);
+            if (!kEnableSegmentConsensus || pixelCount <= 0
+                || segmentConsensusBuf.size() != (size_t)pixelCount * kSegmentConsensusK) {
+                logCtx.infoF(_T("[LogoScan] segment consensus: adopted=%d/%d"), 0, pixelCount);
+                segmentConsensusBuf.clear();
+                segmentConsensusBuf.shrink_to_fit();
+                return;
+            }
+
+            const bool hasLiftMap = ((int)temporalLiftMap.size() == pixelCount)
+                && (temporalLiftP995 > kTemporalLiftScaleEps);
+            const float liftGate = hasLiftMap ? (temporalLiftP995 * kSegmentConsensusLiftGateRatio) : 0.0f;
+            int adopted = 0;
+            for (int off = 0; off < pixelCount; off++) {
+                // 持続オーバーレイの床上げが無い画素はロゴ候補ではないので対象外。
+                if (hasLiftMap && temporalLiftMap[off] < liftGate) {
+                    continue;
+                }
+                SegmentConsensusMoment merged{};
+                bool hasSegment = false;
+                bool hasCleanZeroSegment = false;
+                for (int seg = 0; seg < kSegmentConsensusK; seg++) {
+                    const auto& m = segmentConsensusBuf[(size_t)off * kSegmentConsensusK + seg];
+                    SegmentConsensusLine line{};
+                    float seAlpha = 0.0f;
+                    if (!tryFitSegmentConsensusMoment(m, line, seAlpha)) {
+                        continue;
+                    }
+                    if (isSegmentConsensusLineCleanZero(line, seAlpha)) {
+                        hasCleanZeroSegment = true;
+                        continue;
+                    }
+                    // 多数決ではなく、有意な正αセグメントだけを合算する。
+                    // OFF混合でαが希釈される画素では、この層別選別の方が真値を戻しやすい。
+                    if (!isSegmentConsensusLineSignificant(line, seAlpha)) {
+                        continue;
+                    }
+                    addSegmentConsensusMoment(merged, m);
+                    hasSegment = true;
+                }
+                // 正αセグメントに加えて「きれいなゼロセグメント」(=ロゴOFF期間の証拠) を要求する。
+                // これが無い画素は ON/OFF 切替の証拠が無く、シーン内容の擬似コンセンサスとみなす。
+                if (!hasSegment || !hasCleanZeroSegment) {
+                    continue;
+                }
+                // 少数セグメントの偶然の有意超え (背景の擬似コンセンサス) を弾くため、
+                // 合算後の総サンプル数にも下限を設ける。
+                if (merged.n < kSegmentConsensusMinUnionSamples) {
+                    continue;
+                }
+                SegmentConsensusLine consensus{};
+                float consensusSeAlpha = 0.0f;
+                if (!tryFitSegmentConsensusMoment(merged, consensus, consensusSeAlpha)) {
+                    continue;
+                }
+                if (!isSegmentConsensusLineSignificant(consensus, consensusSeAlpha)) {
+                    continue;
+                }
+                float consensusStdDiff = 0.0f;
+                float consensusConsistency = 0.0f;
+                if (!calcSegmentConsensusDiffStats(merged, consensusStdDiff, consensusConsistency)) {
+                    continue;
+                }
+                segmentConsensusValid[off] = 1;
+                segmentConsensusA[off] = consensus.A;
+                segmentConsensusB[off] = consensus.B;
+                segmentConsensusAlpha[off] = std::max(0.0f, std::min(1.0f, consensus.alpha));
+                segmentConsensusConsistency[off] = consensusConsistency;
+                segmentConsensusStdDiff[off] = consensusStdDiff;
+                adopted++;
+            }
+
+            // 空間コヒーレンスフィルタ: 近傍 (半径kSegmentConsensusNeighborRadius) に
+            // αが近い採用画素が kSegmentConsensusMinNeighbors 個未満の採用を取り消す。
+            // ロゴ (数百画素が同αで凝集) は残り、シーン由来の散発的な擬似採用が落ちる。
+            int adoptedCoherent = 0;
+            {
+                std::vector<uint8_t> filtered(pixelCount, 0);
+                const int r = kSegmentConsensusNeighborRadius;
+                for (int y = 0; y < scanh; y++) {
+                    for (int x = 0; x < scanw; x++) {
+                        const int off = x + y * scanw;
+                        if (!segmentConsensusValid[off]) {
+                            continue;
+                        }
+                        const float a0 = segmentConsensusAlpha[off];
+                        int neighbors = 0;
+                        for (int dy = -r; dy <= r && neighbors < kSegmentConsensusMinNeighbors; dy++) {
+                            const int yy = y + dy;
+                            if (yy < 0 || yy >= scanh) continue;
+                            for (int dx = -r; dx <= r; dx++) {
+                                const int xx = x + dx;
+                                if (xx < 0 || xx >= scanw || (dx == 0 && dy == 0)) continue;
+                                const int noff = xx + yy * scanw;
+                                if (segmentConsensusValid[noff]
+                                    && std::abs(segmentConsensusAlpha[noff] - a0) <= kSegmentConsensusNeighborAlphaTol) {
+                                    neighbors++;
+                                    if (neighbors >= kSegmentConsensusMinNeighbors) break;
+                                }
+                            }
+                        }
+                        if (neighbors >= kSegmentConsensusMinNeighbors) {
+                            filtered[off] = 1;
+                            adoptedCoherent++;
+                        }
+                    }
+                }
+                for (int off = 0; off < pixelCount; off++) {
+                    if (!filtered[off]) {
+                        segmentConsensusValid[off] = 0;
+                    }
+                }
+            }
+            logCtx.infoF(_T("[LogoScan] segment consensus: adopted=%d/%d (coherent=%d)"), adopted, pixelCount, adoptedCoherent);
+            segmentConsensusBuf.clear();
+            segmentConsensusBuf.shrink_to_fit();
+        }
+
+        void copySegmentConsensusDebugMaps(ScoreStageBuffers& scoreStage) const {
+            const int pixelCount = scanw * scanh;
+            if ((int)segmentConsensusValid.size() == pixelCount) {
+                scoreStage.mapSegmentConsensus = segmentConsensusValid;
+            }
+            if ((int)segmentConsensusAlpha.size() == pixelCount) {
+                scoreStage.mapSegmentConsensusAlpha = segmentConsensusAlpha;
+            }
+        }
+
+        void applySegmentConsensusToProvisionalLines() {
+            const int total = scanw * scanh;
+            if (!kEnableSegmentConsensus || (int)segmentConsensusValid.size() != total
+                || (int)segmentConsensusA.size() != total || (int)segmentConsensusB.size() != total
+                || (int)segmentConsensusConsistency.size() != total || (int)segmentConsensusStdDiff.size() != total) {
+                return;
+            }
+            for (int off = 0; off < total; off++) {
+                if (!segmentConsensusValid[off]) {
+                    continue;
+                }
+                // ON/OFF希釈の被害画素だけに介入する。元の全混合線が既に十分なαを
+                // 持つ画素まで差し替えると、周辺スコアの相対バランスが崩れて
+                // パーセンタイル閾値経由で本物パーツが脱落する (q65の箱等) ため。
+                if (provisionalLineValid[off]) {
+                    const float origA = provisionalLineA[off];
+                    const float origAlpha = (std::abs(origA) > 1e-6f) ? (1.0f - 1.0f / origA) : 0.0f;
+                    if (origAlpha >= kSegmentConsensusMaxFullAlpha) {
+                        continue;
+                    }
+                }
+                // 通常のbinAccum+Gompertz線を、有意な時間層だけから再fitした線で差し替える。
+                // consistency/stdDiff も合算モーメントから既存流儀で算出し、residual reweightへ渡す。
+                provisionalLineValid[off] = 1;
+                provisionalLineA[off] = segmentConsensusA[off];
+                provisionalLineB[off] = segmentConsensusB[off];
+                provisionalLineConsistency[off] = segmentConsensusConsistency[off];
+                provisionalLineStdDiff[off] = segmentConsensusStdDiff[off];
+            }
+        }
+
+        float calcTemporalLiftGain(const int off) const {
+            if (!kEnableTemporalLiftGain || temporalLiftP995 <= kTemporalLiftScaleEps) {
+                return 1.0f;
+            }
+            const int pixelCount = scanw * scanh;
+            if (off < 0 || off >= pixelCount || temporalLiftMap.size() != (size_t)pixelCount) {
+                return 1.0f;
+            }
+            const float liftNorm = clamp01(temporalLiftMap[off] / temporalLiftP995);
+            return 1.0f + kTemporalLiftGainWeight * liftNorm;
+        }
+
+        float calcTemporalLiftRescueBaseScale(const ScoreStageBuffers& scoreStage) const {
+            const int pixelCount = scanw * scanh;
+            std::vector<float> baseScores;
+            baseScores.reserve(pixelCount);
+            for (int i = 0; i < pixelCount; i++) {
+                baseScores.push_back(std::max(scoreStage.score[i], 0.0f));
+            }
+            std::sort(baseScores.begin(), baseScores.end());
+            return PercentileOfSorted(baseScores, kTemporalLiftRescueBaseScalePercentile);
+        }
+
+        void collectTemporalLiftRescueEligible(const ScoreStageBuffers& scoreStage, std::vector<uint8_t>& eligible) const {
+            const int pixelCount = scanw * scanh;
+            eligible.assign(pixelCount, 0);
+            std::vector<uint8_t> positiveMask(pixelCount, 0);
+            std::vector<uint8_t> horizontalMask(pixelCount, 0);
+            std::vector<uint8_t> anchorMask(pixelCount, 0);
+            for (int i = 0; i < pixelCount; i++) {
+                positiveMask[i] = (scoreStage.score[i] > 0.0f) ? 1 : 0;
+            }
+
+            // 正base score画素を半径6のboxで膨張し、その近傍だけを穴埋め対象にする。
+            // 横→縦の2パスのスライディングカウントで O(N) に抑える。
+            for (int y = 0; y < scanh; y++) {
+                int count = 0;
+                const int row = y * scanw;
+                for (int x = 0; x <= std::min(scanw - 1, kTemporalLiftRescueAnchorRadius); x++) {
+                    count += positiveMask[row + x] ? 1 : 0;
+                }
+                for (int x = 0; x < scanw; x++) {
+                    horizontalMask[row + x] = (count > 0) ? 1 : 0;
+                    const int removeX = x - kTemporalLiftRescueAnchorRadius;
+                    if (removeX >= 0) {
+                        count -= positiveMask[row + removeX] ? 1 : 0;
+                    }
+                    const int addX = x + kTemporalLiftRescueAnchorRadius + 1;
+                    if (addX < scanw) {
+                        count += positiveMask[row + addX] ? 1 : 0;
+                    }
+                }
+            }
+            for (int x = 0; x < scanw; x++) {
+                int count = 0;
+                for (int y = 0; y <= std::min(scanh - 1, kTemporalLiftRescueAnchorRadius); y++) {
+                    count += horizontalMask[x + y * scanw] ? 1 : 0;
+                }
+                for (int y = 0; y < scanh; y++) {
+                    const int off = x + y * scanw;
+                    anchorMask[off] = (count > 0) ? 1 : 0;
+                    const int removeY = y - kTemporalLiftRescueAnchorRadius;
+                    if (removeY >= 0) {
+                        count -= horizontalMask[x + removeY * scanw] ? 1 : 0;
+                    }
+                    const int addY = y + kTemporalLiftRescueAnchorRadius + 1;
+                    if (addY < scanh) {
+                        count += horizontalMask[x + addY * scanw] ? 1 : 0;
+                    }
+                }
+            }
+
+            for (int i = 0; i < pixelCount; i++) {
+                // base score が正の画素は既存判定を尊重し、temporal lift では一切触らない。
+                // アンカー制限は勝ちケース (base全滅地帯のロゴ復活: q152/q168) まで殺すことが
+                // v3回帰で判明したため切替可能にしてある。無効時は死亡画素条件のみ。
+                eligible[i] = (scoreStage.score[i] <= 0.0f && (!kEnableTemporalLiftRescueAnchor || anchorMask[i])) ? 1 : 0;
+            }
+        }
+
+        void applyTemporalLiftRescue(ScoreStageBuffers& scoreStage, const std::vector<uint8_t>& eligible, const float baseScoreP99) {
+            if (!kEnableTemporalLiftRescue || temporalLiftP995 <= kTemporalLiftScaleEps || baseScoreP99 <= kTemporalLiftScaleEps) {
+                return;
+            }
+            const int pixelCount = scanw * scanh;
+            if ((int)eligible.size() != pixelCount || temporalLiftMap.size() != (size_t)pixelCount) {
+                return;
+            }
+
+            int rescueCount = 0;
+            for (int i = 0; i < pixelCount; i++) {
+                if (!eligible[i]) {
+                    continue;
+                }
+                const float liftNorm = clamp01(temporalLiftMap[i] / temporalLiftP995);
+                const float rescueVal = kTemporalLiftRescueWeight * liftNorm * baseScoreP99;
+                if (rescueVal <= 0.0f) {
+                    continue;
+                }
+                scoreStage.score[i] += rescueVal;
+                scoreStage.mapTemporalLiftRescue[i] += rescueVal;
+                if (scoreStage.mapAccepted[i] <= 0.0f) {
+                    scoreStage.mapAccepted[i] = rescueVal;
+                }
+                scoreStage.validAB[i] = 1;
+                rescueCount++;
+            }
+            if (detailedDebug) {
+                fprintf(stderr, "[LogoScan] temporal lift rescue: baseP99=%.4f liftP995=%.4f weight=%.2f rescued=%d\n",
+                    (double)baseScoreP99, (double)temporalLiftP995, (double)kTemporalLiftRescueWeight, rescueCount);
+            }
+        }
+
+        static float getScoreForThreshold(const ScoreStageBuffers& scoreStage, const int off) {
+            const float score = (off >= 0 && off < (int)scoreStage.score.size()) ? scoreStage.score[off] : 0.0f;
+            const float temporalRescue = (off >= 0 && off < (int)scoreStage.mapTemporalLiftRescue.size())
+                ? scoreStage.mapTemporalLiftRescue[off] : 0.0f;
+            return std::max(score - temporalRescue, 0.0f);
         }
 
         void setProgressPlan(const int stage, const float stageBase, const float stageSpan, const float overallBase, const float overallSpan) {
@@ -4063,6 +4726,291 @@ namespace {
             return hasFrameMask;
         }
 
+        void collectLiftRectCandidates(const AutoDetectRect& pass1RectLocal, std::vector<RectStageCompCandidate>& outCandidates) const {
+            outCandidates.clear();
+            const int pixelCount = scanw * scanh;
+            if (!kEnableLiftCandidateShadow || pixelCount <= 0 || temporalLiftP995 <= kTemporalLiftScaleEps
+                || temporalLiftMap.size() != (size_t)pixelCount) {
+                return;
+            }
+
+            const float thresholdLift = temporalLiftP995 * kLiftCandidateThresholdRatio;
+            const int maxArea = std::max(kLiftCandidateMinArea, (int)std::round(pixelCount * kLiftCandidateMaxAreaRatio));
+            std::vector<uint8_t> liftMask(pixelCount, 0);
+            for (int i = 0; i < pixelCount; i++) {
+                liftMask[i] = (temporalLiftMap[i] >= thresholdLift) ? 1 : 0;
+            }
+
+            std::vector<uint8_t> erodeHorizontalMask(pixelCount, 0);
+            std::vector<uint8_t> erodedMask(pixelCount, 0);
+            for (int y = 0; y < scanh; y++) {
+                int count = 0;
+                int window = 0;
+                const int row = y * scanw;
+                for (int x = 0; x <= std::min(scanw - 1, kLiftCandidateErodeRadius); x++) {
+                    count += liftMask[row + x] ? 1 : 0;
+                    window++;
+                }
+                for (int x = 0; x < scanw; x++) {
+                    erodeHorizontalMask[row + x] = (count == window) ? 1 : 0;
+                    const int removeX = x - kLiftCandidateErodeRadius;
+                    if (removeX >= 0) {
+                        count -= liftMask[row + removeX] ? 1 : 0;
+                        window--;
+                    }
+                    const int addX = x + kLiftCandidateErodeRadius + 1;
+                    if (addX < scanw) {
+                        count += liftMask[row + addX] ? 1 : 0;
+                        window++;
+                    }
+                }
+            }
+            for (int x = 0; x < scanw; x++) {
+                int count = 0;
+                int window = 0;
+                for (int y = 0; y <= std::min(scanh - 1, kLiftCandidateErodeRadius); y++) {
+                    count += erodeHorizontalMask[x + y * scanw] ? 1 : 0;
+                    window++;
+                }
+                for (int y = 0; y < scanh; y++) {
+                    const int off = x + y * scanw;
+                    erodedMask[off] = (count == window) ? 1 : 0;
+                    const int removeY = y - kLiftCandidateErodeRadius;
+                    if (removeY >= 0) {
+                        count -= erodeHorizontalMask[x + removeY * scanw] ? 1 : 0;
+                        window--;
+                    }
+                    const int addY = y + kLiftCandidateErodeRadius + 1;
+                    if (addY < scanh) {
+                        count += erodeHorizontalMask[x + addY * scanw] ? 1 : 0;
+                        window++;
+                    }
+                }
+            }
+
+            std::vector<uint8_t> horizontalMask(pixelCount, 0);
+            std::vector<uint8_t> dilatedMask(pixelCount, 0);
+            for (int y = 0; y < scanh; y++) {
+                int count = 0;
+                const int row = y * scanw;
+                for (int x = 0; x <= std::min(scanw - 1, kLiftCandidateDilateRadius); x++) {
+                    count += erodedMask[row + x] ? 1 : 0;
+                }
+                for (int x = 0; x < scanw; x++) {
+                    horizontalMask[row + x] = (count > 0) ? 1 : 0;
+                    const int removeX = x - kLiftCandidateDilateRadius;
+                    if (removeX >= 0) {
+                        count -= erodedMask[row + removeX] ? 1 : 0;
+                    }
+                    const int addX = x + kLiftCandidateDilateRadius + 1;
+                    if (addX < scanw) {
+                        count += erodedMask[row + addX] ? 1 : 0;
+                    }
+                }
+            }
+            for (int x = 0; x < scanw; x++) {
+                int count = 0;
+                for (int y = 0; y <= std::min(scanh - 1, kLiftCandidateDilateRadius); y++) {
+                    count += horizontalMask[x + y * scanw] ? 1 : 0;
+                }
+                for (int y = 0; y < scanh; y++) {
+                    const int off = x + y * scanw;
+                    dilatedMask[off] = (count > 0) ? 1 : 0;
+                    const int removeY = y - kLiftCandidateDilateRadius;
+                    if (removeY >= 0) {
+                        count -= horizontalMask[x + removeY * scanw] ? 1 : 0;
+                    }
+                    const int addY = y + kLiftCandidateDilateRadius + 1;
+                    if (addY < scanh) {
+                        count += horizontalMask[x + addY * scanw] ? 1 : 0;
+                    }
+                }
+            }
+
+            std::vector<uint8_t> visited(pixelCount, 0);
+            std::queue<int> q;
+            std::vector<RectStageCompCandidate> candidates;
+
+            auto calcIou = [](const AutoDetectRect& a, const AutoDetectRect& b) {
+                if (a.w <= 0 || a.h <= 0 || b.w <= 0 || b.h <= 0) {
+                    return 0.0;
+                }
+                const int ix0 = std::max(a.x, b.x);
+                const int iy0 = std::max(a.y, b.y);
+                const int ix1 = std::min(a.x + a.w, b.x + b.w);
+                const int iy1 = std::min(a.y + a.h, b.y + b.h);
+                const int iw = std::max(0, ix1 - ix0);
+                const int ih = std::max(0, iy1 - iy0);
+                const double inter = (double)iw * ih;
+                const double uni = (double)a.w * a.h + (double)b.w * b.h - inter;
+                return (uni > 0.0) ? (inter / uni) : 0.0;
+            };
+
+            for (int y = 0; y < scanh; y++) {
+                for (int x = 0; x < scanw; x++) {
+                    const int start = x + y * scanw;
+                    if (visited[start] || !dilatedMask[start]) {
+                        continue;
+                    }
+                    visited[start] = 1;
+                    q.push(start);
+                    int minX = scanw, maxX = -1, minY = scanh, maxY = -1, area = 0;
+                    while (!q.empty()) {
+                        const int cur = q.front(); q.pop();
+                        const int cx = cur % scanw;
+                        const int cy = cur / scanw;
+                        if (liftMask[cur]) {
+                            area++;
+                            minX = std::min(minX, cx);
+                            maxX = std::max(maxX, cx);
+                            minY = std::min(minY, cy);
+                            maxY = std::max(maxY, cy);
+                        }
+                        const int nx[4] = { cx - 1, cx + 1, cx, cx };
+                        const int ny[4] = { cy, cy, cy - 1, cy + 1 };
+                        for (int i = 0; i < 4; i++) {
+                            if (nx[i] < 0 || nx[i] >= scanw || ny[i] < 0 || ny[i] >= scanh) {
+                                continue;
+                            }
+                            const int nidx = nx[i] + ny[i] * scanw;
+                            if (visited[nidx] || !dilatedMask[nidx]) {
+                                continue;
+                            }
+                            visited[nidx] = 1;
+                            q.push(nidx);
+                        }
+                    }
+
+                    if (area < kLiftCandidateMinArea || area > maxArea) {
+                        continue;
+                    }
+                    const AutoDetectRect rect{ minX, minY, maxX - minX + 1, maxY - minY + 1 };
+                    // lift コアは細長い文字ロゴで帯状になりやすいので、候補段階では
+                    // isRectSizeAbnormal による帯ノイズ棄却を掛けず、最小寸法だけを見る。
+                    if (rect.w < kLiftCandidateMinWidth || rect.h < kLiftCandidateMinHeight || isRectPositionAbnormal(rect)) {
+                        continue;
+                    }
+                    if (calcIou(rect, pass1RectLocal) > kLiftCandidatePass1DuplicateIou) {
+                        continue;
+                    }
+                    const double centerX = rect.x + rect.w * 0.5;
+                    const double centerY = rect.y + rect.h * 0.5;
+                    const double rightTopPrior = std::max(0.0, std::min(1.0,
+                        (centerX / std::max(1, scanw)) * kLiftCandidateRightPriorXWeight
+                        + ((scanh - centerY) / std::max(1, scanh)) * kLiftCandidateTopPriorYWeight));
+                    const double compScore = std::log(1.0 + area) * kLiftCandidateAreaScoreWeight
+                        + rightTopPrior * kLiftCandidateRightTopScoreWeight;
+                    candidates.push_back(RectStageCompCandidate{ rect, compScore, area, false });
+                }
+            }
+
+            std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+                return a.score > b.score;
+            });
+            const int keepCount = std::min((int)candidates.size(), kLiftCandidateMax);
+            outCandidates.insert(outCandidates.end(), candidates.begin(), candidates.begin() + keepCount);
+        }
+
+        bool evaluateLiftCandidateShadow(const tstring& srcpath, const AutoDetectRect& candidateRect, const char* source, const double compScore, const int candidateId, LiftCandidateMetric& outMetric) {
+            outMetric = LiftCandidateMetric{};
+            outMetric.candidateId = candidateId;
+            outMetric.source = source;
+            outMetric.rect = candidateRect;
+            outMetric.compScore = compScore;
+
+            const Pass2PrepareDebug savedPrepare = debugPass2Prepare;
+            const int savedFrameMaskNonZero = debugPass2FrameMaskNonZero;
+            const LogoAnalyzeFail savedLogoAnalyzeFail = logoAnalyzeFail;
+            const int savedPassIndex = passIndex;
+            const int savedReadFrames = readFrames;
+            const int savedSourceFrameIndex = sourceFrameIndex;
+            const ProgressPlan savedProgressPlan = progressPlan;
+            const int savedLastReportedStage = lastReportedStage;
+            const float savedLastReportedStageProgress = lastReportedStageProgress;
+            const float savedLastReportedProgress = lastReportedProgress;
+
+            auto restoreState = [&]() {
+                debugPass2Prepare = savedPrepare;
+                debugPass2FrameMaskNonZero = savedFrameMaskNonZero;
+                logoAnalyzeFail = savedLogoAnalyzeFail;
+                passIndex = savedPassIndex;
+                readFrames = savedReadFrames;
+                sourceFrameIndex = savedSourceFrameIndex;
+                progressPlan = savedProgressPlan;
+                lastReportedStage = savedLastReportedStage;
+                lastReportedStageProgress = savedLastReportedStageProgress;
+                lastReportedProgress = savedLastReportedProgress;
+            };
+
+            Pass2Buffers shadowPass2{};
+            bool prepared = false;
+            try {
+                prepared = runPass2PrepareMask(srcpath, candidateRect, shadowPass2);
+            } catch (...) {
+                restoreState();
+                throw;
+            }
+
+            const Pass2PrepareDebug shadowPrepare = debugPass2Prepare;
+            const int n = (int)shadowPrepare.judge.size();
+            if (n > 0 && (int)shadowPrepare.median.size() == n) {
+                int presentCount = 0;
+                int unknownCount = 0;
+                int maxOnBlock = 0;
+                int curOnBlock = 0;
+                std::vector<float> presentScores;
+                std::vector<float> allScores;
+                presentScores.reserve(n);
+                allScores.reserve(n);
+                for (int i = 0; i < n; i++) {
+                    const int judge = shadowPrepare.judge[i];
+                    const float med = shadowPrepare.median[i];
+                    allScores.push_back(med);
+                    if (judge == 2) {
+                        presentCount++;
+                        curOnBlock++;
+                        maxOnBlock = std::max(maxOnBlock, curOnBlock);
+                        presentScores.push_back(med);
+                    } else {
+                        curOnBlock = 0;
+                    }
+                    if (judge == 1) {
+                        unknownCount++;
+                    }
+                }
+                std::sort(allScores.begin(), allScores.end());
+                std::sort(presentScores.begin(), presentScores.end());
+                outMetric.presenceRate = (double)presentCount / n;
+                outMetric.unknownRate = (double)unknownCount / n;
+                outMetric.medianCorrAll = PercentileOfSorted(allScores, 0.50f);
+                outMetric.medianCorrOnPresent = PercentileOfSorted(presentScores, 0.50f);
+                outMetric.maxOnBlockRatio = (double)maxOnBlock / n;
+            }
+
+            restoreState();
+            return prepared;
+        }
+
+        void runLiftCandidateShadow(const tstring& srcpath, const AutoDetectRect& pass1RectLocal) {
+            liftCandidateMetrics.clear();
+            if (!kEnableLiftCandidateShadow || pass1RectLocal.w <= 0 || pass1RectLocal.h <= 0) {
+                return;
+            }
+
+            std::vector<RectStageCompCandidate> liftCandidates;
+            collectLiftRectCandidates(pass1RectLocal, liftCandidates);
+
+            int candidateId = 0;
+            LiftCandidateMetric metric{};
+            evaluateLiftCandidateShadow(srcpath, pass1RectLocal, "pass1best", 0.0, candidateId++, metric);
+            liftCandidateMetrics.push_back(metric);
+            for (const auto& cand : liftCandidates) {
+                LiftCandidateMetric liftMetric{};
+                evaluateLiftCandidateShadow(srcpath, cand.rect, "lift", cand.score, candidateId++, liftMetric);
+                liftCandidateMetrics.push_back(liftMetric);
+            }
+        }
+
         bool shouldFallbackToPass1Rect(const AutoDetectRect& pass1RectLocal) const {
             if (pass1RectLocal.w <= 0 || pass1RectLocal.h <= 0 || rectLocal.w <= 0 || rectLocal.h <= 0) {
                 return false;
@@ -4132,7 +5080,7 @@ namespace {
             // frame gate 済みフレームだけで別枝抑制をやり直すことで、
             // q43 のような「下側だけ別の bg 系列が混ざる」点を押し上げる。
             convertBinAccumToStats(pass3Stats);
-            prepareResidualReweightMaps(pass3Stats);
+            prepareResidualReweightMaps(pass3Stats, false);
             setProgressPlan(3, 0.40f, 0.35f, 0.78f, 0.11f);
             rerunResidualWeightedPass(srcpath, pass3Stats, &pass2);
             setProgressPlan(3, 0.75f, 0.25f, 0.89f, 0.09f);
@@ -4207,6 +5155,7 @@ namespace {
             out.bgGain = addSuffixBeforeExtension(base.bgGain, suffix);
             out.extremeGain = addSuffixBeforeExtension(base.extremeGain, suffix);
             out.temporalGain = addSuffixBeforeExtension(base.temporalGain, suffix);
+            out.temporalLiftGain = addSuffixBeforeExtension(base.temporalLiftGain, suffix);
             out.opaquePenalty = addSuffixBeforeExtension(base.opaquePenalty, suffix);
             out.opaqueStaticPenalty = addSuffixBeforeExtension(base.opaqueStaticPenalty, suffix);
             out.lineFitGain = addSuffixBeforeExtension(base.lineFitGain, suffix);
@@ -4218,6 +5167,11 @@ namespace {
             out.edgeMean = addSuffixBeforeExtension(base.edgeMean, suffix);
             out.edgeVar = addSuffixBeforeExtension(base.edgeVar, suffix);
             out.rescueScore = addSuffixBeforeExtension(base.rescueScore, suffix);
+            out.pctP5 = addSuffixBeforeExtension(base.pctP5, suffix);
+            out.pctLift = addSuffixBeforeExtension(base.pctLift, suffix);
+            out.pctRescue = addSuffixBeforeExtension(base.pctRescue, suffix);
+            out.consensus = addSuffixBeforeExtension(base.consensus, suffix);
+            out.consensusAlpha = addSuffixBeforeExtension(base.consensusAlpha, suffix);
             out.presenceGain = addSuffixBeforeExtension(base.presenceGain, suffix);
             out.magGain = addSuffixBeforeExtension(base.magGain, suffix);
             out.upperGate = addSuffixBeforeExtension(base.upperGate, suffix);
@@ -4361,6 +5315,9 @@ namespace {
                 { &path.edgeMean, &score.mapEdgeMean, 1.0f / 0.8f },
                 { &path.edgeVar, &score.mapEdgeVar, 1.0f / 0.04f },
                 { &path.rescueScore, &score.mapRescueScore, 1.0f },
+                { &path.pctP5, &score.mapTemporalP5, 1.0f },
+                { &path.pctRescue, &score.mapTemporalLiftRescue, 1.0f },
+                { &path.consensusAlpha, &score.mapSegmentConsensusAlpha, 1.0f },
                 { &path.presenceGain, &score.mapPresenceGain, 1.0f },
                 { &path.magGain, &score.mapMagGain, 1.0f },
                 { &path.upperGate, &score.mapUpperGate, 1.0f },
@@ -4371,8 +5328,21 @@ namespace {
             for (const auto& m : floatMaps) {
                 writeFloatMap(*m.outPath, *m.values, m.scale);
             }
+            if (!path.pctLift.empty()) {
+                const float liftScale = (temporalLiftP995 > kTemporalLiftScaleEps) ? (1.0f / temporalLiftP995) : 1.0f;
+                writeFloatMap(path.pctLift, score.mapTemporalLift, liftScale);
+            }
+            writeMap(path.temporalLiftGain, [&](int x, int y) {
+                if (path.temporalLiftGain.empty() || kTemporalLiftGainWeight <= kTemporalLiftScaleEps) {
+                    return (uint8_t)0;
+                }
+                const int off = x + y * scanw;
+                const float gain = getFloat(score.mapTemporalLiftGain, off);
+                return toByte((gain - 1.0f) / kTemporalLiftGainWeight);
+            });
 
             const std::pair<const std::string*, const std::vector<uint8_t>*> maskMaps[] = {
+                { &path.consensus, &score.mapSegmentConsensus },
                 { &path.isWall, &score.mapIsWall },
                 { &path.isInterior, &score.mapIsInterior },
             };
@@ -4840,6 +5810,24 @@ namespace {
             }
         }
 
+        void writeLiftCandidateMetricsCsv(const std::string& binaryPath) const {
+            if (binaryPath.empty()) {
+                return;
+            }
+            const std::string csvPath = replaceExtensionWithSuffix(binaryPath, ".candidates.csv");
+            FILE* fp = fopen(csvPath.c_str(), "w");
+            if (fp == nullptr) {
+                return;
+            }
+            fprintf(fp, "candidateId,source,x,y,w,h,compScore,presenceRate,unknownRate,medianCorrOnPresent,medianCorrAll,maxOnBlockRatio\n");
+            for (const auto& m : liftCandidateMetrics) {
+                fprintf(fp, "%d,%s,%d,%d,%d,%d,%.8f,%.8f,%.8f,%.8f,%.8f,%.8f\n",
+                    m.candidateId, m.source.c_str(), m.rect.x, m.rect.y, m.rect.w, m.rect.h,
+                    m.compScore, m.presenceRate, m.unknownRate, m.medianCorrOnPresent, m.medianCorrAll, m.maxOnBlockRatio);
+            }
+            fclose(fp);
+        }
+
         void writeDebug(const tchar* scorePath, const tchar* binaryPath, const tchar* cclPath, const tchar* countPath, const tchar* aPath, const tchar* bPath, const tchar* alphaPath, const tchar* logoYPath, const tchar* consistencyPath, const tchar* fgVarPath, const tchar* bgVarPath, const tchar* transitionPath, const tchar* keepRatePath, const tchar* acceptedPath) {
             if (scanw <= 0 || scanh <= 0) {
                 return;
@@ -4870,6 +5858,7 @@ namespace {
             basePath.bgGain = addSuffixBeforeExtension(basePath.score, ".bggain");
             basePath.extremeGain = addSuffixBeforeExtension(basePath.score, ".extremegain");
             basePath.temporalGain = addSuffixBeforeExtension(basePath.score, ".temporalgain");
+            basePath.temporalLiftGain = addSuffixBeforeExtension(basePath.score, ".pctliftgain");
             basePath.opaquePenalty = addSuffixBeforeExtension(basePath.score, ".opaquepenalty");
             basePath.opaqueStaticPenalty = addSuffixBeforeExtension(basePath.score, ".opaquestaticpenalty");
             basePath.lineFitGain = addSuffixBeforeExtension(basePath.score, ".linefitgain");
@@ -4881,6 +5870,11 @@ namespace {
             basePath.edgeMean     = addSuffixBeforeExtension(basePath.score, ".edgemean");
             basePath.edgeVar      = addSuffixBeforeExtension(basePath.score, ".edgevar");
             basePath.rescueScore  = addSuffixBeforeExtension(basePath.score, ".rescuescore");
+            basePath.pctP5        = addSuffixBeforeExtension(basePath.score, ".pctp5");
+            basePath.pctLift      = addSuffixBeforeExtension(basePath.score, ".pctlift");
+            basePath.pctRescue    = addSuffixBeforeExtension(basePath.score, ".pctrescue");
+            basePath.consensus    = addSuffixBeforeExtension(basePath.score, ".consensus");
+            basePath.consensusAlpha = addSuffixBeforeExtension(basePath.score, ".consalpha");
             basePath.presenceGain = addSuffixBeforeExtension(basePath.score, ".presencegain");
             basePath.magGain      = addSuffixBeforeExtension(basePath.score, ".maggain");
             basePath.upperGate    = addSuffixBeforeExtension(basePath.score, ".uppergate");
@@ -4905,6 +5899,7 @@ namespace {
 
             // 追加: runPass2PrepareMask で得た仮ロゴ/ロゴマスク/frame gate を保存。
             writePass2PrepareDebug(basePath);
+            writeLiftCandidateMetricsCsv(basePath.binary);
         }
 
         int getReadFrames() const { return readFrames; }
@@ -4955,6 +5950,22 @@ namespace {
             }
             if (statsPass != nullptr) {
                 statsPass->reset(scanw, scanh, getCurrentProcessingBitDepth());
+            }
+            if (temporalHistCaptureActive) {
+                temporalHistBuf.assign((size_t)scanw * scanh * kTemporalHistBins, (uint16_t)0);
+                temporalP5Map.assign((size_t)scanw * scanh, 0.0f);
+                temporalLiftMap.assign((size_t)scanw * scanh, 0.0f);
+                temporalLiftP995 = 0.0f;
+            }
+            if (segmentConsensusCaptureActive) {
+                const int pixelCount = scanw * scanh;
+                segmentConsensusBuf.assign((size_t)pixelCount * kSegmentConsensusK, SegmentConsensusMoment());
+                segmentConsensusValid.assign(pixelCount, 0);
+                segmentConsensusA.assign(pixelCount, 0.0f);
+                segmentConsensusB.assign(pixelCount, 0.0f);
+                segmentConsensusAlpha.assign(pixelCount, 0.0f);
+                segmentConsensusConsistency.assign(pixelCount, 0.0f);
+                segmentConsensusStdDiff.assign(pixelCount, 0.0f);
             }
             if (pass2 != nullptr) {
                 pass2->evalDeint.clear();
@@ -5269,6 +6280,7 @@ namespace {
             const int collectXSplits = ParseEnvIntDefault("AMT_LOGO_COLLECT_X_SPLITS", 2, 1);
             const int innerHeight = std::max(0, scanh - 2 * kScanEdgeMargin);
             const int innerWidth = std::max(0, scanw - 2 * kScanEdgeMargin);
+            const int segmentConsensusIndex = getSegmentConsensusIndex();
 
             auto processRange = [&](const int yBegin, const int yEnd, const int xBegin, const int xEnd) {
                 int localFrameCount = 0;
@@ -5279,6 +6291,7 @@ namespace {
                             continue;
                         }
                         const float fgRaw = (float)frameWork[off];
+                        accumulateTemporalHistSample(off, fgRaw, invMaxv);
                         AutoDetectStats& s = stats[off];
                         s.observed++;
                         if (lastObservedValid[off]) {
@@ -5313,6 +6326,7 @@ namespace {
                         s.rawSampleCount++;
                         const int binIdx = std::min(kHistBins - 1, (int)(fgRaw * invMaxv * kHistBins));
                         auto& bin = binAccumBuf[off * kHistBins + binIdx];
+                        accumulateSegmentConsensusSample(off, segmentConsensusIndex, f, b);
                         AddBinAccumSample(bin, f, b, calcSampleResidualWeight(off, f, b));
                         // このフレームで有効だった画素数（デバッグ可視化用）。
                         localFrameCount++;
@@ -5369,6 +6383,7 @@ namespace {
 
                 const int off = tp.x + tp.y * scanw;
                 const float fgFiltered = (float)frameWork[off];
+                accumulateTemporalHistSample(off, fgFiltered, invMaxv);
                 rec.fgFiltered = fgFiltered;
 
                 AutoDetectStats& s = stats[off];
@@ -5435,6 +6450,7 @@ namespace {
                 s.rawSampleCount++;
                 const int binIdx = std::min(kHistBins - 1, (int)(fgFiltered * invMaxv * kHistBins));
                 auto& bin = binAccumBuf[off * kHistBins + binIdx];
+                accumulateSegmentConsensusSample(off, segmentConsensusIndex, f, b);
                 AddBinAccumSample(bin, f, b, calcSampleResidualWeight(off, f, b));
                 rec.histBin = binIdx;
                 frameCount.fetch_add(1, std::memory_order_relaxed);
@@ -6266,7 +7282,7 @@ namespace {
             });
         }
 
-        void prepareResidualReweightMaps(const StatsPassBuffers& statsPass) {
+        void prepareResidualReweightMaps(const StatsPassBuffers& statsPass, const bool applySegmentConsensus) {
             const int total = scanw * scanh;
             provisionalLineValid.assign(total, 0);
             provisionalLineA.assign(total, 0.0f);
@@ -6289,6 +7305,9 @@ namespace {
                 provisionalLineB[off] = B;
                 provisionalLineConsistency[off] = (float)consistency;
                 provisionalLineStdDiff[off] = (float)stdDiff;
+            }
+            if (applySegmentConsensus) {
+                applySegmentConsensusToProvisionalLines();
             }
 
             auto weightedPercentile = [](std::vector<std::pair<double, double>> vals, const double ratio) {
@@ -7166,12 +8185,15 @@ namespace {
                 * scoreStage.mapOpaqueStaticPenalty[i]
                 * whiteConstraintGain
                 * scoreStage.mapLineFitGain[i]
-                * scoreStage.mapSplitBranchGain[i];
+                * scoreStage.mapSplitBranchGain[i]
+                * scoreStage.mapTemporalLiftGain[i];
         }
 
         void computeBaseScoreStage(const StatsPassBuffers& statsPass, ScoreStageBuffers& scoreStage) {
             // 各種出力マップをクリアする。
             scoreStage.reset(scanw, scanh);
+            copyTemporalDebugMaps(scoreStage);
+            copySegmentConsensusDebugMaps(scoreStage);
 
             // 画素単位で A/B 推定と特徴量計算を行い、score を合成する。
             RunParallelRange(threadPool, threadN, scanh, [&](int y0, int y1) {
@@ -7274,6 +8296,7 @@ namespace {
                         const float lineFitGain = 1.0f / (1.0f + 2.5f * dominantResidualPenalty);
                         const float splitBranchPenalty = calcSplitBranchPenalty(statsPass, i, alpha);
                         const float splitBranchGain = 1.0f / (1.0f + 4.0f * splitBranchPenalty);
+                        const float temporalLiftGain = calcTemporalLiftGain(i);
                         scoreStage.mapDiffGain[i] = (float)diffGain;
                         scoreStage.mapDiffGainRaw[i] = (float)diffGainRaw;
                         scoreStage.mapResidualGain[i] = (float)residualGain;
@@ -7283,6 +8306,7 @@ namespace {
                         scoreStage.mapBgGain[i] = (float)bgGain;
                         scoreStage.mapExtremeGain[i] = (float)extremeGain;
                         scoreStage.mapTemporalGain[i] = (float)temporalGain;
+                        scoreStage.mapTemporalLiftGain[i] = temporalLiftGain;
                         scoreStage.mapOpaquePenalty[i] = (float)opaquePenalty;
                         scoreStage.mapOpaqueStaticPenalty[i] = (float)opaqueStaticPenalty;
                         scoreStage.mapLineFitGain[i] = lineFitGain;
@@ -7549,6 +8573,9 @@ namespace {
             }
 
             scoreStage.debugMaxScoreBeforeRescue = calcPositiveMax(scoreStage.score);
+            std::vector<uint8_t> temporalLiftRescueEligible;
+            collectTemporalLiftRescueEligible(scoreStage, temporalLiftRescueEligible);
+            const float temporalLiftRescueBaseP99 = calcTemporalLiftRescueBaseScale(scoreStage);
 
             // rescueScore の単純加算:
             // d9b3138 で入れた suppression/boost は、rescue が疎なケースで
@@ -7573,6 +8600,7 @@ namespace {
             // 通常 score より値が低い。validAB=true かつ両方正の画素から
             // score/rescue 比の p75 を求め、rescue にそのスケールを掛けてから適用する。
             applyPass2OrFallbackRescueBlend(scoreStage, enableRescue, rescueAnchorRect);
+            applyTemporalLiftRescue(scoreStage, temporalLiftRescueEligible, temporalLiftRescueBaseP99);
 
             scoreStage.debugMaxScore = calcPositiveMax(scoreStage.score);
 
@@ -7587,9 +8615,10 @@ namespace {
                 if (scoreStage.validAB[i]) {
                     validPixels++;
                 }
-                if (!scoreStage.validAB[i] || scoreStage.score[i] <= 0) continue;
-                sum += scoreStage.score[i];
-                sum2 += scoreStage.score[i] * scoreStage.score[i];
+                const float scoreForThreshold = getScoreForThreshold(scoreStage, i);
+                if (!scoreStage.validAB[i] || scoreForThreshold <= 0) continue;
+                sum += scoreForThreshold;
+                sum2 += scoreForThreshold * scoreForThreshold;
                 count++;
             }
             scoreValidPixelCount = validPixels;
@@ -7600,7 +8629,7 @@ namespace {
                 int finalPos = 0;
                 for (int i = 0; i < scanw * scanh; i++) {
                     if (!scoreStage.validAB[i]) continue;
-                    if (scoreStage.score[i] > 0) finalPos++;
+                    if (getScoreForThreshold(scoreStage, i) > 0) finalPos++;
                 }
                 const auto finalStats = CalcScoreDebugStats(scoreStage.score, scoreStage.validAB);
                 int sampledPixels = 0;
@@ -7654,7 +8683,7 @@ namespace {
                 for (int i = 0; i < scanw * scanh; i++) {
                     // 閾値は回帰ベーススコアのみで決定する
                     if (!scoreStage.validAB[i]) continue;
-                    const float v = scoreStage.score[i];
+                    const float v = getScoreForThreshold(scoreStage, i);
                     if (v <= 0.0f || !std::isfinite(v)) continue;
                     distVals.push_back(v);
                 }

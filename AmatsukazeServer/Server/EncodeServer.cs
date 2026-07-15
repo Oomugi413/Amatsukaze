@@ -299,6 +299,15 @@ namespace Amatsukaze.Server
             this.finishRequested = finishRequested;
             serverPort = port;
 
+            // 起動時の実行コンテキストをログに残す（EDCB連携等の環境切り分け用）
+            Util.AddLog("[起動診断] " + ServerSupport.GetExecutionContextSummary(), null);
+            if (ServerSupport.IsNonInteractiveServiceContext(out var contextReason))
+            {
+                Util.AddLog($"[起動診断] 警告: {contextReason}。" +
+                    "ネットワークドライブが見えない・AviSynthプラグインがエラーになる等の問題が起きる場合は、" +
+                    "サーバーをユーザーセッションで事前に起動してください。", null);
+            }
+
             queueManager = new QueueManager(this);
             autoLogoPendingResolver = new AutoLogoPendingResolver(this);
             drcsManager = new DRCSManager(this);
@@ -1956,7 +1965,7 @@ namespace Amatsukaze.Server
             string src, string srcOrg, string dst, string json,
             VideoStreamFormat streamFormat,
             int serviceId, string[] logofiles,
-            bool ignoreNoLogo, string jlscommand, string jlsopt, string ceopt, string trimavs, string batDir,
+            bool ignoreNoLogo, string jlscommand, string jlsopt, string ceopt, string trimavs, string resumeDir, string batDir,
             string inHandle, string outHandle, int pid)
         {
             StringBuilder sb = new StringBuilder();
@@ -2133,6 +2142,10 @@ namespace Amatsukaze.Server
                     if (profile.OutputFormat == FormatType.TSREPLACE && profile.TsreplaceRemoveTypeD)
                     {
                         sb.Append(" --tsreplace-remove-typed");
+                    }
+                    if (profile.OutputFormat == FormatType.TSREPLACE && profile.TsreplaceMuxTsTempFile)
+                    {
+                        sb.Append(" --mux-ts-temp");
                     }
 
                     if (bitrateCM != 1)
@@ -2428,6 +2441,10 @@ namespace Amatsukaze.Server
                 {
                     sb.Append(" --trimavs \"").Append(trimavs).Append("\"");
                 }
+                if (string.IsNullOrEmpty(resumeDir) == false)
+                {
+                    sb.Append(" --resume-dir \"").Append(resumeDir).Append("\"");
+                }
                 if (AppData_.setting.ExclusiveBatExec)
                 {
                     sb.Append(" --exclusive-bat-exec");
@@ -2463,12 +2480,35 @@ namespace Amatsukaze.Server
 
         private void CleanTmpDir()
         {
+            var pathComparer = Util.IsServerWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+            var resumeDirs = new HashSet<string>(pathComparer);
+            foreach (var item in queueManager.GetQueueSnapshot())
+            {
+                if (string.IsNullOrWhiteSpace(item.ResumeDir))
+                {
+                    continue;
+                }
+                try
+                {
+                    resumeDirs.Add(NormalizeDirectoryPath(item.ResumeDir));
+                }
+                catch (Exception ex)
+                {
+                    Util.AddLog("[Queue] 再利用用一時フォルダを正規化できないため除外できません: " + item.ResumeDir, ex);
+                }
+            }
+
             // amtディレクトリ
             foreach (var dir in Directory
                 .GetDirectories(AppData_.setting.ActualWorkPath, "amt*"))
             {
                 try
                 {
+                    if (resumeDirs.Contains(NormalizeDirectoryPath(dir)))
+                    {
+                        Util.AddLog("[Queue] キューで再利用予定の一時フォルダを削除対象から除外しました: " + dir, null);
+                        continue;
+                    }
                     Directory.Delete(dir, true);
                 }
                 catch (Exception) { } // 例外は無視
@@ -2498,6 +2538,11 @@ namespace Amatsukaze.Server
                 }
                 catch (Exception) { } // 例外は無視
             }
+        }
+
+        private static string NormalizeDirectoryPath(string path)
+        {
+            return Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         }
 
         private static void CheckPath(string name, string path)
@@ -3630,6 +3675,17 @@ namespace Amatsukaze.Server
         {
             queueQ.Post(data);
             return Task.FromResult(0);
+        }
+
+        internal Task<QueueItem> RequeueTrimItem(
+            int sourceItemId,
+            string profileName,
+            int priority,
+            List<string> tags,
+            string resumeDir,
+            bool removeSourceItem)
+        {
+            return queueManager.RequeueTrimItem(sourceItemId, profileName, priority, tags, resumeDir, removeSourceItem);
         }
 
         public async Task PauseEncode(PauseRequest request)

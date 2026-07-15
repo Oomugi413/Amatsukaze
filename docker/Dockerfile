@@ -389,9 +389,9 @@ RUN git clone --depth 1 -b 0.04 https://github.com/rigaya/SCRenamePy.git tmp_SCR
     && mv tmp_SCRenamePy/SCRename.* exe_files/SCRenamePy/ \
     && rm -rf tmp_SCRenamePy
 
-RUN wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260328-082237/x264_3223_amd64_linux.tar.xz -O x264.tar.xz \
-    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260328-082237/x265_4.1%2B241_amd64_linux.tar.xz -O x265.tar.xz \
-    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260328-082237/SvtAv1EncApp_4.1.0-4_amd64_linux_clang.tar.xz -O svt-av1.tar.xz \
+RUN wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260711-071204/x264_3223_amd64_linux.tar.xz -O x264.tar.xz \
+    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260711-071204/x265_4.2%2B37_amd64_linux.tar.xz -O x265.tar.xz \
+    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260711-071204/SvtAv1EncApp_4.1.0-291_amd64_linux_clang.tar.xz -O svt-av1.tar.xz \
     && tar -xf x264.tar.xz -C /app/exe_files \
     && tar -xf x265.tar.xz -C /app/exe_files \
     && tar -xf svt-av1.tar.xz -C /app/exe_files \

@@ -9,12 +9,14 @@
 #include "TranscodeManager.h"
 #include "rgy_util.h"
 #include "rgy_thread_affinity.h"
+#include <thread>
 #include "AdtsParser.h"
 #include "PacketCache.h"
 #include "rgy_pipe.h"
 #include "rgy_mutex.h"
 #include "Subtitle.h"
 #include "WaveWriter.h"
+#include <filesystem>
 
 namespace {
 
@@ -26,6 +28,400 @@ struct WhisperAudioEntry {
     int audioSourceIndex;
     int dualMonoChannel; // -1: original stereo, 0/1: dual mono channel selection
 };
+
+constexpr int RESUME_MANIFEST_VERSION = 2;
+
+struct ResumeVideoInfo {
+    int numFrames;
+    tstring logoPath;
+    std::vector<int> trims;
+    std::vector<int> divs;
+};
+
+struct ResumeInfo {
+    int64_t srcFileSize;
+    int64_t srcWriteTime;
+    int requestedServiceId;
+    bool captionsParsed;
+    bool tsreplace;
+    bool chapter;
+    bool pmtCut;
+    double pmtCutSideRate[2];
+    std::vector<tstring> logoPath;
+    std::vector<tstring> eraseLogoPath;
+    bool ignoreNoLogo;
+    bool noDelogo;
+    bool looseLogoDetection;
+    int autoLogoDetect;
+    int autoLogoDetectSearchFrames;
+    int autoLogoDetectDivX;
+    int autoLogoDetectDivY;
+    int autoLogoDetectBlockSize;
+    int autoLogoDetectThreshold;
+    int autoLogoDetectMarginX;
+    int autoLogoDetectMarginY;
+    int serviceId;
+    int64_t numTotalPackets;
+    int64_t numScramblePackets;
+    int64_t totalIntVideoSize;
+    int64_t splitterSrcFileSize;
+    int noDrcsMapCount;
+    std::vector<ResumeVideoInfo> videos;
+};
+
+static void writeTString(const File& file, const tstring& str) {
+    file.writeArray(std::vector<tchar>(str.begin(), str.end()));
+}
+
+static void writeTStringArray(const File& file, const std::vector<tstring>& strings) {
+    file.writeValue((int64_t)strings.size());
+    for (const auto& str : strings) {
+        writeTString(file, str);
+    }
+}
+
+static tstring readTString(const File& file) {
+    const auto chars = file.readArray<tchar>();
+    return tstring(chars.begin(), chars.end());
+}
+
+static std::vector<tstring> readTStringArray(const File& file) {
+    const auto count = file.readValue<int64_t>();
+    if (count < 0 || count > INT_MAX) {
+        THROW(FormatException, "再開情報の文字列配列数が不正です");
+    }
+    std::vector<tstring> strings;
+    strings.reserve((size_t)count);
+    for (int64_t i = 0; i < count; i++) {
+        strings.push_back(readTString(file));
+    }
+    return strings;
+}
+
+static int64_t getFileWriteTime(const tstring& path) {
+    std::error_code error;
+    const auto time = std::filesystem::last_write_time(std::filesystem::path(path), error);
+    if (error) {
+        THROWF(IOException, "入力ファイルの更新時刻を取得できません: %s", path.c_str());
+    }
+    return static_cast<int64_t>(time.time_since_epoch().count());
+}
+
+static int64_t getFileSize(const tstring& path) {
+    File file(path, _T("rb"));
+    return file.size();
+}
+
+static void saveResumeManifest(
+    const ConfigWrapper& setting,
+    StreamReformInfo& reformInfo,
+    const std::vector<std::unique_ptr<CMAnalyze>>& cmanalyze,
+    const int serviceId,
+    const int64_t numTotalPackets,
+    const int64_t numScramblePackets,
+    const int64_t totalIntVideoSize,
+    const int64_t srcFileSize,
+    const int noDrcsMapCount,
+    const bool captionsParsed) {
+    const auto srcPath = setting.getSrcFilePath();
+    const auto pmtCutSideRate = setting.getPmtCutSideRate();
+    File file(setting.getTmpResumePath(), _T("wb"));
+
+    file.writeValue(RESUME_MANIFEST_VERSION);
+    file.writeValue(srcFileSize);
+    file.writeValue(getFileWriteTime(srcPath));
+
+    file.writeValue(setting.getServiceId());
+    file.writeValue(captionsParsed);
+    file.writeValue(setting.getFormat() == FORMAT_TSREPLACE);
+    file.writeValue(setting.isChapterEnabled());
+    file.writeValue(setting.isPmtCutEnabled());
+    file.writeValue(pmtCutSideRate[0]);
+    file.writeValue(pmtCutSideRate[1]);
+    writeTStringArray(file, setting.getLogoPath());
+    writeTStringArray(file, setting.getEraseLogoPath());
+    file.writeValue(setting.isIgnoreNoLogo());
+    file.writeValue(setting.isNoDelogo());
+    file.writeValue(setting.isLooseLogoDetection());
+    file.writeValue(setting.getAutoLogoDetect());
+    file.writeValue(setting.getAutoLogoDetectSearchFrames());
+    file.writeValue(setting.getAutoLogoDetectDivX());
+    file.writeValue(setting.getAutoLogoDetectDivY());
+    file.writeValue(setting.getAutoLogoDetectBlockSize());
+    file.writeValue(setting.getAutoLogoDetectThreshold());
+    file.writeValue(setting.getAutoLogoDetectMarginX());
+    file.writeValue(setting.getAutoLogoDetectMarginY());
+
+    file.writeValue(serviceId);
+    file.writeValue(numTotalPackets);
+    file.writeValue(numScramblePackets);
+    file.writeValue(totalIntVideoSize);
+    file.writeValue(srcFileSize);
+    file.writeValue(noDrcsMapCount);
+
+    file.writeValue((int)cmanalyze.size());
+    for (int videoFileIndex = 0; videoFileIndex < (int)cmanalyze.size(); videoFileIndex++) {
+        const auto& cma = cmanalyze[videoFileIndex];
+        const int numFrames = (int)reformInfo.getFilterSourceFrames(videoFileIndex).size();
+        file.writeValue(numFrames);
+        writeTString(file, cma->getLogoPath());
+        file.writeArray(cma->getTrims());
+        file.writeArray(cma->getDivs());
+    }
+}
+
+static ResumeInfo readResumeManifest(const tstring& path) {
+    File file(path, _T("rb"));
+    const auto version = file.readValue<int>();
+    if (version != RESUME_MANIFEST_VERSION) {
+        THROWF(FormatException, "再開情報のバージョンが未対応です: %d", version);
+    }
+
+    ResumeInfo info;
+    info.srcFileSize = file.readValue<int64_t>();
+    info.srcWriteTime = file.readValue<int64_t>();
+    info.requestedServiceId = file.readValue<int>();
+    info.captionsParsed = file.readValue<bool>();
+    info.tsreplace = file.readValue<bool>();
+    info.chapter = file.readValue<bool>();
+    info.pmtCut = file.readValue<bool>();
+    info.pmtCutSideRate[0] = file.readValue<double>();
+    info.pmtCutSideRate[1] = file.readValue<double>();
+    info.logoPath = readTStringArray(file);
+    info.eraseLogoPath = readTStringArray(file);
+    info.ignoreNoLogo = file.readValue<bool>();
+    info.noDelogo = file.readValue<bool>();
+    info.looseLogoDetection = file.readValue<bool>();
+    info.autoLogoDetect = file.readValue<int>();
+    info.autoLogoDetectSearchFrames = file.readValue<int>();
+    info.autoLogoDetectDivX = file.readValue<int>();
+    info.autoLogoDetectDivY = file.readValue<int>();
+    info.autoLogoDetectBlockSize = file.readValue<int>();
+    info.autoLogoDetectThreshold = file.readValue<int>();
+    info.autoLogoDetectMarginX = file.readValue<int>();
+    info.autoLogoDetectMarginY = file.readValue<int>();
+    info.serviceId = file.readValue<int>();
+    info.numTotalPackets = file.readValue<int64_t>();
+    info.numScramblePackets = file.readValue<int64_t>();
+    info.totalIntVideoSize = file.readValue<int64_t>();
+    info.splitterSrcFileSize = file.readValue<int64_t>();
+    info.noDrcsMapCount = file.readValue<int>();
+
+    const auto videoCount = file.readValue<int>();
+    if (videoCount < 0 || videoCount > INT_MAX) {
+        THROW(FormatException, "再開情報の映像数が不正です");
+    }
+    info.videos.resize(videoCount);
+    for (auto& video : info.videos) {
+        video.numFrames = file.readValue<int>();
+        video.logoPath = readTString(file);
+        video.trims = file.readArray<int>();
+        video.divs = file.readArray<int>();
+    }
+    return info;
+}
+
+static bool validateResumeSetting(const ConfigWrapper& setting, const ResumeInfo& info, tstring& reason) {
+    std::vector<tstring> mismatchedFields;
+    if (info.srcFileSize != getFileSize(setting.getSrcFilePath())
+        || info.srcWriteTime != getFileWriteTime(setting.getSrcFilePath())) {
+        mismatchedFields.push_back(_T("入力TS"));
+    }
+    if (info.requestedServiceId != setting.getServiceId()) {
+        mismatchedFields.push_back(_T("サービスID"));
+    }
+    if (info.tsreplace != (setting.getFormat() == FORMAT_TSREPLACE)) {
+        mismatchedFields.push_back(_T("TS置換出力"));
+    }
+    if (info.eraseLogoPath != setting.getEraseLogoPath()) {
+        mismatchedFields.push_back(_T("追加ロゴ消し設定"));
+    }
+    if (mismatchedFields.empty()) {
+        return true;
+    }
+
+    reason = _T("再開情報と設定が一致しません(");
+    for (int index = 0; index < (int)mismatchedFields.size(); index++) {
+        if (index > 0) {
+            reason += _T(", ");
+        }
+        reason += mismatchedFields[index];
+    }
+    reason += _T(")");
+    return false;
+}
+
+static bool validateResumeFiles(
+    const ConfigWrapper& setting,
+    const StreamReformInfo& reformInfo,
+    const ResumeInfo& info,
+    tstring& reason) {
+    const int numVideoFiles = reformInfo.getNumVideoFile();
+    if ((int)info.videos.size() != numVideoFiles) {
+        reason = _T("再開情報の映像数が一致しません");
+        return false;
+    }
+    if (!File::exists(setting.getAudioFilePath()) || !File::exists(setting.getWaveFilePath())) {
+        reason = _T("再開に必要な音声一時ファイルがありません");
+        return false;
+    }
+    if (setting.isWebVTTEnabled() && !File::exists(setting.getTmpTsReadExDumpPath())) {
+        reason = _T("再開に必要なtsreadex_dump.txtがありません");
+        return false;
+    }
+
+    for (int videoFileIndex = 0; videoFileIndex < numVideoFiles; videoFileIndex++) {
+        const auto& video = info.videos[videoFileIndex];
+        const int numFrames = (int)reformInfo.getFilterSourceFrames(videoFileIndex).size();
+        if (video.numFrames != numFrames) {
+            reason = StringFormat(_T("再開情報のフレーム数が一致しません: %d"), videoFileIndex);
+            return false;
+        }
+        if (video.trims.size() % 2 != 0) {
+            reason = StringFormat(_T("再開情報のTrim区間数が不正です: %d"), videoFileIndex);
+            return false;
+        }
+        for (int i = 0; i < (int)video.trims.size(); i += 2) {
+            if (video.trims[i] < 0 || video.trims[i + 1] < video.trims[i]
+                || video.trims[i + 1] > numFrames) {
+                reason = StringFormat(_T("再開情報のTrim区間が不正です: %d"), videoFileIndex);
+                return false;
+            }
+        }
+        if (video.divs.size() > 0) {
+            if (video.divs.size() < 2 || video.divs.front() != 0 || video.divs.back() != numFrames) {
+                reason = StringFormat(_T("再開情報の分割情報が不正です: %d"), videoFileIndex);
+                return false;
+            }
+            for (int i = 1; i < (int)video.divs.size(); i++) {
+                if (video.divs[i] < video.divs[i - 1]) {
+                    reason = StringFormat(_T("再開情報の分割順序が不正です: %d"), videoFileIndex);
+                    return false;
+                }
+            }
+        }
+        const bool requiresSavedLogo = !setting.isNoDelogo()
+            && setting.getLogoPath().size() > 0
+            && numFrames >= 300;
+        if (requiresSavedLogo && video.logoPath.empty()) {
+            reason = StringFormat(_T("ロゴ消しに必要な保存済みロゴ情報がありません: %d"), videoFileIndex);
+            return false;
+        }
+        if (!File::exists(setting.getIntVideoFilePath(videoFileIndex))
+            || !File::exists(setting.getTmpAMTSourcePath(videoFileIndex))) {
+            reason = StringFormat(_T("再開に必要な映像一時ファイルがありません: %d"), videoFileIndex);
+            return false;
+        }
+        if (video.divs.size() > 0 && !File::exists(setting.getTmpTrimAVSPath(videoFileIndex))) {
+            reason = StringFormat(_T("再開に必要なTrimファイルがありません: %d"), videoFileIndex);
+            return false;
+        }
+        if (setting.isChapterEnabled() && numFrames >= 300
+            && !File::exists(setting.getTmpJlsPath(videoFileIndex))) {
+            reason = StringFormat(_T("再開に必要なチャプター情報がありません: %d"), videoFileIndex);
+            return false;
+        }
+        if (video.logoPath.size() > 0 && !File::exists(video.logoPath)) {
+            reason = StringFormat(_T("再開に必要なロゴファイルがありません: %d"), videoFileIndex);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool tryLoadResume(
+    AMTContext& ctx,
+    const ConfigWrapper& setting,
+    ResumeInfo& info,
+    std::unique_ptr<StreamReformInfo>& reformInfo) {
+    if (setting.getResumeDir().size() == 0) {
+        return false;
+    }
+    if (!rgy_path_is_same(setting.getTmpDir(), setting.getResumeDir())) {
+        ctx.warnF(_T("[一時ファイル再利用] 指定された再開フォルダを使用できないため通常処理へ戻ります: %s"), setting.getResumeDir().c_str());
+        return false;
+    }
+
+    try {
+        tstring reason;
+        ctx.info(_T("[一時ファイル再利用] 再開情報を検証します"));
+        if (!File::exists(setting.getTmpStreamInfoPath()) || !File::exists(setting.getTmpResumePath())) {
+            ctx.warn(_T("[一時ファイル再利用] 再開情報が見つからないため通常処理へ戻ります"));
+            return false;
+        }
+        info = readResumeManifest(setting.getTmpResumePath());
+        ctx.info(_T("[一時ファイル再利用] 再開マニフェストを読み込みました"));
+        if (!validateResumeSetting(setting, info, reason)) {
+            ctx.warnF(_T("[一時ファイル再利用] %s。通常処理へ戻ります"), reason.c_str());
+            return false;
+        }
+        if (setting.isSubtitlesEnabled() && !info.captionsParsed) {
+            ctx.warn(_T("[一時ファイル再利用] 再開情報に字幕解析結果が含まれていないため通常処理へ戻ります"));
+            return false;
+        }
+        reformInfo = std::make_unique<StreamReformInfo>(StreamReformInfo::deserialize(ctx, setting.getTmpStreamInfoPath()));
+        if (!setting.isSubtitlesEnabled()) {
+            reformInfo->clearCaptionItems();
+        }
+        reformInfo->prepare(setting.isSplitSub(), setting.isEncodeAudio(), setting.getFormat() == FORMAT_TSREPLACE);
+        ctx.info(_T("[一時ファイル再利用] ストリーム情報を読み込みました"));
+        if (!validateResumeFiles(setting, *reformInfo, info, reason)) {
+            ctx.warnF(_T("[一時ファイル再利用] %s。通常処理へ戻ります"), reason.c_str());
+            reformInfo.reset();
+            return false;
+        }
+        ctx.infoF(_T("[一時ファイル再利用] 再開情報を読み込みました: %s"), setting.getTmpResumePath().c_str());
+        return true;
+    } catch (const Exception& e) {
+        ctx.warnF(_T("[一時ファイル再利用] 再開情報の検証に失敗したため通常処理へ戻ります: %s"), e.message());
+    } catch (const std::exception& e) {
+        ctx.warnF(_T("[一時ファイル再利用] 再開情報の検証に失敗したため通常処理へ戻ります: %s"), char_to_tstring(e.what()));
+    }
+    reformInfo.reset();
+    return false;
+}
+
+static void saveResumeFiles(
+    AMTContext& ctx,
+    const ConfigWrapper& setting,
+    StreamReformInfo& reformInfo,
+    const std::vector<std::unique_ptr<CMAnalyze>>& cmanalyze,
+    const int serviceId,
+    const int64_t numTotalPackets,
+    const int64_t numScramblePackets,
+    const int64_t totalIntVideoSize,
+    const int64_t srcFileSize,
+    const int noDrcsMapCount,
+    const bool captionsParsed) {
+    try {
+        saveResumeManifest(setting, reformInfo, cmanalyze,
+            serviceId, numTotalPackets, numScramblePackets, totalIntVideoSize, srcFileSize,
+            noDrcsMapCount, captionsParsed);
+        ctx.infoF(_T("[一時ファイル再利用] 再開情報を保存しました: %s"), setting.getTmpResumePath().c_str());
+    } catch (const Exception& e) {
+        ctx.warnF(_T("[一時ファイル再利用] 再開情報の保存に失敗しました: %s"), e.message());
+    } catch (const std::exception& e) {
+        ctx.warnF(_T("[一時ファイル再利用] 再開情報の保存に失敗しました: %s"), char_to_tstring(e.what()));
+    }
+}
+
+static void saveResumeStreamInfo(
+    AMTContext& ctx,
+    const ConfigWrapper& setting,
+    StreamReformInfo& reformInfo) {
+    try {
+        reformInfo.serialize(setting.getTmpStreamInfoPath());
+        ctx.infoF(_T("[一時ファイル再利用] ストリーム情報を保存しました: %s"), setting.getTmpStreamInfoPath().c_str());
+    } catch (const Exception& e) {
+        ctx.warnF(_T("[一時ファイル再利用] ストリーム情報の保存に失敗しました: %s"), e.message());
+    } catch (const std::exception& e) {
+        ctx.warnF(_T("[一時ファイル再利用] ストリーム情報の保存に失敗しました: %s"), char_to_tstring(e.what()));
+    }
+}
+
+static bool isCaptionParsingEnabled(const ConfigWrapper& setting) {
+    return setting.isSubtitlesEnabled() || setting.isNoRemoveTmp();
+}
 
 static void copyTrimAVSForCMOnly(
     AMTContext& ctx,
@@ -173,10 +569,77 @@ static tstring createWhisperWaveInput(AMTContext& ctx,
     return wavPath;
 }
 
+// TS解析中にtsreadexへ入力TSを転送し、トレースを保存する。
+// 解析側で例外が発生した場合も、デストラクタで標準入力を閉じて完了を待つ。
+class TsReadExPipe {
+    class TraceProcess : public EventBaseSubProcess {
+    public:
+        TraceProcess(const tstring& args, File* output)
+            : EventBaseSubProcess(args)
+            , output_(output) {}
+
+    protected:
+        void onOut(bool isErr, MemoryChunk mc) override {
+            if (!isErr && output_) {
+                output_->write(mc);
+            }
+        }
+
+    private:
+        File* output_;
+    };
+
+public:
+    TsReadExPipe(AMTContext& ctx, const ConfigWrapper& setting)
+        : output_(new File(setting.getTmpTsReadExDumpPath(), _T("wb")))
+        , process_()
+        , writeEnabled_(true) {
+        ctx.info(_T("[tsreadex 解析]"));
+        const tstring args = StringFormat(
+            _T("\"%s\" -n -1 -r - -"), setting.getTsReadExPath().c_str());
+        ctx.infoF(_T("tsreadex コマンド: %s"), args.c_str());
+        process_.reset(new TraceProcess(args, output_.get()));
+    }
+
+    ~TsReadExPipe() {
+        // EventBaseSubProcess::join()は2回呼ぶとclose済みパイプを操作してしまうため、
+        // 明示的にjoin()済みの場合はここでは何もしない。
+        if (process_ && !joined_) {
+            try {
+                process_->join();
+            } catch (...) {
+            }
+        }
+    }
+
+    void write(MemoryChunk mc) {
+        if (!writeEnabled_) {
+            return;
+        }
+        try {
+            process_->write(mc);
+        } catch (const RuntimeException&) {
+            // tsreadexが早期終了してもTS解析は最後まで継続する。
+            writeEnabled_ = false;
+        }
+    }
+
+    int join() {
+        joined_ = true;
+        return process_->join();
+    }
+
+private:
+    std::unique_ptr<File> output_;
+    std::unique_ptr<TraceProcess> process_;
+    bool writeEnabled_;
+    bool joined_ = false;
+};
+
 } // namespace
 
 AMTSplitter::AMTSplitter(AMTContext& ctx, const ConfigWrapper& setting)
-    : TsSplitter(ctx, true, true, setting.isSubtitlesEnabled())
+    : TsSplitter(ctx, true, true, isCaptionParsingEnabled(setting))
     , setting_(setting)
     , psWriter(ctx)
     , writeHandler(*this)
@@ -233,21 +696,38 @@ void AMTSplitter::readAll() {
     auto buffer_ptr = std::unique_ptr<uint8_t[]>(new uint8_t[BUFSIZE]);
     MemoryChunk buffer(buffer_ptr.get(), BUFSIZE);
     File srcfile(setting_.getSrcFilePath(), _T("rb"));
-    // 入力TSそのままのコピーを作成 (WebVTT出力ON または tsreplace時)
-    const bool needCopyTS = setting_.isWebVTTEnabled() || (setting_.getFormat() == FORMAT_TSREPLACE);
+    // tsreplaceで一時TSを使う場合だけ、入力TSのコピーを作成する。
+    const bool needCopyTS = setting_.getFormat() == FORMAT_TSREPLACE
+        && setting_.isMuxTsTempEnabled();
     std::unique_ptr<File> rawts;
     if (needCopyTS) {
         rawts.reset(new File(setting_.getTmpRawTSPath(), _T("wb")));
+    }
+    std::unique_ptr<TsReadExPipe> tsreadex;
+    if (setting_.isWebVTTEnabled()) {
+        tsreadex.reset(new TsReadExPipe(ctx, setting_));
     }
     srcFileSize_ = srcfile.size();
     size_t readBytes;
     do {
         readBytes = srcfile.read(buffer);
-        if (readBytes > 0 && rawts) {
-            rawts->write(MemoryChunk(buffer.data, readBytes));
+        if (readBytes > 0) {
+            const MemoryChunk chunk(buffer.data, readBytes);
+            if (rawts) {
+                rawts->write(chunk);
+            }
+            if (tsreadex) {
+                tsreadex->write(chunk);
+            }
         }
         inputTsData(MemoryChunk(buffer.data, readBytes));
     } while (readBytes == buffer.length);
+    if (tsreadex) {
+        const int exitCode = tsreadex->join();
+        if (exitCode != 0) {
+            THROWF(FormatException, "tsreadexがエラーコード(%d)を返しました", exitCode);
+        }
+    }
 }
 
 /* static */ bool AMTSplitter::CheckPullDown(PICTURE_TYPE p0, PICTURE_TYPE p1) {
@@ -741,44 +1221,51 @@ void DoBadThing() {
 
     Stopwatch sw;
     sw.start();
-    auto splitter = std::unique_ptr<AMTSplitter>(new AMTSplitter(ctx, setting));
-    if (setting.getServiceId() > 0) {
-        splitter->setServiceId(setting.getServiceId());
+    ResumeInfo resumeInfo;
+    std::unique_ptr<StreamReformInfo> reformInfoPtr;
+    const bool isReusingTmp = !isNoEncode && tryLoadResume(ctx, setting, resumeInfo, reformInfoPtr);
+    const bool captionsParsed = isReusingTmp ? resumeInfo.captionsParsed : isCaptionParsingEnabled(setting);
+    int serviceId;
+    int64_t numTotalPackets;
+    int64_t numScramblePackets;
+    int64_t totalIntVideoSize;
+    int64_t srcFileSize;
+    int noDrcsMapCount;
+    if (isReusingTmp) {
+        serviceId = resumeInfo.serviceId;
+        numTotalPackets = resumeInfo.numTotalPackets;
+        numScramblePackets = resumeInfo.numScramblePackets;
+        totalIntVideoSize = resumeInfo.totalIntVideoSize;
+        srcFileSize = resumeInfo.splitterSrcFileSize;
+        noDrcsMapCount = resumeInfo.noDrcsMapCount;
+    } else {
+        auto splitter = std::unique_ptr<AMTSplitter>(new AMTSplitter(ctx, setting));
+        if (setting.getServiceId() > 0) {
+            splitter->setServiceId(setting.getServiceId());
+        }
+        reformInfoPtr = std::make_unique<StreamReformInfo>(splitter->split());
+        ctx.infoF(_T("TS解析完了: %.2f秒"), sw.getAndReset());
+        if (captionsParsed && !setting.isSubtitlesEnabled()) {
+            ctx.info(_T("[一時ファイル再利用] 再開情報保存用に字幕を解析しました（字幕処理は無効のため出力しません）"));
+        }
+        serviceId = splitter->getActualServiceId();
+        numTotalPackets = splitter->getNumTotalPackets();
+        numScramblePackets = splitter->getNumScramblePackets();
+        totalIntVideoSize = splitter->getTotalIntVideoSize();
+        srcFileSize = splitter->getSrcFileSize();
+        noDrcsMapCount = ctx.getErrorCount(AMT_ERR_NO_DRCS_MAP);
     }
-    StreamReformInfo reformInfo = splitter->split();
-    ctx.infoF(_T("TS解析完了: %.2f秒"), sw.getAndReset());
-    const int serviceId = splitter->getActualServiceId();
-    const int64_t numTotalPackets = splitter->getNumTotalPackets();
-    const int64_t numScramblePackets = splitter->getNumScramblePackets();
-    const int64_t totalIntVideoSize = splitter->getTotalIntVideoSize();
-    const int64_t srcFileSize = splitter->getSrcFileSize();
-    splitter = nullptr;
+    StreamReformInfo& reformInfo = *reformInfoPtr;
+
+    if (!isReusingTmp && setting.isNoRemoveTmp()) {
+        saveResumeStreamInfo(ctx, setting, reformInfo);
+    }
+    if (!isReusingTmp && captionsParsed && !setting.isSubtitlesEnabled()) {
+        reformInfo.clearCaptionItems();
+    }
 
     if (setting.isDumpStreamInfo()) {
         reformInfo.serialize(setting.getStreamInfoPath());
-    }
-
-    // tsreadexでトレースを取得 (WebVTT出力時のみ)
-    if (setting.isWebVTTEnabled()) {
-        ctx.info(_T("[tsreadex 解析]"));
-        File stdoutf(setting.getTmpTsReadExDumpPath(), _T("wb"));
-        tstring args = StringFormat(_T("\"%s\" -n -1 -r - \"%s\""), setting.getTsReadExPath().c_str(), setting.getTmpRawTSPath().c_str());
-        ctx.infoF(_T("tsreadex コマンド: %s"), args.c_str());
-        class MyTsReadEx : public EventBaseSubProcess {
-        public:
-            MyTsReadEx(const tstring& args, File* out) : EventBaseSubProcess(args), out(out) {}
-        protected:
-            File* out;
-            virtual void onOut(bool isErr, MemoryChunk mc) {
-                if (!isErr && out) out->write(mc);
-            }
-        };
-        MyTsReadEx process(args, &stdoutf);
-        int exitCode = process.join();
-        if (exitCode != 0) {
-            THROWF(FormatException, "tsreadexがエラーコード(%d)を返しました", exitCode);
-        }
-        ctx.infoF(_T("tsreadex 完了: %.2f秒"), sw.getAndReset());
     }
 
     // スクランブルパケットチェック
@@ -792,12 +1279,14 @@ void DoBadThing() {
 
     if (!isNoEncode && setting.isIgnoreNoDrcsMap() == false) {
         // DRCSマッピングチェック
-        if (ctx.getErrorCount(AMT_ERR_NO_DRCS_MAP) > 0) {
+        if ((setting.isSubtitlesEnabled() ? noDrcsMapCount : 0) > 0) {
             THROW(NoDrcsMapException, "マッピングにないDRCS外字あり正常に字幕処理できなかったため終了します");
         }
     }
 
-    reformInfo.prepare(setting.isSplitSub(), setting.isEncodeAudio(), setting.getFormat() == FORMAT_TSREPLACE);
+    if (!isReusingTmp) {
+        reformInfo.prepare(setting.isSplitSub(), setting.isEncodeAudio(), setting.getFormat() == FORMAT_TSREPLACE);
+    }
 
     time_t startTime = reformInfo.getFirstFrameTime();
 
@@ -823,6 +1312,9 @@ void DoBadThing() {
     std::vector<std::unique_ptr<CMAnalyze>> cmanalyze;
 
     // ソースファイル読み込み用データ保存
+    if (isReusingTmp) {
+        ctx.info(_T("[一時ファイル再利用] 現在の設定でソースファイル読み込み用データを再生成します"));
+    }
     for (int videoFileIndex = 0; videoFileIndex < numVideoFiles; videoFileIndex++) {
         // ファイル読み込み情報を保存
         auto& fmt = reformInfo.getFormat(EncodeFileKey(videoFileIndex, 0));
@@ -839,28 +1331,37 @@ void DoBadThing() {
     }
 
     // ロゴ・CM解析
-    rm.wait(HOST_CMD_CMAnalyze);
-    ctx.infoF(_T("[ロゴ・CM解析]"));
-    sw.start();
+    if (!isReusingTmp) {
+        rm.wait(HOST_CMD_CMAnalyze);
+        ctx.infoF(_T("[ロゴ・CM解析]"));
+        sw.start();
+    } else {
+        ctx.info(_T("[一時ファイル再利用] ロゴ・CM解析結果を再利用します"));
+    }
     std::vector<std::pair<size_t, bool>> logoFound;
     std::vector<std::unique_ptr<MakeChapter>> chapterMakers(numVideoFiles);
     for (int videoFileIndex = 0; videoFileIndex < numVideoFiles; videoFileIndex++) {
         cmanalyze.push_back(std::make_unique<CMAnalyze>(ctx, setting));
-        const auto& inputVideofmt = reformInfo.getFormat(EncodeFileKey(videoFileIndex, 0)).videoFormat;
         const int numFrames = (int)reformInfo.getFilterSourceFrames(videoFileIndex).size();
         const bool delogoEnabled = setting.isNoDelogo() ? false : true;
         // チャプター解析は300フレーム（約10秒）以上ある場合だけ
         //（短すぎるとエラーになることがあるので
         const bool analyzeChapterAndCM = (setting.isChapterEnabled() && numFrames >= 300);
         CMAnalyze *cma = cmanalyze.back().get();
-        if (analyzeChapterAndCM || delogoEnabled) {
-            cma->analyze(serviceId, videoFileIndex, inputVideofmt, numFrames, analyzeChapterAndCM);
-        }
+        if (isReusingTmp) {
+            const auto& resumeVideo = resumeInfo.videos[videoFileIndex];
+            cma->restore(resumeVideo.logoPath, resumeVideo.trims, resumeVideo.divs, numFrames);
+        } else {
+            const auto& inputVideofmt = reformInfo.getFormat(EncodeFileKey(videoFileIndex, 0)).videoFormat;
+            if (analyzeChapterAndCM || delogoEnabled) {
+                cma->analyze(serviceId, videoFileIndex, inputVideofmt, numFrames, analyzeChapterAndCM);
+            }
 
-        if (analyzeChapterAndCM && setting.isPmtCutEnabled()) {
-            // PMT変更によるCM追加認識
-            cma->applyPmtCut(numFrames, setting.getPmtCutSideRate(),
-                reformInfo.getPidChangedList(videoFileIndex));
+            if (analyzeChapterAndCM && setting.isPmtCutEnabled()) {
+                // PMT変更によるCM追加認識
+                cma->applyPmtCut(numFrames, setting.getPmtCutSideRate(),
+                    reformInfo.getPidChangedList(videoFileIndex));
+            }
         }
 
         if (videoFileIndex == mainFileIndex) {
@@ -890,6 +1391,12 @@ void DoBadThing() {
             THROW(NoLogoException, "マッチするロゴが見つかりませんでした");
         }
         ctx.infoF(_T("ロゴ・CM解析完了: %.2f秒"), sw.getAndReset());
+    }
+
+    if (setting.isNoRemoveTmp()) {
+        saveResumeFiles(ctx, setting, reformInfo, cmanalyze,
+            serviceId, numTotalPackets, numScramblePackets, totalIntVideoSize, srcFileSize,
+            noDrcsMapCount, captionsParsed);
     }
 
     if (isNoEncode) {
@@ -941,6 +1448,7 @@ void DoBadThing() {
         tstring srtPath;
         tstring vttPath;
         std::unique_ptr<StdRedirectedSubProcess> process;
+        int exitCode = -1; // join()の結果 (-1: 未実行)
     };
     std::vector<WhisperTask> whisperTasks;
     std::vector<int> whisperLocalIndex(keys.size(), 0);
@@ -1007,6 +1515,7 @@ void DoBadThing() {
         }
     }
 
+    std::vector<PsisiarcTask> psisiarcTasks;
     ctx.info(_T("[字幕ファイル生成]"));
     for (int i = 0; i < (int)keys.size(); i++) {
         auto key = keys[i];
@@ -1038,7 +1547,7 @@ void DoBadThing() {
         // 字幕構築 + (必要なら) WebVTT生成
         try {
             if (setting.isWebVTTEnabled()) {
-                reformInfo.genWebVTT(key, setting);
+                reformInfo.genWebVTT(key, setting, psisiarcTasks);
             }
         } catch (const Exception& e) {
             ctx.warnF(_T("WebVTT生成に失敗: %s"), e.message());
@@ -1092,7 +1601,7 @@ void DoBadThing() {
                         const auto vttPath = setting.getTmpWhisperVttPath(entry.key, entry.localIndex);
 
                         if (setting.isWhisperParallelEnabled()) {
-                            // 並列実行: ここではタスクだけ登録し、実際のプロセス起動はエンコード直前に行う
+                            // エンコードと並列実行: ここではタスクだけ登録し、別スレッドで直列実行する
                             WhisperTask task;
                             task.keyIndex = i;
                             task.key = entry.key;
@@ -1140,6 +1649,47 @@ void DoBadThing() {
     ctx.infoF(_T("字幕ファイル生成完了: %.2f秒"), sw.getAndReset());
 
     auto argGen = std::unique_ptr<EncoderArgumentGenerator>(new EncoderArgumentGenerator(setting, reformInfo));
+
+    // Whisper並列実行時は、別スレッドでwhisperTasksを直列実行する
+    std::unique_ptr<std::thread> whisperThread;
+    if (setting.isWhisperParallelEnabled() && !whisperTasks.empty()) {
+        whisperThread = std::make_unique<std::thread>([&ctx, &whisperTasks]() {
+            SubtitleGenerator whisperGen(ctx);
+            for (auto& task : whisperTasks) {
+                task.process = whisperGen.startWhisperProcess(task.param);
+                task.exitCode = task.process->join();
+            }
+        });
+    }
+
+    // psisiarcは専用スレッドでタスクを直列実行し、映像エンコードと並行させる。
+    std::unique_ptr<std::thread> psisiarcThread;
+    if (!psisiarcTasks.empty()) {
+        psisiarcThread = std::make_unique<std::thread>([&psisiarcTasks]() {
+            for (auto& task : psisiarcTasks) {
+                // 例外がスレッド外へ漏れるとterminateするため、タスク単位で捕捉して継続する。
+                // ログはスレッドセーフでないため出さず、同期時にまとめて報告する。
+                try {
+                    task.process = std::make_unique<StdRedirectedSubProcess>(
+                        task.cmd, 0, false, false, true);
+                    task.exitCode = task.process->join();
+                } catch (const Exception& e) {
+                    task.errorMessage = e.message();
+                } catch (...) {
+                    task.errorMessage = _T("不明なエラー");
+                }
+            }
+        });
+    }
+    // エンコード中の例外でunwindする場合もjoinを保証し、joinable時のterminateを防ぐ。
+    struct PsisiarcThreadJoiner {
+        std::unique_ptr<std::thread>& thread;
+        ~PsisiarcThreadJoiner() {
+            if (thread && thread->joinable()) {
+                thread->join();
+            }
+        }
+    } psisiarcThreadJoiner{ psisiarcThread };
 
     sw.start();
     for (int i = 0; i < (int)keys.size(); i++) {
@@ -1221,16 +1771,6 @@ void DoBadThing() {
                 return std::unique_ptr<AMTFilterSource>(new AMTFilterSource(ctx, filterSource));
             };
 
-            // Whisper並列実行時は、最初のキーのエンコード直前にすべてのWhisperタスクを起動する
-            if (setting.isWhisperParallelEnabled() && i == 0 && !whisperTasks.empty()) {
-                SubtitleGenerator whisperGen(ctx);
-                for (auto& task : whisperTasks) {
-                    if (!task.process) {
-                        task.process = whisperGen.startWhisperProcess(task.param);
-                    }
-                }
-            }
-
             encoder.encode(filterClip, outfmt,
                 timeCodes, *argGen, passList, bitrateZones, vfrBitrateScale,
                 baseTimecodePath, fileOut.vfrTimingFps, baseOutputPath,
@@ -1244,14 +1784,18 @@ void DoBadThing() {
 
     argGen = nullptr;
 
-    // Whisper並列実行時はここで完了待ち＆ログ出力を行う
+    // Whisper並列実行時はここでバックグラウンドスレッドの完了待ち＆ログ出力を行う
     if (setting.isWhisperParallelEnabled() && !whisperTasks.empty()) {
-        ctx.info(_T("[Whisper字幕生成: 並列処理の完了待ち]"));
+        if (whisperThread && whisperThread->joinable()) {
+            ctx.info(_T("[Whisper字幕生成: バックグラウンド処理の完了待ち]"));
+            whisperThread->join();
+            whisperThread.reset();
+        }
         for (auto& task : whisperTasks) {
             if (!task.process) {
                 continue;
             }
-            int ret = task.process->join();
+            const int ret = task.exitCode;
 
             const auto& lines = task.process->getCapturedLines();
             if (!lines.empty()) {
@@ -1278,6 +1822,39 @@ void DoBadThing() {
             }
             if (rgy_file_exists(task.vttPath) && rgy_get_filesize(task.vttPath.c_str(), &filesize) && filesize == 0) {
                 rgy_file_remove(task.vttPath.c_str());
+            }
+        }
+    }
+
+    // muxがpscを読む前にpsisiarcの完了を待ち、捕捉した出力をまとめて記録する。
+    if (!psisiarcTasks.empty()) {
+        if (psisiarcThread && psisiarcThread->joinable()) {
+            ctx.info(_T("[psisiarc: バックグラウンド処理の完了待ち]"));
+            psisiarcThread->join();
+            psisiarcThread.reset();
+        }
+        for (auto& task : psisiarcTasks) {
+            if (!task.errorMessage.empty()) {
+                ctx.warnF(_T("psisiarcの実行に失敗: %s"), task.errorMessage.c_str());
+                continue;
+            }
+            if (!task.process) {
+                continue;
+            }
+            const auto& lines = task.process->getCapturedLines();
+            if (!lines.empty()) {
+                ctx.info(_T("↓↓↓↓↓↓psisiarc出力↓↓↓↓↓↓"));
+                for (const auto& line : lines) {
+                    std::vector<char> buffer = line;
+                    if (buffer.empty() || buffer.back() != '\0') {
+                        buffer.push_back('\0');
+                    }
+                    ctx.infoF(_T("%s"), char_to_tstring(buffer.data()));
+                }
+                ctx.info(_T("↑↑↑↑↑↑psisiarc出力↑↑↑↑↑↑"));
+            }
+            if (task.exitCode != 0) {
+                ctx.warnF(_T("psisiarcがエラーコード(%d)を返しました"), task.exitCode);
             }
         }
     }
