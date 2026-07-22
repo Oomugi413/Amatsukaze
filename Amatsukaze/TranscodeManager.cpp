@@ -720,6 +720,39 @@ void AMTSplitter::readAll() {
         tsreadex.reset(new TsReadExPipe(ctx, setting_));
     }
     srcFileSize_ = srcfile.size();
+    const auto retryServiceSelection = [&]() {
+        if (!needsServiceSelectionRetry()) return;
+
+        // TsInfoの事前解析と同じく、まずファイル中央の情報を確認する。
+        // TsInfo側で取得できなければ、さらに先頭から1/30の位置も確認される。
+        TsInfo retryInfo(ctx);
+        retryInfo.ReadFile(setting_.getSrcFilePath().c_str());
+
+        std::vector<int> serviceIds;
+        bool serviceFound = false;
+        for (int i = 0; i < retryInfo.GetNumProgram(); i++) {
+            int programId, hasVideo, videoPid, numContent;
+            retryInfo.GetProgramInfo(i, &programId, &hasVideo, &videoPid, &numContent);
+            serviceIds.push_back(programId);
+            if (programId == setting_.getServiceId()) {
+                serviceFound = true;
+            }
+        }
+        if (!serviceFound) {
+            StringBuilder sb;
+            sb.append("サービスID: ");
+            for (int i = 0; i < (int)serviceIds.size(); i++) {
+                sb.append("%s%d", (i > 0) ? ", " : "", serviceIds[i]);
+            }
+            sb.append(" 指定サービスID: %d", setting_.getServiceId());
+            ctx.error(_T("再確認した位置にも指定されたサービスがありません"));
+            ctx.error(char_to_tstring(sb.str()));
+            THROW(FormatException, "指定されたサービスがありません");
+        }
+        ctx.infoF(_T("別位置のPATでサービス %d を確認しました。先頭からの解析を継続します"),
+            setting_.getServiceId());
+        completeServiceSelectionRetry();
+    };
     while (true) {
         // 最初のPATの判定が終わるまでは小分けに読み、同じ入力チャンク内の
         // 後続PATによって失敗状態が上書きされないようにする。
@@ -734,39 +767,11 @@ void AMTSplitter::readAll() {
             tsreadex->write(chunk);
         }
         inputTsData(chunk);
-
-        if (needsServiceSelectionRetry()) {
-            // TsInfoの事前解析と同じく、まずファイル中央の情報を確認する。
-            // TsInfo側で取得できなければ、さらに先頭から1/30の位置も確認される。
-            TsInfo retryInfo(ctx);
-            retryInfo.ReadFile(setting_.getSrcFilePath().c_str());
-
-            std::vector<int> serviceIds;
-            bool serviceFound = false;
-            for (int i = 0; i < retryInfo.GetNumProgram(); i++) {
-                int programId, hasVideo, videoPid, numContent;
-                retryInfo.GetProgramInfo(i, &programId, &hasVideo, &videoPid, &numContent);
-                serviceIds.push_back(programId);
-                if (programId == setting_.getServiceId()) {
-                    serviceFound = true;
-                }
-            }
-            if (!serviceFound) {
-                StringBuilder sb;
-                sb.append("サービスID: ");
-                for (int i = 0; i < (int)serviceIds.size(); i++) {
-                    sb.append("%s%d", (i > 0) ? ", " : "", serviceIds[i]);
-                }
-                sb.append(" 指定サービスID: %d", setting_.getServiceId());
-                ctx.error(_T("再確認した位置にも指定されたサービスがありません"));
-                ctx.error(char_to_tstring(sb.str()));
-                THROW(FormatException, "指定されたサービスがありません");
-            }
-            ctx.infoF(_T("別位置のPATでサービス %d を確認しました。先頭からの解析を継続します"),
-                setting_.getServiceId());
-            completeServiceSelectionRetry();
-        }
+        retryServiceSelection();
     }
+    // inputTsData()の内部に残った最終TSパケットをEOF時にも処理する。
+    flush();
+    retryServiceSelection();
     if (setting_.getServiceId() > 0 && getActualServiceId() != setting_.getServiceId()) {
         THROW(FormatException, "指定されたサービスがありません");
     }
