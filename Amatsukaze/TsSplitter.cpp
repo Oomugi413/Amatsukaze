@@ -327,12 +327,27 @@ void TsSplitter::reset() {
     initPhase = PMT_WAITING;
     preferedServiceId = -1;
     selectedServiceId = -1;
+    serviceSelectionRetryEnabled = false;
+    serviceSelectionRetryRequested = false;
+    serviceSelectionRetryCompleted = false;
     tsPacketParser.setEnableBuffering(true);
 }
 
 // 0以下で指定無効
 void TsSplitter::setServiceId(int sid) {
     preferedServiceId = sid;
+}
+
+void TsSplitter::setServiceSelectionRetryEnabled(bool enable) {
+    serviceSelectionRetryEnabled = enable;
+}
+
+bool TsSplitter::needsServiceSelectionRetry() const {
+    return serviceSelectionRetryRequested && !serviceSelectionRetryCompleted && selectedServiceId < 0;
+}
+
+void TsSplitter::completeServiceSelectionRetry() {
+    serviceSelectionRetryCompleted = true;
 }
 
 int TsSplitter::getActualServiceId() {
@@ -428,6 +443,16 @@ TsSplitter::SpCaptionParser::SpCaptionParser(AMTContext&ctx, TsSplitter& this_)
         }
     }
     if (preferedServiceId > 0) {
+        // 録画開始直後には、NITだけでサービスを含まない過渡的なPATが入ることがある。
+        // エンコード処理では別位置のPATを確認するまでエラーを保留する。
+        if (serviceSelectionRetryEnabled) {
+            if (!serviceSelectionRetryRequested) {
+                ctx.warnF(_T("最初のPATに指定サービス %d がないため、別位置で再確認します"), preferedServiceId);
+                serviceSelectionRetryRequested = true;
+            }
+            return -1;
+        }
+
         // サービス指定があるのに該当サービスがなかったらエラーとする
         StringBuilder sb;
         sb.append("サービスID: ");
@@ -437,7 +462,12 @@ TsSplitter::SpCaptionParser::SpCaptionParser(AMTContext&ctx, TsSplitter& this_)
         sb.append(" 指定サービスID: %d", preferedServiceId);
         ctx.error(_T("指定されたサービスがありません"));
         ctx.error(char_to_tstring(sb.str()));
-        //THROW(InvalidOperationException, "failed to select service");
+        return -1;
+    }
+    if (pids.empty()) {
+        // NITだけのPATでは選択できるサービスがないため、次のPAT更新を待つ
+        ctx.warn(_T("PATにサービスがありません"));
+        return -1;
     }
     selectedServiceId = pids[0];
     ctx.infoF(_T("サービス %d を選択（指定がありませんでした）"), selectedServiceId);
