@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.6
+
 # Amatsukaze Dockerfile
 # Ubuntu 24.04 ベースで Amatsukaze を実行するためのマルチステージビルド
 # デバッグモードとリリースモードの両方に対応
@@ -52,6 +54,9 @@ RUN apt-get update && apt-get install -y \
     autoconf \
     automake \
     libtool \
+    yasm \
+    locales \
+    software-properties-common \
     openssl \
     zlib1g \
     libz-dev \
@@ -59,6 +64,13 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean \
     && apt-get autoremove -y
+
+# AmatsukazeServer / WebUI のビルドに必要な .NET SDK をインストール
+RUN add-apt-repository ppa:dotnet/backports \
+    && apt-get update \
+    && apt-get install -y dotnet-sdk-10.0 \
+    && dotnet workload install wasm-tools --skip-manifest-update \
+    && rm -rf /var/lib/apt/lists/*
 
 # AviSynth+ のインストール
 RUN wget https://github.com/rigaya/AviSynthCUDAFilters/releases/download/${AVISYNTHCUDAFILTERS_VER}/avisynth_${AVISYNTH_VER}-1_${ARCH}_Ubuntu${UBUNTU_VERSION}.deb -O avisynth.deb \
@@ -194,6 +206,32 @@ RUN rm -rf /tmp/plugins \
     && rm -rf /usr/share/man/* \
     && rm -rf /usr/share/locale/* \
     && rm -rf /usr/share/info/*
+
+# Amatsukaze本体の依存ライブラリはソースより先にビルドし、Dockerレイヤーへキャッシュする。
+# ソースコードだけを変更した通常の再ビルドでは、この重い依存ビルドは再実行されない。
+COPY scripts/build_dep.sh scripts/mfx.diff /tmp/amatsukaze-build-scripts/scripts/
+RUN mkdir -p /tmp/amatsukaze-deps /amt \
+    && cd /tmp/amatsukaze-deps \
+    && /tmp/amatsukaze-build-scripts/scripts/build_dep.sh /amt \
+    && rm -rf /tmp/amatsukaze-deps /tmp/amatsukaze-build-scripts
+
+ENV AMT_BASELIBS_DIR=/amt/baselibs
+ENV AMT_PKGCONFIG_FFNK_DIR=/amt/ffmpeg_nekopanda/build/lib/pkgconfig
+ENV AMT_PKGCONFIG_FF612_DIR=/amt/ffmpeg_612/build/lib/pkgconfig
+
+# cloneしたローカル作業ツリーを唯一のAmatsukazeソースとして使用する。
+# .gitは.dockerignoreで除外するため、バージョン生成用の最小Git履歴をコンテナ内で作る。
+COPY . /src/Amatsukaze
+RUN cd /src/Amatsukaze \
+    && git init \
+    && git config user.name "Amatsukaze Docker Build" \
+    && git config user.email "docker-build@localhost" \
+    && git add -A \
+    && git commit -m "Local Docker build source" \
+    && git tag 0.0.0 \
+    && ./scripts/build.sh /opt/amatsukaze /tmp/amatsukaze-build \
+    && ./scripts/install.sh /opt/amatsukaze \
+    && rm -rf /tmp/amatsukaze-build /src/Amatsukaze/.git
 
 # 実行段階
 FROM nvidia/cuda:12.8.1-base-ubuntu24.04 AS runtime
@@ -402,11 +440,18 @@ COPY --from=builder /usr/local/lib /usr/local/lib
 COPY --from=builder /usr/local/bin /usr/local/bin
 COPY --from=builder /usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu
 
-# Amatsukaze のインストール
-RUN curl -s https://api.github.com/repos/rigaya/Amatsukaze/releases/latest \
-        | grep "browser_download_url.*tar.xz" | grep "Ubuntu${UBUNTU_VERSION}" | cut -d : -f 2,3 | tr -d \" \
-        | wget -i - -O - | tar -xJ -C /app \
-        && if [ -f /app/scripts/install.sh ]; then /app/scripts/install.sh; fi
+# ローカルソースからビルドしたAmatsukazeをインストール
+COPY --from=builder /opt/amatsukaze/ /app/
+
+# CUDAフィルタを含む実行段階の全パッケージが揃った後で、AviSynthプラグインへのリンクを作成する。
+# 必須プラグインが欠けたイメージを生成しないよう、リンク先の存在もここで検証する。
+RUN /app/scripts/install.sh /app \
+    && for plugin in \
+        KUtil.so KFM.so KNNEDI3.so KTGMC.so AvsCUDA.so mt_masktools.so \
+        libmvtools2.so libmasktools2.so libnnedi3.so libtivtc.so libtdeint.so librgtools.so; do \
+        test -e "/app/exe_files/plugins64/${plugin}" || exit 1; \
+    done \
+    && ls /app/exe_files/plugins64/libyadifmod2*.so >/dev/null 2>&1
 
 # for debug
 #COPY Amatsukaze_Ubuntu24.04_r926.tar.xz /app
@@ -472,4 +517,4 @@ RUN sed -i 's/\r$//' /app/entrypoint.sh \
 
 # デフォルトコマンド（モードに応じて切り替え）
 ENTRYPOINT ["./entrypoint.sh"]
-CMD if [ "$BUILD_MODE" = "debug" ]; then /bin/bash; else ./AmatsukazeServer.sh; fi
+CMD ["/bin/sh", "-c", "if [ \"$BUILD_MODE\" = \"debug\" ]; then exec /bin/bash; else exec ./AmatsukazeServer.sh; fi"]
