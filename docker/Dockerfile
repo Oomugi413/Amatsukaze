@@ -31,7 +31,7 @@ ENV RGTOOLS_VER=1.2
 ENV GPAC_VER=v2.4.0
 ENV LSMASH_REV=18a9ed25c7ff79a7f4f4bf850c345c72179b8998
 ENV CHAPTER_EXE_REV=32880d45f088e574285a101e6a49b032bb04f6ea
-ENV JOIN_LOGO_SCP_VER=Ver4.1.0_Linux
+ENV JOIN_LOGO_SCP_VER=v5.1.1
 ENV FDK_AAC_REV=d8e6b1a3aa606c450241632b64b703f21ea31ce3
 ENV FDKAAC_VER=v1.0.6
 ENV TSREADEX_VER=master-240517
@@ -158,9 +158,9 @@ RUN git clone https://github.com/rigaya/chapter_exe \
     && install -D -t /usr/local/bin chapter_exe
 
 # join_logo_scp
-RUN git clone --depth=1 --branch ${JOIN_LOGO_SCP_VER} https://github.com/tobitti0/join_logo_scp \
+RUN git clone --depth=1 --branch ${JOIN_LOGO_SCP_VER} https://github.com/yobibi/join_logo_scp \
     && cd join_logo_scp/src \
-    && make -j$(nproc) \
+    && make \
     && install -D -t /usr/local/bin join_logo_scp
 
 # 音声エンコーダ
@@ -261,9 +261,9 @@ ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics
 ENV VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_egl_icd.json
 
-ENV QSVENCC_VER=8.07
-ENV NVENCC_VER=9.13
-ENV VCEENCC_VER=9.05
+ENV QSVENCC_VER=8.22
+ENV NVENCC_VER=9.25
+ENV VCEENCC_VER=9.08
 ENV AMDGPU_INSTALL_VER=25.35.1
 ENV AMDGPU_INSTALL_DEB_VER=7.2.1.70201-1
 ENV TSREPLACE_VER=0.19
@@ -427,9 +427,9 @@ RUN git clone --depth 1 -b 0.04 https://github.com/rigaya/SCRenamePy.git tmp_SCR
     && mv tmp_SCRenamePy/SCRename.* exe_files/SCRenamePy/ \
     && rm -rf tmp_SCRenamePy
 
-RUN wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260711-071204/x264_3223_amd64_linux.tar.xz -O x264.tar.xz \
-    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260711-071204/x265_4.2%2B37_amd64_linux.tar.xz -O x265.tar.xz \
-    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260711-071204/SvtAv1EncApp_4.1.0-291_amd64_linux_clang.tar.xz -O svt-av1.tar.xz \
+RUN wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260720-140556/x264_3223_amd64_linux.tar.xz -O x264.tar.xz \
+    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260720-140556/x265_4.2%2B37_amd64_linux.tar.xz -O x265.tar.xz \
+    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260720-140556/SvtAv1EncApp_4.2.0-15_amd64_linux_clang.tar.xz -O svt-av1.tar.xz \
     && tar -xf x264.tar.xz -C /app/exe_files \
     && tar -xf x265.tar.xz -C /app/exe_files \
     && tar -xf svt-av1.tar.xz -C /app/exe_files \

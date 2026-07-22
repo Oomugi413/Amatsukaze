@@ -868,6 +868,18 @@ namespace Amatsukaze.Server
             return GetLogoFilePath(fileName);
         }
 
+        internal void DeleteLogoFileForRest(string fileName)
+        {
+            if (string.IsNullOrEmpty(fileName) || fileName == LogoSetting.NO_LOGO ||
+                Path.GetFileName(fileName) != fileName)
+            {
+                throw new IOException("不正なロゴファイル名です: " + fileName);
+            }
+
+            var filePath = GetLogoFilePath(fileName);
+            File.Delete(filePath);
+        }
+
         private string GetJLDirectoryPath()
         {
             return Path.GetFullPath("JL");
@@ -2337,12 +2349,22 @@ namespace Amatsukaze.Server
                     if (profile.EnableWebVTT)
                     {
                         sb.Append(" --webvtt");
-                        sb.Append(" --tsreadex \"")
-                            .Append(setting.TsReadExPath)
-                            .Append("\" --b24tovtt \"")
+                        sb.Append(" --b24tovtt \"")
                             .Append(setting.B24ToVttPath)
                             .Append("\" --psisiarc \"")
                             .Append(setting.PsisiarcPath)
+                            .Append("\"");
+                    }
+                }
+
+                // 一時ファイルを残す元タスクでtsreadex_dump.txtを生成しておく。
+                // 再投入時にも、dumpがなければ通常処理へ戻って生成できるようパスを渡す。
+                if (profile.EnableWebVTT || profile.NoRemoveTmp || !string.IsNullOrEmpty(resumeDir))
+                {
+                    if (!string.IsNullOrEmpty(setting.TsReadExPath))
+                    {
+                        sb.Append(" --tsreadex \"")
+                            .Append(setting.TsReadExPath)
                             .Append("\"");
                     }
                 }
