@@ -17,6 +17,9 @@ services:
           # Amatsukazeを実行するユーザーIDとグループIDを指定
           - RUN_UID=1000
           - RUN_GID=1000
+          - NVIDIA_VISIBLE_DEVICES=all
+          - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics
+          - VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_egl_icd.json
         volumes:
           - ./avs:/app/avs
           - ./bat:/app/bat
@@ -28,7 +31,8 @@ services:
           - ./profile:/app/profile
           - ./input:/app/input
           - ./output:/app/output
-          - /tmp:/tmp
+          - ./tmp:/app/tmp
+          - /mnt:/mnt
         # QSVEncC/VCEEncCを使うための設定
         # /dev/driが環境にない場合は無効化が必要
         devices:
@@ -42,4 +46,4 @@ services:
               devices:
                 - driver: nvidia
                   count: all
-                  capabilities: [compute, utility, video]
+                  capabilities: [compute, utility, video, graphics]

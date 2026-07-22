@@ -1,0 +1,30 @@
+# Dockerイメージ内で再生成するもの
+.git/
+build/
+x64/
+**/bin/
+**/obj/
+**/.vs/
+
+# エージェント・エディタの作業データ
+.agents/
+.claude/
+.codex/
+.vscode/
+
+# Docker実行時にbind mountする運用データ
+docker/avs/
+docker/bat/
+docker/config/
+docker/data/
+docker/drcs/
+docker/input/
+docker/JL/
+docker/logo/
+docker/output/
+docker/profile/
+docker/tmp/
+
+# ローカルログ・一時ファイル
+*.log
+*.tmp

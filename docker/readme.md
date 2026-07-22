@@ -103,20 +103,53 @@ sudo apt install intel-media-va-driver-non-free intel-opencl-icd libmfx1 libmfx-
 ## コンテナ作成用のディレクトリ構築
 
 ```sh
-git clone https://github.com/rigaya/Amatsukaze.git
+git clone --recursive https://github.com/Oomugi413/Amatsukaze.git
 cd Amatsukaze/docker
-# ディレクトリ構成の作成
+
+# デフォルト設定のコピーと、bind mount用ディレクトリの作成
 ./setup.sh
-# Amatsukazeを実行するユーザーIDとグループIDをRUN_UIDとRUN_GIDで指定
-# 必要に応じて volumes のマウント対象等を調整
-# また、環境に応じて devices や deploy を調整
+
+# 必要に応じてRUN_UID、RUN_GID、volumes、devices、deployを調整
 vi compose.yml
 ```
+
+このDockerfileはGitHub Releases APIから配布パッケージを取得せず、cloneしたローカル作業ツリーをソースとして
+AmatsukazeCLI、共有ライブラリ、サーバー、WebUIをビルドします。コミット前のローカル変更もビルド対象に含まれます。
+
+リポジトリルートがDockerのbuild contextになるため、`compose.yml` のbuild設定は次のまま使用してください。
+
+```yaml
+build:
+  context: ..
+  dockerfile: docker/Dockerfile
+```
+
+初回ビルドではFFmpeg、.NET WebAssembly workload、各種AviSynthプラグインなども構築するため、時間と空き容量が必要です。
+ビルド中はGitHub、Ubuntu、NuGetなどへのインターネット接続も必要です。依存ライブラリはDockerレイヤーに分離されるため、
+通常のソース変更後はAmatsukaze本体を中心に再ビルドされます。
 
 ## 起動
 
 ```sh
+# cloneしたローカルソースからイメージをビルド
+docker compose build
+
+# コンテナを作成・起動
 docker compose up -d
+```
+
+ソース変更を反映する場合は、エンコード中のタスクがないことを確認してから再ビルド・再作成します。
+
+```sh
+docker compose build
+docker compose up -d --force-recreate
+```
+
+依存ライブラリのバージョンやビルド手順を変更し、キャッシュを使わず完全に作り直す場合は次を実行します。
+
+```sh
+docker compose build --no-cache
+docker compose up -d --force-recreate
 ```
 
 ## 接続方法

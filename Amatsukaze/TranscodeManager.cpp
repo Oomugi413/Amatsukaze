@@ -16,6 +16,7 @@
 #include "rgy_mutex.h"
 #include "Subtitle.h"
 #include "WaveWriter.h"
+#include "TsInfo.h"
 #include <filesystem>
 
 namespace {
@@ -660,6 +661,7 @@ AMTSplitter::AMTSplitter(AMTContext& ctx, const ConfigWrapper& setting)
     , waveFileSize_(0)
     , srcFileSize_(0) {
     psWriter.setHandler(&writeHandler);
+    setServiceSelectionRetryEnabled(true);
 }
 
 StreamReformInfo AMTSplitter::split() {
@@ -701,7 +703,9 @@ int64_t AMTSplitter::StreamFileWriteHandler::getTotalSize() const {
 void AMTSplitter::readAll() {
     enum {
         BUFSIZE = 4 * 1024 * 1024,
-        BUFFER_COUNT = 4
+        BUFFER_COUNT = 4,
+        // PATは短い間隔で送出されるため、最初だけ小分けに読み、失敗を早期に検出する
+        INITIAL_READ_SIZE = 64 * 1024
     };
     ReadAheadFile srcfile(setting_.getSrcFilePath(), BUFSIZE, BUFFER_COUNT);
     // tsreplaceで一時TSを使う場合だけ、入力TSのコピーを作成する。
@@ -717,7 +721,11 @@ void AMTSplitter::readAll() {
     }
     srcFileSize_ = srcfile.size();
     while (true) {
-        const MemoryChunk chunk = srcfile.read();
+        // 最初のPATの判定が終わるまでは小分けに読み、同じ入力チャンク内の
+        // 後続PATによって失敗状態が上書きされないようにする。
+        const size_t readSize = getActualServiceId() < 0 && !needsServiceSelectionRetry()
+            ? INITIAL_READ_SIZE : BUFSIZE;
+        const MemoryChunk chunk = srcfile.read(readSize);
         if (chunk.length == 0) break;
         if (rawts) {
             rawts->write(chunk);
@@ -726,6 +734,41 @@ void AMTSplitter::readAll() {
             tsreadex->write(chunk);
         }
         inputTsData(chunk);
+
+        if (needsServiceSelectionRetry()) {
+            // TsInfoの事前解析と同じく、まずファイル中央の情報を確認する。
+            // TsInfo側で取得できなければ、さらに先頭から1/30の位置も確認される。
+            TsInfo retryInfo(ctx);
+            retryInfo.ReadFile(setting_.getSrcFilePath().c_str());
+
+            std::vector<int> serviceIds;
+            bool serviceFound = false;
+            for (int i = 0; i < retryInfo.GetNumProgram(); i++) {
+                int programId, hasVideo, videoPid, numContent;
+                retryInfo.GetProgramInfo(i, &programId, &hasVideo, &videoPid, &numContent);
+                serviceIds.push_back(programId);
+                if (programId == setting_.getServiceId()) {
+                    serviceFound = true;
+                }
+            }
+            if (!serviceFound) {
+                StringBuilder sb;
+                sb.append("サービスID: ");
+                for (int i = 0; i < (int)serviceIds.size(); i++) {
+                    sb.append("%s%d", (i > 0) ? ", " : "", serviceIds[i]);
+                }
+                sb.append(" 指定サービスID: %d", setting_.getServiceId());
+                ctx.error(_T("再確認した位置にも指定されたサービスがありません"));
+                ctx.error(char_to_tstring(sb.str()));
+                THROW(FormatException, "指定されたサービスがありません");
+            }
+            ctx.infoF(_T("別位置のPATでサービス %d を確認しました。先頭からの解析を継続します"),
+                setting_.getServiceId());
+            completeServiceSelectionRetry();
+        }
+    }
+    if (setting_.getServiceId() > 0 && getActualServiceId() != setting_.getServiceId()) {
+        THROW(FormatException, "指定されたサービスがありません");
     }
     if (tsreadex) {
         const int exitCode = tsreadex->join();
