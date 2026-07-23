@@ -233,76 +233,9 @@ RUN cd /src/Amatsukaze \
     && ./scripts/install.sh /opt/amatsukaze \
     && rm -rf /tmp/amatsukaze-build /src/Amatsukaze/.git
 
-# Blackwell向けネイティブコードを含むNVEncCのビルド段階。
-# 公式配布debはCUDA 11.2ビルドのため、CUDA 12.8環境でもsm_120向けPTX JITが必要になる。
-# CUDA 12.8のnvccでNVEncC自体をビルドし、完成したバイナリにsm_120があることも検証する。
-FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS nvencc-builder
-
-ARG NVENC_BUILD_JOBS=4
-
-ENV DEBIAN_FRONTEND=noninteractive
-ENV NVENCC_VER=9.25
-ENV CUDA_PATH=/usr/local/cuda
-ENV RUSTUP_HOME=/usr/local/rustup
-ENV CARGO_HOME=/usr/local/cargo
-ENV PATH=/usr/local/cargo/bin:${PATH}
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
-        ca-certificates \
-        curl \
-        git \
-        meson \
-        ninja-build \
-        pkg-config \
-        libssl-dev \
-        libavcodec-dev \
-        libavdevice-dev \
-        libavfilter-dev \
-        libavformat-dev \
-        libavutil-dev \
-        libswresample-dev \
-        libass-dev \
-        libplacebo-dev \
-        libvulkan-dev \
-        libx11-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# NVEncCが同梱するlibdovi/libhdr10plusのビルドには新しいRustとcargo-cが必要。
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-      | sh -s -- -y --profile minimal --default-toolchain stable \
-    && cargo install cargo-c --locked
-
-RUN git clone --depth=1 --branch "${NVENCC_VER}" --recursive https://github.com/rigaya/NVEnc.git /tmp/NVEnc \
-    && cd /tmp/NVEnc \
-    && grep -q 'arch=compute_50,code=' meson.build \
-    && grep -q 'arch=compute_61,code=' meson.build \
-    && sed -i '/arch=compute_50,code=/d; /arch=compute_61,code=/d' meson.build \
-    && ! grep -q 'arch=compute_50,code=' meson.build \
-    && ! grep -q 'arch=compute_61,code=' meson.build \
-    && meson setup build \
-        --prefix=/opt/nvencc \
-        --buildtype=release \
-        -Dnvenc_dev_ptx=false \
-        -Denable_vapoursynth=false \
-        -Denable_avisynth=false \
-        -Denable_libass=true \
-        -Denable_libplacebo=enabled \
-        -Dlibplacebo_static=false \
-        -Denable_vmaf=disabled \
-        -Denable_libvship=disabled \
-        -Denable_vulkan=enabled \
-        -Denable_onnxruntime=disabled \
-    && meson compile -C build -j"${NVENC_BUILD_JOBS}" \
-    && meson install -C build \
-    && test -x /opt/nvencc/bin/nvencc \
-    && /usr/local/cuda/bin/cuobjdump --list-elf /opt/nvencc/bin/nvencc > /tmp/nvencc-cubins.txt \
-    && grep -q 'sm_75' /tmp/nvencc-cubins.txt \
-    && grep -q 'sm_86' /tmp/nvencc-cubins.txt \
-    && grep -q 'sm_120' /tmp/nvencc-cubins.txt
-
 # 実行段階
-FROM nvidia/cuda:12.8.1-base-ubuntu24.04 AS runtime
+# NVEncC 9.25.1のビルドに使用されたCUDAと実行時ライブラリの版を揃える。
+FROM nvidia/cuda:13.3.0-base-ubuntu24.04 AS runtime
 
 # 変数の定義（実行段階でも使用）
 ARG UBUNTU_VERSION=24.04
@@ -330,7 +263,7 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics
 ENV VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_egl_icd.json
 
 ENV QSVENCC_VER=8.22
-ENV NVENCC_VER=9.25
+ENV NVENCC_VER=9.25.1
 ENV VCEENCC_VER=9.08
 ENV AMDGPU_INSTALL_VER=25.35.1
 ENV AMDGPU_INSTALL_DEB_VER=7.2.1.70201-1
@@ -382,18 +315,19 @@ RUN apt-get update && apt-get install -y \
         locales \
         openssl \
         zlib1g \
-        ffmpeg \
-        libass9 \
         mkvtoolnix \
         opus-tools \
         libvulkan1 \
         libplacebo-dev \
         vulkan-tools \
         intel-media-va-driver-non-free intel-opencl-icd libigfxcmrt7 libmfx1 libmfx-gen1.2 libva-drm2 libva-x11-2 ocl-icd-opencl-dev \
-        cuda-nvrtc-12-5 cuda-nvrtc-dev-12-5 libnpp-12-5 \
+        cuda-nvrtc-13-3 cuda-nvrtc-dev-13-3 libnpp-13-3 \
     && wget https://github.com/rigaya/QSVEnc/releases/download/${QSVENCC_VER}/qsvencc_${QSVENCC_VER}_${ARCH}.deb -O qsvencc.deb \
         && apt-get install -y ./qsvencc.deb \
         && rm ./qsvencc.deb \
+    && wget https://github.com/Oomugi413/NVEnc/releases/download/${NVENCC_VER}/nvencc_${NVENCC_VER}_${ARCH}.deb -O nvencc.deb \
+        && apt-get install -y ./nvencc.deb \
+        && rm ./nvencc.deb \
     && if [ "$ENABLE_VCEENCC" = "1" ]; then \
         wget https://github.com/rigaya/VCEEnc/releases/download/${VCEENCC_VER}/vceencc_${VCEENCC_VER}_${ARCH}.deb -O vceencc.deb \
         && apt-get install -y ./vceencc.deb \
@@ -506,10 +440,6 @@ RUN wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/a
 COPY --from=builder /usr/local/lib /usr/local/lib
 COPY --from=builder /usr/local/bin /usr/local/bin
 COPY --from=builder /usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu
-
-# CUDA 12.8でビルドし、sm_120を含むことを検証済みのNVEncCを使用する。
-COPY --from=nvencc-builder /opt/nvencc/bin/nvencc /usr/local/bin/nvencc
-RUN ln -sf /usr/local/bin/nvencc /usr/bin/nvencc
 
 # ローカルソースからビルドしたAmatsukazeをインストール
 COPY --from=builder /opt/amatsukaze/ /app/
