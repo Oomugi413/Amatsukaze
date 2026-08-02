@@ -511,7 +511,7 @@ RUN set -eux;     test -f /usr/local/cuda/targets/x86_64-linux/include/nvml.h;  
     meson setup build         --prefix=/usr/local         --buildtype=release         -Denable_libplacebo=enabled         -Denable_vulkan=enabled         -Dlibplacebo_static=false         -Denable_avisynth=true         -Denable_vapoursynth=false         -Denable_libass=true         -Denable_vmaf=disabled         -Denable_libvship=disabled;     meson compile -C build -j"${NVENC_BUILD_JOBS:-2}" -v;     meson install -C build || true;     if [ -x /tmp/NVEnc/build/nvencc ]; then install -m 755 /tmp/NVEnc/build/nvencc /usr/local/bin/nvencc; fi;     test -x /usr/local/bin/nvencc;     rm -rf /tmp/NVEnc;     ln -sf /usr/local/bin/nvencc /usr/bin/nvencc;     ldconfig;     /usr/bin/nvencc --check-environment || true
 
 # Amatsukazeのインストール
-RUN curl -s https://api.github.com/repos/rigaya/Amatsukaze/releases/latest \
+RUN curl -s https://api.github.com/repos/Oomugi413/Amatsukaze/releases/latest \
         | grep "browser_download_url.*tar.xz" | grep "Ubuntu${UBUNTU_VERSION}" | cut -d : -f 2,3 | tr -d \" \
         | wget -i - -O - | tar -xJ -C /app \
         && if [ -f /app/scripts/install.sh ]; then /app/scripts/install.sh; fi

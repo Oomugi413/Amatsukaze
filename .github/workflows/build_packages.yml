@@ -1,5 +1,8 @@
 name: Build Linux Packages
 
+permissions:
+  contents: write
+
 on:
   push:
     branches:
@@ -76,10 +79,11 @@ jobs:
       - name: Build Exec
         id: build_exec
         run: |
+          GHCR_OWNER=$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           # Ensure latest base image tag is pulled (avoid stale cache)
-          docker pull ghcr.io/${{ github.repository_owner }}/amatsukaze-builder:${{ matrix.dockerimg }} || true
+          docker pull ghcr.io/${GHCR_OWNER}/amatsukaze-builder:${{ matrix.dockerimg }} || true
           docker build \
-            --build-arg GHCR_OWNER=${{ github.repository_owner }} \
+            --build-arg GHCR_OWNER=${GHCR_OWNER} \
             --tag ${{ steps.prep.outputs.tagged_image }} \
             --platform linux/${{ matrix.arch }} \
             --file ${{ env.DOCKER_FILE }} ./

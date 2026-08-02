@@ -93,7 +93,7 @@ sudo apt install intel-media-va-driver-non-free intel-opencl-icd libmfx1 libmfx-
   UBUNTU_VERSION=24.04
   # /usr/local/bin/にインストールする例
   mkdir -p /tmp/Amatsukaze \
-    && curl -s https://api.github.com/repos/rigaya/Amatsukaze/releases/latest \
+    && curl -s https://api.github.com/repos/Oomugi413/Amatsukaze/releases/latest \
         | grep "browser_download_url.*tar.xz" | grep "Ubuntu${UBUNTU_VERSION}" | cut -d : -f 2,3 | tr -d \" \
         | wget -i - -O - | tar -xJ -C /tmp/Amatsukaze \
     && sudo install /tmp/Amatsukaze/exe_files/AmatsukazeAddTask /usr/local/bin/ \
