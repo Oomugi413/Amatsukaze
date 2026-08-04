@@ -44,7 +44,7 @@ sudo apt install -y ./avisynth_<version>_amd64_Ubuntuxx.xx.deb
 - インストール先への実行ファイルの配置
 
 ```bash
-git clone https://github.com/rigaya/Amatsukaze.git --recursive
+git clone https://github.com/Oomugi413/Amatsukaze.git --recursive
 cd Amatsukaze
 ./scripts/build.sh $HOME/Amatsukaze
 ```
