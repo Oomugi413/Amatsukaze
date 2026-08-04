@@ -10,6 +10,7 @@
 #include "ComputeKernel.h"
 #include "ComputeKernelSIMD.h"
 #include <algorithm>
+#include <cassert>
 
 float CalcCorrelation5x5_AVX2(const float* k, const float* Y, int x, int y, int w, float* pavg) {
     return CalcCorrelation5x5_AVX_AVX2<true>(k, Y, x, y, w, pavg);
@@ -40,8 +41,6 @@ void removeLogoLineAVX2(float *dst, const float *src, const int srcStride, const
     }
 }
 
-namespace {
-
 constexpr int kTryEstimateBgHorizontalLoadBytes = 64;
 
 static const uint8_t TryEstimateBgValidMaskFFThen00[kTryEstimateBgHorizontalLoadBytes * 2] = {
@@ -63,20 +62,6 @@ RGY_FORCEINLINE uint32_t HorizontalSumEpi16(const __m128i v) {
     return (uint32_t)_mm_extract_epi16(v3, 0);
 }
 
-RGY_FORCEINLINE uint8_t ReduceMin16xU8(__m128i v) {
-    const __m128i vw = _mm_min_epu16(v, _mm_srli_epi16(v, 8));
-    const __m128i minPos = _mm_minpos_epu16(vw);
-    return (uint8_t)_mm_extract_epi16(minPos, 0);
-}
-
-RGY_FORCEINLINE uint8_t ReduceMax16xU8(__m128i v) {
-    const __m128i zero = _mm_setzero_si128();
-    const __m128i vff = _mm_cmpeq_epi16(zero, zero);
-    const __m128i vinv = _mm_xor_si128(v, vff);
-    const uint8_t vmininv = ReduceMin16xU8(vinv);
-    return ~vmininv;
-}
-
 RGY_FORCEINLINE uint32_t Sum64BytesToU32(const __m256i v0, const __m256i v1) {
     const __m256i zero = _mm256_setzero_si256();
     const __m256i sum16 =
@@ -86,13 +71,21 @@ RGY_FORCEINLINE uint32_t Sum64BytesToU32(const __m256i v0, const __m256i v1) {
     return HorizontalSumEpi16(_mm_add_epi16(_mm256_castsi256_si128(sum16), _mm256_extracti128_si256(sum16, 1)));
 }
 
-RGY_FORCEINLINE void MinMax64BytesToScalar(const __m256i v0, const __m256i v1, uint8_t& minvOut, uint8_t& maxvOut) {
+RGY_FORCEINLINE void MinMax64BytesToScalarAccurate(const __m256i v0, const __m256i v1, uint8_t& minvOut, uint8_t& maxvOut) {
     const __m256i vmin8 = _mm256_min_epu8(v0, v1);
     const __m256i vmax8 = _mm256_max_epu8(v0, v1);
-    const __m128i min128 = _mm_min_epu8(_mm256_castsi256_si128(vmin8), _mm256_extracti128_si256(vmin8, 1));
-    const __m128i max128 = _mm_max_epu8(_mm256_castsi256_si128(vmax8), _mm256_extracti128_si256(vmax8, 1));
-    minvOut = ReduceMin16xU8(min128);
-    maxvOut = ReduceMax16xU8(max128);
+    __m128i min128 = _mm_min_epu8(_mm256_castsi256_si128(vmin8), _mm256_extracti128_si256(vmin8, 1));
+    __m128i max128 = _mm_max_epu8(_mm256_castsi256_si128(vmax8), _mm256_extracti128_si256(vmax8, 1));
+    min128 = _mm_min_epu8(min128, _mm_srli_si128(min128, 8));
+    max128 = _mm_max_epu8(max128, _mm_srli_si128(max128, 8));
+    min128 = _mm_min_epu8(min128, _mm_srli_si128(min128, 4));
+    max128 = _mm_max_epu8(max128, _mm_srli_si128(max128, 4));
+    min128 = _mm_min_epu8(min128, _mm_srli_si128(min128, 2));
+    max128 = _mm_max_epu8(max128, _mm_srli_si128(max128, 2));
+    min128 = _mm_min_epu8(min128, _mm_srli_si128(min128, 1));
+    max128 = _mm_max_epu8(max128, _mm_srli_si128(max128, 1));
+    minvOut = (uint8_t)_mm_cvtsi128_si32(min128);
+    maxvOut = (uint8_t)_mm_cvtsi128_si32(max128);
 }
 
 RGY_FORCEINLINE uint8_t BilateralFilter5x5U8RangeLUTScalarPixel(const uint8_t* srcBase, const int srcPitch, const int w, const int h, const int x, const int y, const float* spatial, const float* rangeWeight) {
@@ -115,27 +108,24 @@ RGY_FORCEINLINE uint8_t BilateralFilter5x5U8RangeLUTScalarPixel(const uint8_t* s
     return (uint8_t)std::clamp((int)(outv + 0.5f), 0, 255);
 }
 
-}
+bool TryEstimateBgEvalSideContiguousU8_AVX2(const uint8_t* ptr, int len, int threshold, float& avg, uint8_t& minvOut, uint8_t& maxvOut) {
+    if (len == 65) {
+        const __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr + 0));
+        const __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr + 32));
+        uint8_t minv = 0;
+        uint8_t maxv = 0;
+        MinMax64BytesToScalarAccurate(v0, v1, minv, maxv);
+        const uint8_t tail = ptr[64];
+        minv = std::min(minv, tail);
+        maxv = std::max(maxv, tail);
+        const uint32_t sum = Sum64BytesToU32(v0, v1) + tail;
+        avg = (float)sum / len;
+        minvOut = minv;
+        maxvOut = maxv;
+        return (int)maxv - (int)minv <= threshold;
+    }
 
-bool TryEstimateBgEvalSideHorizontalInRangeU8_65_AVX2(const uint8_t* ptr, int threshold, float& avg, uint8_t& minvOut, uint8_t& maxvOut) {
-    const __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr + 0));
-    const __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr + 32));
-    uint8_t minv = 0;
-    uint8_t maxv = 0;
-    MinMax64BytesToScalar(v0, v1, minv, maxv);
-
-    const uint8_t tail = ptr[64];
-    minv = std::min(minv, tail);
-    maxv = std::max(maxv, tail);
-    const uint32_t sum = Sum64BytesToU32(v0, v1) + tail;
-
-    avg = (float)sum * (1.0f / 65.0f);
-    minvOut = minv;
-    maxvOut = maxv;
-    return (int)maxv - (int)minv <= threshold;
-}
-
-bool TryEstimateBgEvalSideHorizontalInRangeU8_LE64_AVX2(const uint8_t* ptr, int len, int threshold, float& avg, uint8_t& minvOut, uint8_t& maxvOut) {
+    assert(len > 0 && len <= 64);
     const uint8_t* validMask = TryEstimateBgValidMaskFFThen00 + (kTryEstimateBgHorizontalLoadBytes - len);
     const __m256i raw0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr + 0));
     const __m256i raw1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr + 32));
@@ -143,20 +133,61 @@ bool TryEstimateBgEvalSideHorizontalInRangeU8_LE64_AVX2(const uint8_t* ptr, int 
     const __m256i mask1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(validMask + 32));
     const __m256i data0 = _mm256_and_si256(raw0, mask0);
     const __m256i data1 = _mm256_and_si256(raw1, mask1);
-    const __m256i zero = _mm256_setzero_si256();
-    const __m256i fill255 = _mm256_cmpeq_epi16(zero, zero);
-    const __m256i minData0 = _mm256_blendv_epi8(fill255, data0, mask0);
-    const __m256i minData1 = _mm256_blendv_epi8(fill255, data1, mask1);
+    // 無効laneを有効な先頭画素で埋めれば、min/maxを1回の縮約で正確に求められる。
+    const __m256i fill = _mm256_set1_epi8((char)ptr[0]);
+    const __m256i minMaxData0 = _mm256_blendv_epi8(fill, raw0, mask0);
+    const __m256i minMaxData1 = _mm256_blendv_epi8(fill, raw1, mask1);
 
     uint8_t minv = 0;
     uint8_t maxv = 0;
-    MinMax64BytesToScalar(minData0, minData1, minv, maxv);
+    MinMax64BytesToScalarAccurate(minMaxData0, minMaxData1, minv, maxv);
     const uint32_t sum = Sum64BytesToU32(data0, data1);
 
     avg = (float)sum / len;
     minvOut = minv;
     maxvOut = maxv;
     return (int)maxv - (int)minv <= threshold;
+}
+
+ RGY_FORCEINLINE void CalcBgSideStatsBlock32U8_AVX2Impl(const uint8_t* ptr, const int step, const int len, uint16_t* sums, uint8_t* minvOut, uint8_t* maxvOut) {
+     const __m256i zero = _mm256_setzero_si256();
+     __m256i sumsLaneLo = _mm256_setzero_si256();
+     __m256i sumsLaneHi = _mm256_setzero_si256();
+     __m256i minv = _mm256_set1_epi8((char)0xff);
+     __m256i maxv = _mm256_setzero_si256();
+     for (int i = 0; i < len; i++, ptr += step) {
+         const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr));
+         sumsLaneLo = _mm256_add_epi16(sumsLaneLo, _mm256_unpacklo_epi8(v, zero));
+         sumsLaneHi = _mm256_add_epi16(sumsLaneHi, _mm256_unpackhi_epi8(v, zero));
+         minv = _mm256_min_epu8(minv, v);
+         maxv = _mm256_max_epu8(maxv, v);
+     }
+     // unpackは128bit laneごとに動作するため、最後に画素順へ並べ直す。
+     const __m256i sums0To15 = _mm256_permute2x128_si256(sumsLaneLo, sumsLaneHi, 0x20);
+     const __m256i sums16To31 = _mm256_permute2x128_si256(sumsLaneLo, sumsLaneHi, 0x31);
+     _mm256_storeu_si256(reinterpret_cast<__m256i*>(sums), sums0To15);
+     _mm256_storeu_si256(reinterpret_cast<__m256i*>(sums + 16), sums16To31);
+     _mm256_storeu_si256(reinterpret_cast<__m256i*>(minvOut), minv);
+}
+
+void CalcBgSideStatsBlock32U8_AVX2(const uint8_t* src, int stride, int x, int y, int radius,
+    uint16_t* sideSums, uint8_t* sideMins, uint8_t* sideMaxs) {
+    constexpr int lanes = 32;
+    const int len = radius * 2 + 1;
+    assert(radius >= 0 && len <= 65);
+
+    // laneを隣接する32画素に割り当て、各辺の同じ位置を256bit幅で連続ロードする。
+    const uint8_t* sidePtr[4] = {
+        src + (y - radius) * stride + x - radius,
+        src + (y + radius) * stride + x - radius,
+        src + (y - radius) * stride + x - radius,
+        src + (y - radius) * stride + x + radius,
+    };
+    const int sideStep[4] = { 1, 1, stride, stride };
+    for (int side = 0; side < 4; side++) {
+        CalcBgSideStatsBlock32U8_AVX2Impl(sidePtr[side], sideStep[side], len,
+            sideSums + side * lanes, sideMins + side * lanes, sideMaxs + side * lanes);
+    }
 }
 
 void BilateralFilter5x5U8RangeLUT_AVX2(uint8_t* dst, const uint8_t* srcBase, int srcPitch, int w, int h, const float* spatial, const float* rangeWeight, uint8_t maxv, int y0, int y1) {

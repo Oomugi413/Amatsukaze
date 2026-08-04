@@ -24,7 +24,7 @@ ENV AVISYNTHCUDAFILTERS_VER=0.7.1
 ENV AVISYNTH_VER=3.7.5
 ENV YADIFMOD2_VER=0.2.8
 ENV TIVTC_VER=v1.0.29
-ENV NNEDI3_REV=a93dbaea9f0dfc3f6d496a3fe01466bc22dd3a88
+ENV NNEDI3_REV=baa68b771e52e6daf8820531b5172253d4a504ac
 ENV MASKTOOLS_REV=8291927bf6956981a6412d353da8ca39d49c9d3a
 ENV MVTOOLS_VER=2.7.46
 ENV RGTOOLS_VER=1.2
@@ -234,7 +234,7 @@ RUN cd /src/Amatsukaze \
     && rm -rf /tmp/amatsukaze-build /src/Amatsukaze/.git
 
 # 実行段階
-# NVEncC 9.25.1のビルドに使用されたCUDAと実行時ライブラリの版を揃える。
+# NVEncC 9.29.1のビルドに使用されたCUDAと実行時ライブラリの版を揃える。
 FROM nvidia/cuda:13.3.0-base-ubuntu24.04 AS runtime
 
 # 変数の定義（実行段階でも使用）
@@ -262,9 +262,9 @@ ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics
 ENV VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_egl_icd.json
 
-ENV QSVENCC_VER=8.22
-ENV NVENCC_VER=9.26.1
-ENV VCEENCC_VER=9.08
+ENV QSVENCC_VER=8.24
+ENV NVENCC_VER=9.29.1
+ENV VCEENCC_VER=9.10
 ENV AMDGPU_INSTALL_VER=25.35.1
 ENV AMDGPU_INSTALL_DEB_VER=7.2.1.70201-1
 ENV TSREPLACE_VER=0.19
@@ -429,8 +429,8 @@ RUN git clone --depth 1 -b 0.04 https://github.com/rigaya/SCRenamePy.git tmp_SCR
     && rm -rf tmp_SCRenamePy
 
 RUN wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260720-140556/x264_3223_amd64_linux.tar.xz -O x264.tar.xz \
-    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260720-140556/x265_4.2%2B37_amd64_linux.tar.xz -O x265.tar.xz \
-    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260720-140556/SvtAv1EncApp_4.2.0-15_amd64_linux_clang.tar.xz -O svt-av1.tar.xz \
+    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260801-080608/x265_4.2%2B37_amd64_linux.tar.xz -O x265.tar.xz \
+    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260801-080608/SvtAv1EncApp_4.2.0-67_amd64_linux_clang.tar.xz -O svt-av1.tar.xz \
     && tar -xf x264.tar.xz -C /app/exe_files \
     && tar -xf x265.tar.xz -C /app/exe_files \
     && tar -xf svt-av1.tar.xz -C /app/exe_files \

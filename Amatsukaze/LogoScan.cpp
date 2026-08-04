@@ -42,11 +42,151 @@
 #endif
 #include "zlib.h"
 #include "rgy_event.h"
-#include "rgy_thread_pool.h"
 
 namespace {
 
 constexpr int kTryEstimateBgHorizontalAVX2Pad = 64;
+
+class LogoScanWorkerPool {
+    using JobProc = void (*)(void*, int, int);
+
+    struct WorkerContext {
+        unique_event startEvent;
+        unique_event doneEvent;
+        std::thread thread;
+        std::exception_ptr exception;
+
+        WorkerContext()
+            : startEvent(CreateEventUnique(nullptr, false, false))
+            , doneEvent(CreateEventUnique(nullptr, false, false))
+            , thread()
+            , exception() {
+        }
+    };
+
+    std::vector<std::unique_ptr<WorkerContext>> workers;
+    std::vector<HANDLE> doneEvents;
+    std::atomic<bool> stopping;
+    std::atomic<int> nextJob;
+    int jobTotal;
+    int jobGrain;
+    void* jobContext;
+    JobProc jobProc;
+
+    void workerLoop(WorkerContext* worker) {
+        for (;;) {
+            WaitForSingleObject(worker->startEvent.get(), INFINITE);
+            if (stopping.load(std::memory_order_acquire)) {
+                return;
+            }
+            try {
+                for (;;) {
+                    const int start = nextJob.fetch_add(jobGrain, std::memory_order_relaxed);
+                    if (start >= jobTotal) {
+                        break;
+                    }
+                    jobProc(jobContext, start, std::min(jobTotal, start + jobGrain));
+                }
+            } catch (...) {
+                worker->exception = std::current_exception();
+            }
+            SetEvent(worker->doneEvent.get());
+        }
+    }
+
+public:
+    explicit LogoScanWorkerPool(const int threadCount)
+        : workers()
+        , doneEvents()
+        , stopping(false)
+        , nextJob(0)
+        , jobTotal(0)
+        , jobGrain(1)
+        , jobContext(nullptr)
+        , jobProc(nullptr) {
+        const int count = std::max(1, threadCount);
+        workers.reserve(count);
+        doneEvents.reserve(count);
+        for (int i = 0; i < count; i++) {
+            workers.push_back(std::make_unique<WorkerContext>());
+            doneEvents.push_back(workers.back()->doneEvent.get());
+        }
+        try {
+            for (auto& worker : workers) {
+                WorkerContext* const context = worker.get();
+                worker->thread = std::thread([this, context]() {
+                    workerLoop(context);
+                });
+            }
+        } catch (...) {
+            stopping.store(true, std::memory_order_release);
+            for (auto& worker : workers) {
+                if (worker->thread.joinable()) {
+                    SetEvent(worker->startEvent.get());
+                }
+            }
+            for (auto& worker : workers) {
+                if (worker->thread.joinable()) {
+                    worker->thread.join();
+                }
+            }
+            throw;
+        }
+    }
+
+    ~LogoScanWorkerPool() {
+        stopping.store(true, std::memory_order_release);
+        for (auto& worker : workers) {
+            SetEvent(worker->startEvent.get());
+        }
+        for (auto& worker : workers) {
+            if (worker->thread.joinable()) {
+                worker->thread.join();
+            }
+        }
+    }
+
+    LogoScanWorkerPool(const LogoScanWorkerPool&) = delete;
+    LogoScanWorkerPool& operator=(const LogoScanWorkerPool&) = delete;
+
+    template<typename F>
+    void run(const int total, F&& fn, const int grainSize = 0) {
+        const int activeWorkers = std::min((int)workers.size(), total);
+        if (activeWorkers <= 1 || total <= 1) {
+            fn(0, total);
+            return;
+        }
+
+        using Fn = typename std::remove_reference<F>::type;
+        void* const jobContext = const_cast<void*>(static_cast<const void*>(std::addressof(fn)));
+        const JobProc jobProc = [](void* context, const int start, const int end) {
+            (*static_cast<Fn*>(context))(start, end);
+        };
+        this->jobTotal = total;
+        this->jobGrain = (grainSize > 0) ? grainSize : (total + activeWorkers - 1) / activeWorkers;
+        this->jobContext = jobContext;
+        this->jobProc = jobProc;
+        nextJob.store(0, std::memory_order_relaxed);
+        for (int i = 0; i < activeWorkers; i++) {
+            auto& worker = *workers[i];
+            worker.exception = nullptr;
+            SetEvent(worker.startEvent.get());
+        }
+
+        // Linux版は個々のイベントを順に待つ実装だが、完了状態を保持するため
+        // 全ワーカーの完了バリアとして利用できる。Windowsの上限に合わせて分割する。
+        constexpr int kMaxWaitEvents = 64;
+        for (int offset = 0; offset < activeWorkers; offset += kMaxWaitEvents) {
+            const int waitCount = std::min(kMaxWaitEvents, activeWorkers - offset);
+            WaitForMultipleObjects(waitCount, doneEvents.data() + offset, 1, INFINITE);
+        }
+        for (int i = 0; i < activeWorkers; i++) {
+            if (workers[i]->exception) {
+                std::rethrow_exception(workers[i]->exception);
+            }
+        }
+    }
+};
 
 int ResolveAutoDetectThreadCount(const int configured) {
     if (configured > 0) {
@@ -54,7 +194,8 @@ int ResolveAutoDetectThreadCount(const int configured) {
     }
     const unsigned logicalRaw = std::thread::hardware_concurrency();
     const int logical = std::max(1, (int)((logicalRaw > 0) ? logicalRaw : 1));
-    return std::min(logical, 16);
+    // フレームごとに複数回同期するため、過剰なワーカー数はタスク切替コストが支配的になる。
+    return std::min(logical, 8);
 }
 
 std::string FormatAvErrorDetail(int errnum) {
@@ -2051,7 +2192,7 @@ namespace {
     }
 
     template<typename pixel_t, int radius>
-    static void BilateralFilter(std::vector<pixel_t>& dst, const pixel_t* srcBase, const int srcPitch, const int w, const int h, const float sigmaSpace, const float sigmaRange, const pixel_t maxv, RGYThreadPool* pool = nullptr, const int threadN = 1) {
+    static void BilateralFilter(std::vector<pixel_t>& dst, const pixel_t* srcBase, const int srcPitch, const int w, const int h, const float sigmaSpace, const float sigmaRange, const pixel_t maxv, LogoScanWorkerPool* pool = nullptr, const int threadN = 1) {
         static_assert(radius > 0, "radius must be positive");
         dst.resize(w * h);
         constexpr int ksize = radius * 2 + 1;
@@ -2093,21 +2234,7 @@ namespace {
                 filterRangeU8(0, h);
                 return;
             }
-            const int workers = std::max(1, std::min(threadN, h));
-            const int chunk = (h + workers - 1) / workers;
-            std::vector<std::future<void>> futures;
-            futures.reserve(workers);
-            for (int worker = 0; worker < workers; worker++) {
-                const int start = worker * chunk;
-                const int end = std::min(h, start + chunk);
-                if (start >= end) break;
-                futures.push_back(pool->enqueue([&filterRangeU8, start, end]() {
-                    filterRangeU8(start, end);
-                }));
-            }
-            for (auto& f : futures) {
-                f.get();
-            }
+            pool->run(h, filterRangeU8);
             return;
         }
         auto filterRange = [&](const int y0, const int y1) {
@@ -2142,21 +2269,7 @@ namespace {
             filterRange(0, h);
             return;
         }
-        const int workers = std::max(1, std::min(threadN, h));
-        const int chunk = (h + workers - 1) / workers;
-        std::vector<std::future<void>> futures;
-        futures.reserve(workers);
-        for (int worker = 0; worker < workers; worker++) {
-            const int start = worker * chunk;
-            const int end = std::min(h, start + chunk);
-            if (start >= end) break;
-            futures.push_back(pool->enqueue([&filterRange, start, end]() {
-                filterRange(start, end);
-            }));
-        }
-        for (auto& f : futures) {
-            f.get();
-        }
+        pool->run(h, filterRange);
     }
 
     static bool TryApproxWeightedLine(const double n, const double sum_x, const double sum_y, const double sum_x2, const double sum_xy, double& a, double& b) {
@@ -2285,6 +2398,8 @@ namespace {
         int sideCount = 0;
         float sideSum = 0.0f;
         int firstSide = -1;
+        const std::vector<pixel_t>* transposed = nullptr;
+        bool fastContiguousU8 = false;
     };
 
     enum class TryEstimateBgSideAxis {
@@ -2303,15 +2418,6 @@ namespace {
 
         if constexpr (Axis == TryEstimateBgSideAxis::Horizontal) {
             const pixel_t* ptr = &y[sx + sy * w];
-            if constexpr (std::is_same_v<pixel_t, uint8_t>) {
-                if (HasAVX2AvailableCached()) {
-                    if constexpr (FixedLen == 65) {
-                        return TryEstimateBgEvalSideHorizontalInRangeU8_65_AVX2(ptr, threshold, avg, minvOut, maxvOut);
-                    } else if (len <= 64) {
-                        return TryEstimateBgEvalSideHorizontalInRangeU8_LE64_AVX2(ptr, len, threshold, avg, minvOut, maxvOut);
-                    }
-                }
-            }
             for (int i = 0; i < len; i++) {
                 const pixel_t v = ptr[i];
                 minv = std::min(minv, v);
@@ -2339,12 +2445,17 @@ namespace {
     // max-min が threshold 以下なら「近い色(ほぼ単色)」として true を返す。
     // 範囲外を含む場合は clamp 参照で安全に評価する。
     template<typename pixel_t>
-    static bool TryEstimateBgEvalSide(const std::vector<pixel_t>& y, const int w, const int h, const int sx, const int sy, const int dx, const int dy, const int sideLen, const int threshold, float& avg, pixel_t& minvOut, pixel_t& maxvOut) {
+    static bool TryEstimateBgEvalSide(const std::vector<pixel_t>& y, const int w, const int h, const int sx, const int sy, const int dx, const int dy, const int sideLen, const int threshold, float& avg, pixel_t& minvOut, pixel_t& maxvOut, const std::vector<pixel_t>* transposed = nullptr) {
         const bool horizontal = (dy == 0);
         if (horizontal) {
             const int ex = sx + sideLen - 1;
             const bool inRange = sy >= 0 && sy < h && sx >= 0 && ex < w;
             if (inRange) {
+                if constexpr (std::is_same_v<pixel_t, uint8_t>) {
+                    if (HasAVX2AvailableCached() && sideLen <= 65) {
+                        return TryEstimateBgEvalSideContiguousU8_AVX2(&y[sx + sy * w], sideLen, threshold, avg, minvOut, maxvOut);
+                    }
+                }
                 if (sideLen == 65) {
                     return TryEstimateBgEvalSideImpl<pixel_t, TryEstimateBgSideAxis::Horizontal, 65>(y, w, h, sx, sy, sideLen, threshold, avg, minvOut, maxvOut);
                 }
@@ -2353,11 +2464,25 @@ namespace {
             const int safeSy = ClampInt(sy, 0, h - 1);
             const int start = ClampInt(sx, 0, w - 1);
             const int end = ClampInt(ex, 0, w - 1);
+            if constexpr (std::is_same_v<pixel_t, uint8_t>) {
+                const int len = end - start + 1;
+                if (HasAVX2AvailableCached() && len <= 65) {
+                    return TryEstimateBgEvalSideContiguousU8_AVX2(&y[start + safeSy * w], len, threshold, avg, minvOut, maxvOut);
+                }
+            }
             return TryEstimateBgEvalSideImpl<pixel_t, TryEstimateBgSideAxis::Horizontal, 0>(y, w, h, start, safeSy, end - start + 1, threshold, avg, minvOut, maxvOut);
         }
         const int ey = sy + sideLen - 1;
         const bool inRange = sx >= 0 && sx < w && sy >= 0 && ey < h;
         if (inRange) {
+            if constexpr (std::is_same_v<pixel_t, uint8_t>) {
+                if (transposed != nullptr && HasAVX2AvailableCached()) {
+                    const uint8_t* ptr = transposed->data() + sy + sx * h;
+                    if (sideLen <= 65) {
+                        return TryEstimateBgEvalSideContiguousU8_AVX2(ptr, sideLen, threshold, avg, minvOut, maxvOut);
+                    }
+                }
+            }
             if (sideLen == 65) {
                 return TryEstimateBgEvalSideImpl<pixel_t, TryEstimateBgSideAxis::Vertical, 65>(y, w, h, sx, sy, sideLen, threshold, avg, minvOut, maxvOut);
             }
@@ -2366,6 +2491,13 @@ namespace {
         const int safeSx = ClampInt(sx, 0, w - 1);
         const int start = ClampInt(sy, 0, h - 1);
         const int end = ClampInt(ey, 0, h - 1);
+        if constexpr (std::is_same_v<pixel_t, uint8_t>) {
+            const int len = end - start + 1;
+            if (transposed != nullptr && HasAVX2AvailableCached() && len <= 65) {
+                const uint8_t* ptr = transposed->data() + start + safeSx * h;
+                return TryEstimateBgEvalSideContiguousU8_AVX2(ptr, len, threshold, avg, minvOut, maxvOut);
+            }
+        }
         return TryEstimateBgEvalSideImpl<pixel_t, TryEstimateBgSideAxis::Vertical, 0>(y, w, h, safeSx, start, end - start + 1, threshold, avg, minvOut, maxvOut);
     }
 
@@ -2376,7 +2508,20 @@ namespace {
         if (st.sideEvaluated[side]) {
             return st.sideValid[side] != 0;
         }
-        const bool ok = TryEstimateBgEvalSide(y, w, h, baseSx[side], baseSy[side], sideDx[side], sideDy[side], sideLen, threshold, st.sideAvg[side], st.sideMin[side], st.sideMax[side]);
+        bool ok = false;
+        if constexpr (std::is_same_v<pixel_t, uint8_t>) {
+            if (st.fastContiguousU8) {
+                // 内側画素は4辺とも固定長かつ連続なので、軸判定と境界判定を省く。
+                const uint8_t* ptr = (side < 2)
+                    ? y.data() + baseSx[side] + baseSy[side] * w
+                    : st.transposed->data() + baseSy[side] + baseSx[side] * h;
+                ok = TryEstimateBgEvalSideContiguousU8_AVX2(ptr, sideLen, threshold, st.sideAvg[side], st.sideMin[side], st.sideMax[side]);
+            } else {
+                ok = TryEstimateBgEvalSide(y, w, h, baseSx[side], baseSy[side], sideDx[side], sideDy[side], sideLen, threshold, st.sideAvg[side], st.sideMin[side], st.sideMax[side], st.transposed);
+            }
+        } else {
+            ok = TryEstimateBgEvalSide(y, w, h, baseSx[side], baseSy[side], sideDx[side], sideDy[side], sideLen, threshold, st.sideAvg[side], st.sideMin[side], st.sideMax[side], st.transposed);
+        }
         st.sideEvaluated[side] = 1;
         st.sideValid[side] = ok ? 1 : 0;
         return ok;
@@ -2471,7 +2616,7 @@ namespace {
                 if (sx < 0 || sx >= w || sy < 0 || sy >= h || ex < 0 || ex >= w || ey < 0 || ey >= h) {
                     continue;
                 }
-                const bool ok = TryEstimateBgEvalSide(y, w, h, sx, sy, sideDx[side], sideDy[side], sideLen, threshold, st.sideAvg[side], st.sideMin[side], st.sideMax[side]);
+                const bool ok = TryEstimateBgEvalSide(y, w, h, sx, sy, sideDx[side], sideDy[side], sideLen, threshold, st.sideAvg[side], st.sideMin[side], st.sideMax[side], st.transposed);
                 st.sideEvaluated[side] = 1;
                 st.sideValid[side] = ok ? 1 : 0;
                 if (ok && TryEstimateBgTryPairWithFirst(side, threshold, st)) {
@@ -2504,7 +2649,7 @@ namespace {
     // 背景:
     // - ロゴ混入やテクスチャの強い辺を除外し、安定した背景推定点だけを使うため
     template<typename pixel_t>
-    static bool TryEstimateBg(const std::vector<pixel_t>& y, const int w, const int h, const int x, const int y0, const int radius, const int threshold, float& bg, BgDebugInfo* dbg = nullptr) {
+    static bool TryEstimateBg(const std::vector<pixel_t>& y, const int w, const int h, const int x, const int y0, const int radius, const int threshold, float& bg, BgDebugInfo* dbg = nullptr, const std::vector<pixel_t>* transposed = nullptr) {
         const int baseSx[4] = { x - radius, x - radius, x - radius, x + radius };
         const int baseSy[4] = { y0 - radius, y0 + radius, y0 - radius, y0 - radius };
         const int sideDx[4] = { 1, 1, 0, 0 };
@@ -2515,6 +2660,14 @@ namespace {
         const int sideLen = radius * 2 + 1;
 
         TryEstimateBgState<pixel_t> st;
+        st.transposed = transposed;
+        if constexpr (std::is_same_v<pixel_t, uint8_t>) {
+            st.fastContiguousU8 = transposed != nullptr
+                && sideLen <= 65
+                && x - radius >= 0 && x + radius < w
+                && y0 - radius >= 0 && y0 + radius < h
+                && HasAVX2AvailableCached();
+        }
         bool pairFound = TryEstimateBgFindInitialPair(y, w, h, baseSx, baseSy, sideDx, sideDy, sideLen, threshold, st);
         if (!pairFound && st.firstSide >= 0) {
             // 1辺しか取れないときの救済:
@@ -2543,29 +2696,103 @@ namespace {
         return true;
     }
 
-    static void RunParallelRange(RGYThreadPool& pool, const int threadN, const int total, const std::function<void(int, int)>& fn, const int blockSize = 0) {
+    // 隣接する32画素の基準4辺を一括評価し、通常版と同じ順序規則で背景値を確定する。
+    // 基準辺だけで確定しない画素の救済探索は、結果一致を優先して既存経路へ戻す。
+    static uint32_t TryEstimateBgBlock32U8(const std::vector<uint8_t>& y, const int w, const int h,
+        const int x, const int y0, const int radius, const int threshold, float bg[32],
+        const std::vector<uint8_t>* transposed) {
+        constexpr int lanes = 32;
+        alignas(32) uint16_t sideSums[4][lanes];
+        alignas(32) uint8_t sideMins[4][lanes];
+        alignas(32) uint8_t sideMaxs[4][lanes];
+        CalcBgSideStatsBlock32U8_AVX2(y.data(), w, x, y0, radius,
+            &sideSums[0][0], &sideMins[0][0], &sideMaxs[0][0]);
+
+        const int sideLen = radius * 2 + 1;
+        static constexpr int retryOrder[4][3] = {
+            { 2, 3, 1 },
+            { 2, 3, 0 },
+            { 0, 1, 3 },
+            { 0, 1, 2 },
+        };
+        uint32_t validMask = 0;
+        for (int lane = 0; lane < lanes; lane++) {
+            float sideAvg[4];
+            uint8_t sideValid[4];
+            for (int side = 0; side < 4; side++) {
+                sideAvg[side] = (float)sideSums[side][lane] / sideLen;
+                sideValid[side] = ((int)sideMaxs[side][lane] - (int)sideMins[side][lane] <= threshold) ? 1 : 0;
+            }
+
+            int firstSide = -1;
+            for (int side = 0; side < 4; side++) {
+                if (sideValid[side]) {
+                    firstSide = side;
+                    break;
+                }
+            }
+            bool basePairFound = false;
+            if (firstSide >= 0) {
+                for (int i = 0; i < 3; i++) {
+                    const int side = retryOrder[firstSide][i];
+                    if (sideValid[side]
+                        && std::abs(sideAvg[side] - sideAvg[firstSide]) <= threshold) {
+                        bg[lane] = (sideAvg[firstSide] + sideAvg[side]) / 2;
+                        validMask |= 1u << lane;
+                        basePairFound = true;
+                        break;
+                    }
+                }
+            }
+            if (basePairFound) {
+                continue;
+            }
+
+            // 基準4辺だけで確定できなかったlaneだけ、既存の救済探索へ渡す。
+            TryEstimateBgState<uint8_t> st;
+            st.transposed = transposed;
+            st.firstSide = firstSide;
+            for (int side = 0; side < 4; side++) {
+                st.sideAvg[side] = sideAvg[side];
+                st.sideMin[side] = sideMins[side][lane];
+                st.sideMax[side] = sideMaxs[side][lane];
+                st.sideValid[side] = sideValid[side];
+                st.sideEvaluated[side] = 1;
+            }
+
+            bool pairFound = false;
+            if (firstSide >= 0) {
+                const int centerX = x + lane;
+                const int baseSx[4] = { centerX - radius, centerX - radius, centerX - radius, centerX + radius };
+                const int baseSy[4] = { y0 - radius, y0 + radius, y0 - radius, y0 - radius };
+                const int sideDx[4] = { 1, 1, 0, 0 };
+                const int sideDy[4] = { 0, 0, 1, 1 };
+                const int retryOutX[4] = { 0, 0, -1, 1 };
+                const int retryOutY[4] = { -1, 1, 0, 0 };
+                pairFound = TryEstimateBgFindRetryPair(y, w, h, sideLen, threshold,
+                    baseSx, baseSy, sideDx, sideDy, retryOutX, retryOutY, st);
+            }
+            if (!pairFound) {
+                TryEstimateBgFinalizeSideStats(st);
+            }
+            if (st.sideCount < 2) {
+                bg[lane] = 0.0f;
+                continue;
+            }
+            bg[lane] = st.sideSum / st.sideCount;
+            validMask |= 1u << lane;
+        }
+        return validMask;
+    }
+
+    template<typename F>
+    static void RunParallelRange(LogoScanWorkerPool& pool, const int threadN, const int total, F&& fn, const int blockSize = 0) {
         const int workers = std::max(1, std::min(threadN, total));
         if (workers <= 1 || total <= 1) {
             fn(0, total);
             return;
         }
-        std::vector<std::future<void>> futures;
-        const int chunk = (blockSize > 0) ? blockSize : (total + workers - 1) / workers;
-        const int numTasks = (total + chunk - 1) / chunk;
-        futures.reserve(numTasks);
-        for (int task = 0; task < numTasks; task++) {
-            const int start = task * chunk;
-            const int end = std::min(total, start + chunk);
-            if (start >= end) {
-                break;
-            }
-            futures.push_back(pool.enqueue([&fn, start, end]() {
-                fn(start, end);
-            }));
-        }
-        for (auto& f : futures) {
-            f.get();
-        }
+        pool.run(total, std::forward<F>(fn), blockSize);
     }
 
     struct ScoreDebugStats {
@@ -2763,7 +2990,7 @@ namespace {
         const bool detailedDebug;
         AMTContext& logCtx;
         logo::LOGO_AUTODETECT_CB cb;
-        RGYThreadPool threadPool;
+        LogoScanWorkerPool threadPool;
 
         int srcImgW;
         int srcImgH;
@@ -2975,8 +3202,12 @@ namespace {
         struct StatsPassBuffers {
             std::vector<uint8_t> frameWork8;
             std::vector<uint16_t> frameWork16;
+            std::vector<uint8_t> frameTranspose8;
+            std::vector<std::vector<uint8_t>> batchFrameWork8;
+            std::vector<std::vector<uint8_t>> batchFrameTranspose8;
+            std::vector<std::vector<uint8_t>> batchRaw8;
             std::vector<AutoDetectStats> stats;
-            // ヒストグラムbin蓄積バッファ (scanw * scanh * kHistBins)
+            // bin優先配置のヒストグラム蓄積バッファ: [bin][画素]
             std::vector<BinAccum> binAccumBuf;
             std::vector<float> lastObservedFg;
             std::vector<uint8_t> lastObservedValid;
@@ -2987,15 +3218,18 @@ namespace {
 
             void reset(const int scanw, const int scanh, const int bitDepth) {
                 if (bitDepth <= 8) {
-                    // TryEstimateBgEvalSideHorizontalInRangeU8_LE64_AVX2 が
-                    // 行末付近でも 64 byte を直接ロードできるように末尾へ余白を持たせる。
+                    // 背景辺のAVX2処理が行末付近でも64 byteを直接ロードできるよう、
+                    // 作業画像と転置画像の末尾へ余白を持たせる。
                     frameWork8.resize(scanw * scanh + kTryEstimateBgHorizontalAVX2Pad);
+                    frameTranspose8.resize(scanw * scanh + kTryEstimateBgHorizontalAVX2Pad);
                     frameWork16.clear();
                     frameWork16.shrink_to_fit();
                 } else {
                     frameWork16.resize(scanw * scanh);
                     frameWork8.clear();
                     frameWork8.shrink_to_fit();
+                    frameTranspose8.clear();
+                    frameTranspose8.shrink_to_fit();
                 }
                 stats.assign(scanw * scanh, AutoDetectStats());
                 binAccumBuf.assign(scanw * scanh * kHistBins, BinAccum());
@@ -3034,6 +3268,7 @@ namespace {
         std::vector<float> temporalP5Map;
         std::vector<float> temporalLiftMap;
         float temporalLiftP995 = 0.0f;
+        // segment優先配置: [segment][画素]
         std::vector<SegmentConsensusMoment> segmentConsensusBuf;
         std::vector<uint8_t> segmentConsensusValid;
         std::vector<float> segmentConsensusA;
@@ -4019,6 +4254,16 @@ namespace {
             return false;
         }
 
+        const uint8_t* getStoredRoiFramePointer(const int frameIndex) const {
+            if (roiCacheBackend != RoiCacheBackend::Ram || frameIndex < 0 || frameIndex >= roiCacheStoredFrames) {
+                return nullptr;
+            }
+            const int slabIndex = frameIndex / kRoiCacheFramesPerSlab;
+            const int frameInSlab = frameIndex % kRoiCacheFramesPerSlab;
+            const auto& slab = roiCacheRamSlabs[slabIndex];
+            return slab.data() + (size_t)frameInSlab * roiCacheFrameBytes;
+        }
+
         template<typename FrameCb>
         void runStoredRoiPassWithProgress(const int stage, const float stageBase, const float stageSpan, const float overallBase, const float overallSpan, FrameCb&& onFrame) {
             if (!hasStoredRoiCache()) {
@@ -4036,6 +4281,33 @@ namespace {
                 if (!onFrame(roiReplayFrame.data())) {
                     break;
                 }
+            }
+            if (!reportProgressInCurrentPlan(1.0f, readFrames, searchFrames)) {
+                THROW(RuntimeException, "Cancel requested");
+            }
+        }
+
+        void runStoredRoiStatsPassWithProgress(const int stage, const float stageBase, const float stageSpan,
+            const float overallBase, const float overallSpan, StatsPassBuffers& statsPass, Pass2Buffers* pass2) {
+            const int frameBatch = std::min(32, ParseEnvIntDefault("AMT_LOGO_FRAME_BATCH", 16, 1));
+            // 追跡点はフレームごとの詳細状態を記録するため、従来経路で処理する。
+            // 少数ワーカーでは同期削減よりバッチ内の作業集合増加が勝るため、従来経路を使う。
+            if (threadN < 8 || frameBatch <= 1 || !tracePoints.empty()) {
+                runStoredRoiPassWithProgress(stage, stageBase, stageSpan, overallBase, overallSpan,
+                    [&](const uint8_t* frameY) { return processStoredFrame(frameY, &statsPass, pass2); });
+                return;
+            }
+            if (!hasStoredRoiCache()) {
+                THROW(InvalidOperationException, "ROI cache is not available");
+            }
+            setProgressPlan(stage, stageBase, stageSpan, overallBase, overallSpan);
+            if (!reportProgressInCurrentPlan(0.0f, 0, searchFrames)) {
+                THROW(RuntimeException, "Cancel requested");
+            }
+            readFrames = 0;
+            for (int frame = 0; frame < roiCacheStoredFrames; frame += frameBatch) {
+                const int count = std::min(frameBatch, roiCacheStoredFrames - frame);
+                processStoredStatsBatch(frame, count, statsPass, pass2);
             }
             if (!reportProgressInCurrentPlan(1.0f, readFrames, searchFrames)) {
                 THROW(RuntimeException, "Cancel requested");
@@ -4111,6 +4383,10 @@ namespace {
                 }
             }
             return maxValue;
+        }
+
+        RGY_FORCEINLINE size_t binAccumIndex(const int off, const int bin) const {
+            return (size_t)bin * (scanw * scanh) + off;
         }
 
         void accumulateTemporalHistSample(const int off, const float rawValue, const float invMaxv) {
@@ -4222,7 +4498,8 @@ namespace {
                 || segmentConsensusBuf.size() != (size_t)pixelCount * kSegmentConsensusK) {
                 return;
             }
-            auto& m = segmentConsensusBuf[(size_t)off * kSegmentConsensusK + segment];
+            // 同一フレームでは全画素が同じsegmentを更新するため、segment優先で連続化する。
+            auto& m = segmentConsensusBuf[(size_t)segment * pixelCount + off];
             m.sumF += (float)fg;
             m.sumB += (float)bg;
             m.sumF2 += (float)(fg * fg);
@@ -4360,7 +4637,7 @@ namespace {
                 bool hasSegment = false;
                 bool hasCleanZeroSegment = false;
                 for (int seg = 0; seg < kSegmentConsensusK; seg++) {
-                    const auto& m = segmentConsensusBuf[(size_t)off * kSegmentConsensusK + seg];
+                    const auto& m = segmentConsensusBuf[(size_t)seg * pixelCount + off];
                     SegmentConsensusLine line{};
                     float seAlpha = 0.0f;
                     if (!tryFitSegmentConsensusMoment(m, line, seAlpha)) {
@@ -5159,8 +5436,7 @@ namespace {
             StatsPassBuffers pass3Stats{};
             resetAccumulationState(&pass3Stats, &pass2);
             if (hasStoredRoiCache()) {
-                runStoredRoiPassWithProgress(3, 0.0f, 0.40f, 0.65f, 0.13f,
-                    [&](const uint8_t* frameY) { return processStoredFrame(frameY, &pass3Stats, &pass2); });
+                runStoredRoiStatsPassWithProgress(3, 0.0f, 0.40f, 0.65f, 0.13f, pass3Stats, &pass2);
             } else {
                 runFramePassWithProgress(srcpath, 3, 0.0f, 0.40f, 0.65f, 0.13f,
                     [&](AVStream *videoStream, AVFrame* frame) { processFirstFrame(videoStream, frame, &pass3Stats, &pass2); },
@@ -6327,6 +6603,14 @@ namespace {
             BilateralFilter<uint8_t, kBilateralRadius>(frameWork, srcY, pitchY, scanw, scanh, 1.4f, sigmaRange, (uint8_t)255, &threadPool, threadN);
         }
 
+        void preprocessStoredFrameSingleThread(const uint8_t* srcY, const int pitchY,
+            std::vector<uint8_t>& frameWork, const float thresholdRaw) {
+            constexpr int kBilateralRadius = 2;
+            const float sigmaRange = std::max(6.0f, thresholdRaw * 0.6f);
+            BilateralFilter<uint8_t, kBilateralRadius>(frameWork, srcY, pitchY, scanw, scanh,
+                1.4f, sigmaRange, (uint8_t)255, nullptr, 1);
+        }
+
         template<typename pixel_t>
         void AccumulateCorrectedEdgeFromNeighbor(const std::vector<pixel_t>& frameWork, const int neighborOff, const float fg_i, const float invMaxv, float& maxCorrected, bool& anyPositive) const {
             const float fg_j = (float)frameWork[neighborOff] * invMaxv;
@@ -6365,6 +6649,100 @@ namespace {
         }
 
         template<typename pixel_t>
+        RGY_FORCEINLINE int collectFrameSampleRange(const std::vector<pixel_t>& frameWork, const float invMaxv,
+            const int thresholdRaw, const float transitionThreshold, StatsPassBuffers& statsPass,
+            const std::vector<pixel_t>* transposed, const int segmentConsensusIndex,
+            const int yBegin, const int yEnd, const int xBegin, const int xEnd, const bool useBgBlock32) {
+            auto& stats = statsPass.stats;
+            auto& binAccumBuf = statsPass.binAccumBuf;
+            auto& lastObservedFg = statsPass.lastObservedFg;
+            auto& lastObservedValid = statsPass.lastObservedValid;
+            int localFrameCount = 0;
+            for (int y = yBegin; y < yEnd; y++) {
+                auto collectOne = [&](const int x, const bool bgOk, const float bg) {
+                    const int off = x + y * scanw;
+                    if (off >= 0 && off < (int)tracePointIndexByOffset.size() && tracePointIndexByOffset[off] >= 0) {
+                        return 0;
+                    }
+                    const float fgRaw = (float)frameWork[off];
+                    accumulateTemporalHistSample(off, fgRaw, invMaxv);
+                    AutoDetectStats& s = stats[off];
+                    s.observed++;
+                    if (lastObservedValid[off]) {
+                        if (std::abs(lastObservedFg[off] - fgRaw) > transitionThreshold) {
+                            s.fgTransition++;
+                        }
+                    }
+                    lastObservedFg[off] = fgRaw;
+                    lastObservedValid[off] = 1;
+
+                    AccumulateCorrectedEdge(frameWork, off, x, y, invMaxv, statsPass);
+
+                    // 背景推定不可(周辺辺が不一致など)な点は無効サンプルとして棄却。
+                    if (!bgOk) {
+                        return 0;
+                    }
+                    s.totalCandidates++;
+                    const double f = (double)frameWork[off] * invMaxv;
+                    const double b = (double)bg * invMaxv;
+
+                    if (IsExtremeContrastSample(f, b)) {
+                        s.rejectedExtreme++;
+                        return 0;
+                    }
+
+                    s.rawSampleCount++;
+                    const int binIdx = std::min(kHistBins - 1, (int)(fgRaw * invMaxv * kHistBins));
+                    auto& bin = binAccumBuf[binAccumIndex(off, binIdx)];
+                    accumulateSegmentConsensusSample(off, segmentConsensusIndex, f, b);
+                    AddBinAccumSample(bin, f, b, calcSampleResidualWeight(off, f, b));
+                    return 1;
+                };
+
+                int x = xBegin;
+                for (; x < xEnd;) {
+                    if constexpr (std::is_same_v<pixel_t, uint8_t>) {
+                        const bool blockInRange = useBgBlock32
+                            && x + 32 <= xEnd
+                            && x - radius >= 0 && x + 31 + radius < scanw
+                            && y - radius >= 0 && y + radius < scanh;
+                        if (blockInRange) {
+                            float bg[32];
+                            const uint32_t bgValidMask = TryEstimateBgBlock32U8(frameWork, scanw, scanh,
+                                x, y, radius, thresholdRaw, bg, transposed);
+                            for (int lane = 0; lane < 32; lane++) {
+                                localFrameCount += collectOne(x + lane,
+                                    (bgValidMask & (1u << lane)) != 0, bg[lane]);
+                            }
+                            x += 32;
+                            continue;
+                        }
+                    }
+                    float bg = 0.0f;
+                    const bool bgOk = TryEstimateBg(frameWork, scanw, scanh, x, y,
+                        radius, thresholdRaw, bg, nullptr, transposed);
+                    localFrameCount += collectOne(x, bgOk, bg);
+                    x++;
+                }
+            }
+            return localFrameCount;
+        }
+
+        void buildFrameTranspose8(const std::vector<uint8_t>& frameWork, std::vector<uint8_t>& transpose) const {
+            const int pixelCount = scanw * scanh;
+            const int pixelCountWithPad = pixelCount + kTryEstimateBgHorizontalAVX2Pad;
+            if ((int)transpose.size() < pixelCountWithPad) {
+                transpose.resize(pixelCountWithPad);
+            }
+            for (int x = 0; x < scanw; x++) {
+                uint8_t* dst = transpose.data() + x * scanh;
+                for (int y = 0; y < scanh; y++) {
+                    dst[y] = frameWork[x + y * scanw];
+                }
+            }
+        }
+
+        template<typename pixel_t>
         int collectFrameSamples(const std::vector<pixel_t>& frameWork, const float invMaxv, const float rawScale, const int thresholdRaw, StatsPassBuffers& statsPass, const std::vector<float>& traceFgRaw) {
             auto& stats = statsPass.stats;
             auto& binAccumBuf = statsPass.binAccumBuf;
@@ -6382,60 +6760,30 @@ namespace {
             const float transitionThreshold = std::max(0.75f * rawScale, thresholdRaw * 0.125f);
             const int collectYBlock = ParseEnvIntDefault("AMT_LOGO_COLLECT_Y_BLOCK", 16, 1);
             const int collectXSplits = ParseEnvIntDefault("AMT_LOGO_COLLECT_X_SPLITS", 2, 1);
+            const bool enableBgBlock32 = ParseEnvBoolDefault("AMT_LOGO_BG_BLOCK32", true);
             const int innerHeight = std::max(0, scanh - 2 * kScanEdgeMargin);
             const int innerWidth = std::max(0, scanw - 2 * kScanEdgeMargin);
             const int segmentConsensusIndex = getSegmentConsensusIndex();
+            bool useBgBlock32 = false;
+            if constexpr (std::is_same_v<pixel_t, uint8_t>) {
+                useBgBlock32 = enableBgBlock32 && HasAVX2AvailableCached() && radius * 2 + 1 <= 65;
+            }
+            // 垂直辺を連続ロードできるよう、AVX2利用時だけROIを列優先に並べ替える。
+            const std::vector<pixel_t>* transposed = nullptr;
+            if constexpr (std::is_same_v<pixel_t, uint8_t>) {
+                if (!HasAVX2AvailableCached()) {
+                    transposed = nullptr;
+                } else {
+                    auto& transpose = statsPass.frameTranspose8;
+                    buildFrameTranspose8(frameWork, transpose);
+                    transposed = &transpose;
+                }
+            }
 
             auto processRange = [&](const int yBegin, const int yEnd, const int xBegin, const int xEnd) {
-                int localFrameCount = 0;
-                for (int y = yBegin; y < yEnd; y++) {
-                    for (int x = xBegin; x < xEnd; x++) {
-                        const int off = x + y * scanw;
-                        if (off >= 0 && off < (int)tracePointIndexByOffset.size() && tracePointIndexByOffset[off] >= 0) {
-                            continue;
-                        }
-                        const float fgRaw = (float)frameWork[off];
-                        accumulateTemporalHistSample(off, fgRaw, invMaxv);
-                        AutoDetectStats& s = stats[off];
-                        s.observed++;
-                        if (lastObservedValid[off]) {
-                            if (std::abs(lastObservedFg[off] - fgRaw) > transitionThreshold) {
-                                s.fgTransition++;
-                            }
-                        }
-                        lastObservedFg[off] = fgRaw;
-                        lastObservedValid[off] = 1;
-
-                        AccumulateCorrectedEdge(frameWork, off, x, y, invMaxv, statsPass);
-
-                        float bg = 0.0f;
-                        // 背景推定不可(周辺辺が不一致など)な点は無効サンプルとして棄却。
-                        // 例: ブロック辺にロゴ形状や高周波模様が入り、単色背景を仮定できない点。
-                        if (!TryEstimateBg(frameWork, scanw, scanh, x, y, radius, thresholdRaw, bg)) {
-                            continue;
-                        }
-                        s.totalCandidates++;
-                        const double f = (double)frameWork[off] * invMaxv;
-                        const double b = (double)bg * invMaxv;
-
-                        // 極端コントラスト点を棄却。
-                        // 具体例:
-                        //   黒帯/白飛び/フラッシュに起因する「ロゴとは無関係な巨大差分」。
-                        //   これを残すと score の裾が広がり、2値化が不安定になる。
-                        if (IsExtremeContrastSample(f, b)) {
-                            s.rejectedExtreme++;
-                            continue;
-                        }
-
-                        s.rawSampleCount++;
-                        const int binIdx = std::min(kHistBins - 1, (int)(fgRaw * invMaxv * kHistBins));
-                        auto& bin = binAccumBuf[off * kHistBins + binIdx];
-                        accumulateSegmentConsensusSample(off, segmentConsensusIndex, f, b);
-                        AddBinAccumSample(bin, f, b, calcSampleResidualWeight(off, f, b));
-                        // このフレームで有効だった画素数（デバッグ可視化用）。
-                        localFrameCount++;
-                    }
-                }
+                const int localFrameCount = collectFrameSampleRange(frameWork, invMaxv, thresholdRaw,
+                    transitionThreshold, statsPass, transposed, segmentConsensusIndex,
+                    yBegin, yEnd, xBegin, xEnd, useBgBlock32);
                 frameCount.fetch_add(localFrameCount, std::memory_order_relaxed);
             };
 
@@ -6504,7 +6852,7 @@ namespace {
 
                 float bg = 0.0f;
                 BgDebugInfo dbgBg{};
-                const bool bgOk = TryEstimateBg(frameWork, scanw, scanh, tp.x, tp.y, radius, thresholdRaw, bg, &dbgBg);
+                const bool bgOk = TryEstimateBg(frameWork, scanw, scanh, tp.x, tp.y, radius, thresholdRaw, bg, &dbgBg, transposed);
                 rec.bgOk = bgOk ? 1 : 0;
                 rec.bg = bg;
                 rec.bgSideCount = dbgBg.sideCount;
@@ -6553,7 +6901,7 @@ namespace {
 
                 s.rawSampleCount++;
                 const int binIdx = std::min(kHistBins - 1, (int)(fgFiltered * invMaxv * kHistBins));
-                auto& bin = binAccumBuf[off * kHistBins + binIdx];
+                auto& bin = binAccumBuf[binAccumIndex(off, binIdx)];
                 accumulateSegmentConsensusSample(off, segmentConsensusIndex, f, b);
                 AddBinAccumSample(bin, f, b, calcSampleResidualWeight(off, f, b));
                 rec.histBin = binIdx;
@@ -6566,6 +6914,132 @@ namespace {
                 statsPass.traceRecords.push_back(rec);
             }
             return frameCount.load(std::memory_order_relaxed);
+        }
+
+        void processStoredStatsBatch(const int firstFrame, const int batchCount,
+            StatsPassBuffers& statsPass, Pass2Buffers* pass2) {
+            struct BatchFrameInfo {
+                const uint8_t* src = nullptr;
+                int segmentConsensusIndex = 0;
+                bool active = false;
+            };
+
+            constexpr float kInvMaxv = 1.0f / 255.0f;
+            constexpr float kRawScale = 1.0f;
+            const int thresholdRaw = threshold;
+            const float transitionThreshold = std::max(0.75f * kRawScale, thresholdRaw * 0.125f);
+            const int pixelCount = scanw * scanh;
+            const int workSize = pixelCount + kTryEstimateBgHorizontalAVX2Pad;
+            const bool enableBgBlock32 = ParseEnvBoolDefault("AMT_LOGO_BG_BLOCK32", true);
+            const bool useBgBlock32 = enableBgBlock32
+                && HasAVX2AvailableCached() && radius * 2 + 1 <= 65;
+            const bool useTranspose = HasAVX2AvailableCached();
+
+            statsPass.batchFrameWork8.resize(batchCount);
+            statsPass.batchFrameTranspose8.resize(batchCount);
+            statsPass.batchRaw8.resize(batchCount);
+            std::vector<BatchFrameInfo> frames(batchCount);
+            std::vector<int> activeFrames;
+            activeFrames.reserve(batchCount);
+
+            for (int bi = 0; bi < batchCount; bi++) {
+                const int frameIndex = firstFrame + bi;
+                auto& info = frames[bi];
+                const bool skip = passIndex == 3 && pass2 != nullptr && !pass2->frameMask.empty()
+                    && (frameIndex < 0 || frameIndex >= (int)pass2->frameMask.size() || pass2->frameMask[frameIndex] == 0);
+                if (skip) {
+                    pass2->skippedFrames++;
+                    continue;
+                }
+                if (passIndex == 3 && pass2 != nullptr && !pass2->frameMask.empty()) {
+                    pass2->acceptedFrames++;
+                }
+
+                info.src = getStoredRoiFramePointer(frameIndex);
+                if (info.src == nullptr) {
+                    auto& raw = statsPass.batchRaw8[bi];
+                    if (!readStoredRoiFrame(frameIndex, raw)) {
+                        THROW(IOException, "failed to read ROI cache frame");
+                    }
+                    info.src = raw.data();
+                }
+                info.segmentConsensusIndex = ClampInt((int)(((int64_t)frameIndex * kSegmentConsensusK)
+                    / std::max(1, searchFrames)), 0, kSegmentConsensusK - 1);
+                info.active = true;
+                activeFrames.push_back(bi);
+                statsPass.batchFrameWork8[bi].resize(workSize);
+                if (useTranspose) {
+                    statsPass.batchFrameTranspose8[bi].resize(workSize);
+                }
+            }
+
+            // フレーム間で独立な前処理をまとめて投入し、起床・完了待ちをバッチ単位にする。
+            threadPool.run((int)activeFrames.size(), [&](const int begin, const int end) {
+                for (int ai = begin; ai < end; ai++) {
+                    const int bi = activeFrames[ai];
+                    preprocessStoredFrameSingleThread(frames[bi].src, scanw,
+                        statsPass.batchFrameWork8[bi], thresholdRaw);
+                    if (useTranspose) {
+                        buildFrameTranspose8(statsPass.batchFrameWork8[bi], statsPass.batchFrameTranspose8[bi]);
+                    }
+                }
+            }, 1);
+
+            const int collectYBlock = ParseEnvIntDefault("AMT_LOGO_COLLECT_Y_BLOCK", 16, 1);
+            const int collectXSplits = ParseEnvIntDefault("AMT_LOGO_COLLECT_X_SPLITS", 2, 1);
+            const int innerHeight = std::max(0, scanh - 2 * kScanEdgeMargin);
+            const int innerWidth = std::max(0, scanw - 2 * kScanEdgeMargin);
+            const int xSplits = (collectXSplits <= 1 || innerWidth <= 1)
+                ? 1 : std::min(collectXSplits, innerWidth);
+            const int yTasks = (innerHeight + collectYBlock - 1) / collectYBlock;
+            const int totalTasks = yTasks * xSplits;
+            std::vector<int> taskFrameCounts((size_t)totalTasks * batchCount, 0);
+
+            // 各空間タイルを一つのワーカーが所有し、同じ画素をフレーム順に更新する。
+            threadPool.run(totalTasks, [&](const int taskBegin, const int taskEnd) {
+                for (int task = taskBegin; task < taskEnd; task++) {
+                    const int tileY = task / xSplits;
+                    const int tileX = task % xSplits;
+                    const int localY0 = tileY * collectYBlock;
+                    const int localY1 = std::min(innerHeight, localY0 + collectYBlock);
+                    if (localY0 >= localY1) {
+                        continue;
+                    }
+                    const int localX0 = (innerWidth * tileX) / xSplits;
+                    const int localX1 = (innerWidth * (tileX + 1)) / xSplits;
+                    if (localX0 >= localX1) {
+                        continue;
+                    }
+                    for (int bi = 0; bi < batchCount; bi++) {
+                        if (!frames[bi].active) {
+                            continue;
+                        }
+                        const auto* transposed = useTranspose ? &statsPass.batchFrameTranspose8[bi] : nullptr;
+                        taskFrameCounts[(size_t)task * batchCount + bi] = collectFrameSampleRange(
+                            statsPass.batchFrameWork8[bi], kInvMaxv, thresholdRaw, transitionThreshold,
+                            statsPass, transposed, frames[bi].segmentConsensusIndex,
+                            localY0 + kScanEdgeMargin, localY1 + kScanEdgeMargin,
+                            localX0 + kScanEdgeMargin, localX1 + kScanEdgeMargin, useBgBlock32);
+                    }
+                }
+            }, 1);
+
+            for (int bi = 0; bi < batchCount; bi++) {
+                int frameCount = 0;
+                if (frames[bi].active) {
+                    for (int task = 0; task < totalTasks; task++) {
+                        frameCount += taskFrameCounts[(size_t)task * batchCount + bi];
+                    }
+                }
+                statsPass.frameValidCounts.push_back(frameCount);
+                readFrames++;
+                if (cb && (readFrames % 8) == 0) {
+                    const float passProgress = readFrames / (float)searchFrames;
+                    if (!reportProgressInCurrentPlan(passProgress, readFrames, searchFrames)) {
+                        THROW(RuntimeException, "Cancel requested");
+                    }
+                }
+            }
         }
 
         bool processFrame(AVFrame* frame, StatsPassBuffers* statsPass, Pass2Buffers* pass2) {
@@ -6979,7 +7453,7 @@ namespace {
             double posSumFB = 0.0;
 
             for (int b = 0; b < kHistBins; b++) {
-                const auto& bin = statsPass.binAccumBuf[off * kHistBins + b];
+                const auto& bin = statsPass.binAccumBuf[binAccumIndex(off, b)];
                 if (bin.count == 0) continue;
                 double avgFg = 0.0;
                 double avgBg = 0.0;
@@ -7085,7 +7559,7 @@ namespace {
             double dominantResidual = 0.0;
             double badResidualWeight = 0.0;
             for (int b = 0; b < kHistBins; b++) {
-                const auto& bin = statsPass.binAccumBuf[off * kHistBins + b];
+                const auto& bin = statsPass.binAccumBuf[binAccumIndex(off, b)];
                 if (bin.count == 0) continue;
 
                 double avgFg = 0.0;
@@ -7139,7 +7613,7 @@ namespace {
             bins.reserve(kHistBins);
             double totalWeight = 0.0;
             for (int b = 0; b < kHistBins; b++) {
-                const auto& bin = statsPass.binAccumBuf[off * kHistBins + b];
+                const auto& bin = statsPass.binAccumBuf[binAccumIndex(off, b)];
                 if (bin.count == 0) continue;
 
                 double avgFg = 0.0;
@@ -7345,7 +7819,7 @@ namespace {
                         AutoDetectStats provisional{};
                         provisional.rawSampleCount = s.rawSampleCount;
                         for (int b = 0; b < kHistBins; b++) {
-                            const auto& bin = statsPass.binAccumBuf[off * kHistBins + b];
+                            const auto& bin = statsPass.binAccumBuf[binAccumIndex(off, b)];
                             if (bin.count == 0) continue;
                             const double avg_fg = bin.sum_fg / bin.count;
                             const double avg_bg = bin.sum_bg / bin.count;
@@ -7365,7 +7839,7 @@ namespace {
                         s.sumF = 0.0; s.sumB = 0.0; s.sumF2 = 0.0; s.sumB2 = 0.0; s.sumFB = 0.0;
                         s.sumW = 0.0; s.effectiveBinCount = 0;
                         for (int b = 0; b < kHistBins; b++) {
-                            const auto& bin = statsPass.binAccumBuf[off * kHistBins + b];
+                            const auto& bin = statsPass.binAccumBuf[binAccumIndex(off, b)];
                             if (bin.count == 0) continue;
                             double avg_fg = 0.0;
                             double avg_bg = 0.0;
@@ -7468,7 +7942,7 @@ namespace {
                 fgVals.reserve(kHistBins);
                 lowFgVals.reserve(kHistBins);
                 for (int b = 0; b < kHistBins; b++) {
-                    const auto& bin = statsPass.binAccumBuf[off * kHistBins + b];
+                    const auto& bin = statsPass.binAccumBuf[binAccumIndex(off, b)];
                     if (bin.count <= 0) continue;
                     const double w = GompertzWeight(bin.count, /*n0=*/5.0, /*c=*/0.7);
                     if (w <= 1e-8) continue;
@@ -7542,8 +8016,8 @@ namespace {
             sampleResidualReweightActive = true;
             resetAccumulationState(&statsPass, pass2);
             if (hasStoredRoiCache()) {
-                runStoredRoiPassWithProgress(progressPlan.stage, progressPlan.stageBase, progressPlan.stageSpan, progressPlan.overallBase, progressPlan.overallSpan,
-                    [&](const uint8_t* frameY) { return processStoredFrame(frameY, &statsPass, pass2); });
+                runStoredRoiStatsPassWithProgress(progressPlan.stage, progressPlan.stageBase, progressPlan.stageSpan,
+                    progressPlan.overallBase, progressPlan.overallSpan, statsPass, pass2);
             } else {
                 runFramePassWithProgress(srcpath, progressPlan.stage, progressPlan.stageBase, progressPlan.stageSpan, progressPlan.overallBase, progressPlan.overallSpan,
                     [&](AVStream *videoStream, AVFrame* frame) { processFirstFrame(videoStream, frame, &statsPass, pass2); },
@@ -7569,7 +8043,7 @@ namespace {
                 const float provisionalConsistency = hasProvisionalLine ? provisionalLineConsistency[off] : 0.0f;
 
                 for (int b = 0; b < kHistBins; b++) {
-                    const auto& bin = statsPass.binAccumBuf[off * kHistBins + b];
+                    const auto& bin = statsPass.binAccumBuf[binAccumIndex(off, b)];
                     if (bin.count == 0) continue;
                     double avgFg = 0.0;
                     double adjustedBg = 0.0;
