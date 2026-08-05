@@ -4,6 +4,51 @@
 # Ubuntu 24.04 ベースで Amatsukaze を実行するためのマルチステージビルド
 # デバッグモードとリリースモードの両方に対応
 
+# NVEncCのlibplacebo/Vulkanフィルタ用共有ライブラリをビルドする段階。
+# Ubuntu 24.04のlibplacebo-devはVulkan無効でビルドされているため、
+# NVEncC 9.30.2と同じlibplacebo 7.360.1のVulkan対応版を使用する。
+FROM ubuntu:24.04 AS libplacebo-builder
+
+ARG LIBPLACEBO_VER=7.360.1
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        git \
+        liblcms2-dev \
+        libshaderc-dev \
+        libvulkan-dev \
+        libxxhash-dev \
+        meson \
+        ninja-build \
+        pkg-config \
+    && git clone --depth=1 --branch "v${LIBPLACEBO_VER}" --recursive \
+        https://code.videolan.org/videolan/libplacebo.git /tmp/libplacebo \
+    && meson setup /tmp/libplacebo/build /tmp/libplacebo \
+        --buildtype=release \
+        --prefix=/usr/local \
+        --libdir=lib/x86_64-linux-gnu \
+        -Ddefault_library=shared \
+        -Dprefer_static=false \
+        -Dd3d11=disabled \
+        -Ddemos=false \
+        -Dglslang=disabled \
+        -Dlcms=enabled \
+        -Ddovi=disabled \
+        -Dlibdovi=disabled \
+        -Dopengl=disabled \
+        -Dshaderc=enabled \
+        -Dtests=false \
+        -Dvulkan=enabled \
+        -Dxxhash=enabled \
+    && meson compile -C /tmp/libplacebo/build \
+    && DESTDIR=/opt/libplacebo-root meson install -C /tmp/libplacebo/build \
+    && test -f /opt/libplacebo-root/usr/local/lib/x86_64-linux-gnu/libplacebo.so.360 \
+    && rm -rf /var/lib/apt/lists/* /tmp/libplacebo
+
 # ビルド段階
 FROM ubuntu:24.04 AS builder
 
@@ -234,7 +279,7 @@ RUN cd /src/Amatsukaze \
     && rm -rf /tmp/amatsukaze-build /src/Amatsukaze/.git
 
 # 実行段階
-# NVEncC 9.29.1のビルドに使用されたCUDAと実行時ライブラリの版を揃える。
+# NVEncC 9.30.2はCUDA 13.3でビルドし、実行時NVRTCは対応ドライバで使用できる12.9系に固定する。
 FROM nvidia/cuda:13.3.0-base-ubuntu24.04 AS runtime
 
 # 変数の定義（実行段階でも使用）
@@ -263,7 +308,7 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics
 ENV VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_egl_icd.json
 
 ENV QSVENCC_VER=8.24
-ENV NVENCC_VER=9.29.1
+ENV NVENCC_VER=9.30.2
 ENV VCEENCC_VER=9.10
 ENV AMDGPU_INSTALL_VER=25.35.1
 ENV AMDGPU_INSTALL_DEB_VER=7.2.1.70201-1
@@ -318,10 +363,12 @@ RUN apt-get update && apt-get install -y \
         mkvtoolnix \
         opus-tools \
         libvulkan1 \
-        libplacebo-dev \
+        liblcms2-2 \
+        libshaderc1 \
+        libxxhash0 \
         vulkan-tools \
         intel-media-va-driver-non-free intel-opencl-icd libigfxcmrt7 libmfx1 libmfx-gen1.2 libva-drm2 libva-x11-2 ocl-icd-opencl-dev \
-        cuda-nvrtc-13-3 cuda-nvrtc-dev-13-3 libnpp-13-3 \
+        cuda-nvrtc-12-9 cuda-nvrtc-dev-12-9 libnpp-13-3 \
     && wget https://github.com/rigaya/QSVEnc/releases/download/${QSVENCC_VER}/qsvencc_${QSVENCC_VER}_${ARCH}.deb -O qsvencc.deb \
         && apt-get install -y ./qsvencc.deb \
         && rm ./qsvencc.deb \
@@ -355,6 +402,13 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean \
     && apt-get autoremove -y
 
+# libplacebo-builderでビルドしたVulkan対応libplaceboを使用する。
+# Ubuntu標準のVulkan無効版libplaceboはインストールしない。
+COPY --from=libplacebo-builder /opt/libplacebo-root/usr/local/lib/x86_64-linux-gnu/ /usr/local/lib/x86_64-linux-gnu/
+RUN printf '%s\n' /usr/local/lib/x86_64-linux-gnu > /etc/ld.so.conf.d/libplacebo.conf \
+    && ldconfig \
+    && test -s /usr/local/lib/x86_64-linux-gnu/libplacebo.so.360
+
 # NVIDIA Container Toolkit が注入する nvidia_icd.json は libGLX_nvidia.so.0 を
 # 参照する環境があり、ヘッドレスコンテナでは Vulkan ICD として初期化できない場合がある。
 # libEGL_nvidia.so.0 参照の ICD を用意し、NVEncC/libplacebo ではこちらを使う。
@@ -363,9 +417,10 @@ RUN mkdir -p /etc/vulkan/icd.d \
       > /etc/vulkan/icd.d/nvidia_egl_icd.json
 
 # NVEncC の --vpp-colorspace / --vpp-libplacebo-* は Vulkan、libplacebo、NVRTC を実行時に使う。
+# CUDA 13.3イメージ上で12.9系NVRTCを使うため、12.9のライブラリパスを動的リンカへ登録する。
 # cuda-nvrtc-dev が通常は非バージョン付き symlink を提供するが、念のため補完する。
 RUN set -eux; \
-    CUDA_LIB="/usr/local/cuda/targets/x86_64-linux/lib"; \
+    CUDA_LIB="/usr/local/cuda-12.9/targets/x86_64-linux/lib"; \
     if [ -d "$CUDA_LIB" ]; then \
         if [ ! -e "$CUDA_LIB/libnvrtc.so" ]; then \
             found="$(find "$CUDA_LIB" -maxdepth 1 -name 'libnvrtc.so.*' -print -quit)"; \
@@ -375,6 +430,7 @@ RUN set -eux; \
             found="$(find "$CUDA_LIB" -maxdepth 1 -name 'libnvrtc-builtins.so.*' -print -quit)"; \
             if [ -n "$found" ]; then ln -s "$(basename "$found")" "$CUDA_LIB/libnvrtc-builtins.so"; fi; \
         fi; \
+        printf '%s\n' "$CUDA_LIB" > /etc/ld.so.conf.d/cuda-nvrtc-12-9.conf; \
     fi; \
     ldconfig; \
     ldconfig -p | grep -E 'libvulkan|libplacebo|libnvrtc' || true
@@ -414,7 +470,7 @@ RUN if [ "$ENABLE_FASTER_WHISPER" = "1" ]; then \
     fi
 
 # ライブラリパスの設定
-ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 
 # 作業ディレクトリの設定
 WORKDIR /app
