@@ -335,19 +335,19 @@ RUN apt-get update && apt-get install -y \
         && rm ./amdgpu-install.deb \
         && apt-get update \
         && amdgpu-install -y --usecase=opencl --opencl=rocr --no-dkms \
-        && wget https://repo.radeon.com/amdgpu/6.4.4/ubuntu/pool/proprietary/a/amdgpu-pro-core/amdgpu-pro-core_25.10-2202160.24.04_all.deb \
-        && wget https://repo.radeon.com/amdgpu/6.4.4/ubuntu/pool/proprietary/liba/libamdenc-amdgpu-pro/libamdenc-amdgpu-pro_25.10-2202160.24.04_amd64.deb \
-        && wget https://repo.radeon.com/amdgpu/6.4.4/ubuntu/pool/proprietary/a/amf-amdgpu-pro/amf-amdgpu-pro_1.4.37-2202160.24.04_amd64.deb \
+        && wget https://repo.radeon.com/amdgpu/6.4.4/ubuntu/pool/proprietary/a/amdgpu-pro-core/amdgpu-pro-core_25.10-2203192.24.04_all.deb \
+        && wget https://repo.radeon.com/amdgpu/6.4.4/ubuntu/pool/proprietary/liba/libamdenc-amdgpu-pro/libamdenc-amdgpu-pro_25.10-2203192.24.04_amd64.deb \
+        && wget https://repo.radeon.com/amdgpu/6.4.4/ubuntu/pool/proprietary/a/amf-amdgpu-pro/amf-amdgpu-pro_1.4.37-2203192.24.04_amd64.deb \
         && apt-get remove --purge -y amf-amdgpu-pro libamdenc-amdgpu-pro || true \
         && apt-get install -y --allow-downgrades \
-            ./amdgpu-pro-core_25.10-2202160.24.04_all.deb \
-            ./libamdenc-amdgpu-pro_25.10-2202160.24.04_amd64.deb \
-            ./amf-amdgpu-pro_1.4.37-2202160.24.04_amd64.deb \
+            ./amdgpu-pro-core_25.10-2203192.24.04_all.deb \
+            ./libamdenc-amdgpu-pro_25.10-2203192.24.04_amd64.deb \
+            ./amf-amdgpu-pro_1.4.37-2203192.24.04_amd64.deb \
         && apt-mark hold amdgpu-pro-core libamdenc-amdgpu-pro amf-amdgpu-pro \
         && rm -f \
-            ./amdgpu-pro-core_25.10-2202160.24.04_all.deb \
-            ./libamdenc-amdgpu-pro_25.10-2202160.24.04_amd64.deb \
-            ./amf-amdgpu-pro_1.4.37-2202160.24.04_amd64.deb \
+            ./amdgpu-pro-core_25.10-2203192.24.04_all.deb \
+            ./libamdenc-amdgpu-pro_25.10-2203192.24.04_amd64.deb \
+            ./amf-amdgpu-pro_1.4.37-2203192.24.04_amd64.deb \
         && if [ ! -e /lib/x86_64-linux-gnu/libOpenCL.so ] && [ -e /lib/x86_64-linux-gnu/libOpenCL.so.1 ]; then \
             ln -s /lib/x86_64-linux-gnu/libOpenCL.so.1 /lib/x86_64-linux-gnu/libOpenCL.so; \
         fi; \
