@@ -39,7 +39,8 @@ jobs:
 
       - name: Build and push base image
         run: |
-          IMAGE=ghcr.io/${{ github.repository_owner }}/amatsukaze-builder:${{ matrix.tag }}
+          GHCR_OWNER=$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE=ghcr.io/${GHCR_OWNER}/amatsukaze-builder:${{ matrix.tag }}
           docker buildx build \
             --push \
             --build-arg UBUNTU_VERSION=${{ matrix.ubuntu_version }} \
