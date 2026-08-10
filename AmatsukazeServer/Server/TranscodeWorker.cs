@@ -820,7 +820,8 @@ namespace Amatsukaze.Server
             string[] logopaths = null;
             bool enableChapter = !profile.DisableChapter;
             bool enableDelogo = !profile.NoDelogo;
-            if (item.Mode != ProcMode.DrcsCheck && (enableChapter || enableDelogo))
+            bool enableLogoForChapter = enableChapter && !profile.NoLogoInCM;
+            if (item.Mode != ProcMode.DrcsCheck && (enableLogoForChapter || enableDelogo))
             {
                 var logofiles = serviceSetting.LogoSettings
                     .Where(s => s.CanUse(item.TsTime))
@@ -939,6 +940,8 @@ namespace Amatsukaze.Server
             {
                 trimavs = null;
             }
+            string divfilePath = srcpath + ".div.txt";
+            string divfile = null;
 
             try
             {
@@ -1008,12 +1011,18 @@ namespace Amatsukaze.Server
                     }
                 }
 
+                // 再利用時はJLSが実行されないため、ファイルがない場合も明示して古い分割点を消す
+                if (!string.IsNullOrEmpty(resumeDir))
+                {
+                    divfile = divfilePath;
+                }
+
                 string args = server.MakeAmatsukazeArgs(
                     item.Mode, profile,
                     server.AppData_.setting,
                     isMp4,
                     srcpath, srcpathOrg, localdst + ext, json, item.StreamFormat,
-                    item.ServiceId, logopaths, ignoreNoLogo, jlscmd, jlsopt, ceopt, trimavs, resumeDir, server.GetBatDirectoryPath(),
+                    item.ServiceId, logopaths, ignoreNoLogo, jlscmd, jlsopt, ceopt, trimavs, divfile, resumeDir, server.GetBatDirectoryPath(),
                     pipes?.InHandle, pipes?.OutHandle, Id);
                 string exename = server.AppData_.setting.AmatsukazePath;
 

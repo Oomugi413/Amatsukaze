@@ -262,6 +262,7 @@ struct Config {
     bool ignoreNicoJKError;
     double pmtCutSideRate[2];
     bool looseLogoDetection;
+    bool noLogoInCM;
     bool noDelogo;
     bool parallelLogoAnalysis;
     int numParallelLogoAnalysis;
@@ -288,6 +289,7 @@ struct Config {
     bool webvtt;
     int cmoutmask;
     tstring trimavsPath;
+    tstring divFilePath;
     // CM解析のみ実行時にtrim%d.avsを入力ディレクトリへコピーする
     bool copyTrimAVS;
     // 検出モード用
@@ -432,6 +434,8 @@ public:
 
     bool isLooseLogoDetection() const;
 
+    bool isNoLogoInCM() const;
+
     bool isNoDelogo() const;
 
     bool isParallelLogoAnalysis() const;
@@ -463,6 +467,7 @@ public:
     tstring getJoinLogoScpOptions() const;
 
     tstring getTrimAVSPath() const;
+    tstring getDivFilePath() const;
     bool isCopyTrimAVSEnabled() const;
 
     bool isWebVTTEnabled() const;

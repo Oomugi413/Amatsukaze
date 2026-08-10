@@ -307,9 +307,9 @@ ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics
 ENV VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_egl_icd.json
 
-ENV QSVENCC_VER=8.24
-ENV NVENCC_VER=9.30.2
-ENV VCEENCC_VER=9.10
+ENV QSVENCC_VER=8.26
+ENV NVENCC_VER=9.31.1
+ENV VCEENCC_VER=9.12
 ENV AMDGPU_INSTALL_VER=25.35.1
 ENV AMDGPU_INSTALL_DEB_VER=7.2.1.70201-1
 ENV TSREPLACE_VER=0.19
@@ -335,19 +335,19 @@ RUN apt-get update && apt-get install -y \
         && rm ./amdgpu-install.deb \
         && apt-get update \
         && amdgpu-install -y --usecase=opencl --opencl=rocr --no-dkms \
-        && wget https://repo.radeon.com/amdgpu/6.4.4/ubuntu/pool/proprietary/a/amdgpu-pro-core/amdgpu-pro-core_25.10-2202160.24.04_all.deb \
-        && wget https://repo.radeon.com/amdgpu/6.4.4/ubuntu/pool/proprietary/liba/libamdenc-amdgpu-pro/libamdenc-amdgpu-pro_25.10-2202160.24.04_amd64.deb \
-        && wget https://repo.radeon.com/amdgpu/6.4.4/ubuntu/pool/proprietary/a/amf-amdgpu-pro/amf-amdgpu-pro_1.4.37-2202160.24.04_amd64.deb \
+        && wget https://repo.radeon.com/amdgpu/6.4.4/ubuntu/pool/proprietary/a/amdgpu-pro-core/amdgpu-pro-core_25.10-2203192.24.04_all.deb \
+        && wget https://repo.radeon.com/amdgpu/6.4.4/ubuntu/pool/proprietary/liba/libamdenc-amdgpu-pro/libamdenc-amdgpu-pro_25.10-2203192.24.04_amd64.deb \
+        && wget https://repo.radeon.com/amdgpu/6.4.4/ubuntu/pool/proprietary/a/amf-amdgpu-pro/amf-amdgpu-pro_1.4.37-2203192.24.04_amd64.deb \
         && apt-get remove --purge -y amf-amdgpu-pro libamdenc-amdgpu-pro || true \
         && apt-get install -y --allow-downgrades \
-            ./amdgpu-pro-core_25.10-2202160.24.04_all.deb \
-            ./libamdenc-amdgpu-pro_25.10-2202160.24.04_amd64.deb \
-            ./amf-amdgpu-pro_1.4.37-2202160.24.04_amd64.deb \
+            ./amdgpu-pro-core_25.10-2203192.24.04_all.deb \
+            ./libamdenc-amdgpu-pro_25.10-2203192.24.04_amd64.deb \
+            ./amf-amdgpu-pro_1.4.37-2203192.24.04_amd64.deb \
         && apt-mark hold amdgpu-pro-core libamdenc-amdgpu-pro amf-amdgpu-pro \
         && rm -f \
-            ./amdgpu-pro-core_25.10-2202160.24.04_all.deb \
-            ./libamdenc-amdgpu-pro_25.10-2202160.24.04_amd64.deb \
-            ./amf-amdgpu-pro_1.4.37-2202160.24.04_amd64.deb \
+            ./amdgpu-pro-core_25.10-2203192.24.04_all.deb \
+            ./libamdenc-amdgpu-pro_25.10-2203192.24.04_amd64.deb \
+            ./amf-amdgpu-pro_1.4.37-2203192.24.04_amd64.deb \
         && if [ ! -e /lib/x86_64-linux-gnu/libOpenCL.so ] && [ -e /lib/x86_64-linux-gnu/libOpenCL.so.1 ]; then \
             ln -s /lib/x86_64-linux-gnu/libOpenCL.so.1 /lib/x86_64-linux-gnu/libOpenCL.so; \
         fi; \
@@ -485,8 +485,8 @@ RUN git clone --depth 1 -b 0.04 https://github.com/rigaya/SCRenamePy.git tmp_SCR
     && rm -rf tmp_SCRenamePy
 
 RUN wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260720-140556/x264_3223_amd64_linux.tar.xz -O x264.tar.xz \
-    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260801-080608/x265_4.2%2B37_amd64_linux.tar.xz -O x265.tar.xz \
-    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260801-080608/SvtAv1EncApp_4.2.0-67_amd64_linux_clang.tar.xz -O svt-av1.tar.xz \
+    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260808-080802/x265_4.2%2B37_amd64_linux.tar.xz -O x265.tar.xz \
+    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260808-080802/SvtAv1EncApp_4.2.0-71_amd64_linux_clang.tar.xz -O svt-av1.tar.xz \
     && tar -xf x264.tar.xz -C /app/exe_files \
     && tar -xf x265.tar.xz -C /app/exe_files \
     && tar -xf svt-av1.tar.xz -C /app/exe_files \

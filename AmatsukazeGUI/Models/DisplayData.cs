@@ -1783,6 +1783,18 @@ namespace Amatsukaze.Models
         }
         #endregion
 
+        #region NoLogoInCM変更通知プロパティ
+        public bool NoLogoInCM {
+            get { return Data.NoLogoInCM; }
+            set {
+                if (Data.NoLogoInCM == value)
+                    return;
+                Data.NoLogoInCM = value;
+                RaisePropertyChanged();
+            }
+        }
+        #endregion
+
         #region NoDelogo変更通知プロパティ
         public bool NoDelogo {
             get { return Data.NoDelogo; }
@@ -4636,6 +4648,21 @@ namespace Amatsukaze.Models
         }
         #endregion
 
+        #region MatchAllGenres変更通知プロパティ
+        public bool MatchAllGenres
+        {
+            get { return Item.MatchAllGenres; }
+            set
+            {
+                if (Item.MatchAllGenres == value)
+                    return;
+                Item.MatchAllGenres = value;
+                ApplyCondition();
+                RaisePropertyChanged();
+            }
+        }
+        #endregion
+
         #region ServiceEnabled変更通知プロパティ
         public bool ServiceEnabled
         {
@@ -4757,6 +4784,10 @@ namespace Amatsukaze.Models
                 else
                 {
                     cond = "ジャンル:" + cond;
+                    if (Item.MatchAllGenres)
+                    {
+                        cond += "（全ジャンル対象）";
+                    }
                 }
                 conds.Add(cond);
             }
