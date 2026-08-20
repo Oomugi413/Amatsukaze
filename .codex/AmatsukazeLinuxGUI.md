@@ -297,7 +297,7 @@ PythonからC#の `AmatsukazeShared` を直接参照しない。`AmatsukazeShare
 
 処理規則は次のとおりとする。
 
-- 通常ファイルは、映像コンテナーとしてのTSファイルを表す拡張子 `.ts` または `.m2ts` のみ受け付ける。`.m2t` は対象にしない。拡張子比較は大文字・小文字を区別しない。
+- 通常ファイルは、現行QueueManagerの列挙条件に合わせ、映像コンテナーとしてのTSファイルを表す拡張子 `.ts` または `.m2t` のみ受け付ける。`.m2ts` は対象にしない。拡張子比較は大文字・小文字を区別しない。
 - ディレクトリがドロップされた場合は直下の対象ファイルだけを列挙し、再帰検索しない。
 - `os.path.abspath()` と `os.path.normpath()` で、シンボリックリンクを強制解決せずに絶対パスへ正規化する。
 - Linuxのパス規則に合わせ、重複判定は大文字・小文字を区別する。
@@ -313,7 +313,7 @@ Windows GUIと同様に複数ファイルを扱えるため、WebUIの単一パ�
 - OSのファイル選択ダイアログを使用する。
 - GTK 4.10以降の `Gtk.FileDialog.open_multiple()` と `Gtk.FileDialog.select_folder()` を使用する。
 - 複数選択を許可する。
-- フィルターはTSファイル（`.ts`、`.m2ts`）とする。
+- フィルターはTSファイル（`.ts`、`.m2t`）とする。
 - ドラッグ＆ドロップと同じ検証サービスへ入力を渡し、挙動を統一する。
 - 出力先はフォルダー選択ダイアログで選択する。
 
@@ -409,7 +409,6 @@ GUI固有設定はXDG Base Directoryに従って保存する。
 | `scripts/build.sh` | Python構文検査を行い、GUIモジュールとランチャーを配布物へコピー |
 | `doc/BuildLinux.md` | GUIのビルド、起動、必要なLinuxパッケージを追記 |
 | `docker/readme.md` | 同一パスbind mount、ポート公開、UID/GID、GUI接続方法を追記 |
-| `docker/compose.sample.yml` | `/mnt:/mnt` など同一パスbind mountのコメント例を追記 |
 
 Pythonアプリは.NETソリューションへ追加しない。既存REST APIで不足がなければ、`AmatsukazeServer` と `AmatsukazeShared` の変更は行わない。GitHub Actionsは既存の `scripts/build.sh` を呼ぶため、GUI追加だけを理由とするworkflowファイルの変更は原則不要とする。
 
@@ -491,13 +490,11 @@ Docker対応を後から追加するのではなく、フェーズ0からホス�
 
 ### 将来フェーズ: 機能拡張
 
-- 同梱ServerCLIの起動補助とヘルスチェック
+- ホストとコンテナーで異なるパスを使うDocker構成の明示的なパス変換
 - キュー一覧、進捗、キャンセル、ログ表示
 - プロファイル編集
 - サーバー側パス候補APIを使うリモート接続モード
-- ホストとコンテナーで異なるパスを使うDocker構成の明示的なパス変換
 - `.desktop` ファイルとデスクトップメニューへの登録
-- ARM64環境への対応確認
 
 サーバー自動起動を追加する場合も、GUIプロセスへサーバーを埋め込まない。既存 `AmatsukazeServerCLI` を独立プロセスとして起動し、GUI終了後も実行中タスクを継続できるライフサイクルにする。
 
@@ -557,7 +554,7 @@ Docker対応を後から追加するのではなく、フェーズ0からホス�
 2. `GDK_BACKEND=wayland` を指定して起動でき、起動ログまたはGTK InspectorでWayland displayへ接続していることを確認できる。XWaylandでの動作はP0合格としない。
 3. ネイティブWayland上でD&D、ファイルダイアログ、日本語入力、クリップボード、描画が正常に動く。
 4. ローカルServerCLIへの接続状態と接続エラーが分かる。
-5. `.ts` / `.m2ts` をGNOME Filesからドロップして絶対パスを取得でき、`.m2t` は対象外となる。
+5. `.ts` / `.m2t` をGNOME Filesからドロップして絶対パスを取得でき、`.m2ts` は対象外となる。
 6. ファイルダイアログと手入力でも同じ入力一覧を作れる。
 7. WebUIのタスク追加画面と同等のプロファイル、出力先、優先度、追加時バッチ、処理モードを指定できる。
 8. 複数ファイルを1つの `AddQueueRequest` にまとめ、同一のプロファイル、出力先、優先度、処理モード、追加時バッチで登録できる。
@@ -616,17 +613,50 @@ Docker対応を後から追加するのではなく、フェーズ0からホス�
 
 PyGObject固有の解消困難な問題が見つかった場合も、ネイティブWaylandを優先してGTK 4自体は維持し、GirCoreによるC#実装、次にgtkmmによるC++実装の順で再評価する。AvaloniaやWindows WPF全体の移植へ自動的に切り替えない。
 
-## 17. 現行QueueManagerの拡張子条件に関する別途修正注
+## 17. 入力・出力拡張子の全体調査結果
 
-Linux GUIで受け付ける正しい拡張子は `.ts` と `.m2ts` であり、`.m2t` は対象外とする。
+### 17.1 QueueManagerの現行TS入力条件との整合
 
-現行の `AmatsukazeServer/Server/QueueManager.cs` では、`AddQueueRequest.Targets` が `null` の場合に行うディレクトリ自動列挙の条件が `.ts` または `.m2t` となっている。一方、Linux GUIが利用する `Targets != null` の分岐は明示されたTargetをそのまま処理するため、この条件だけを理由に `.m2ts` が拒否されるわけではない。しかし、ディレクトリ自動列挙では正しい `.m2ts` を除外し、対象外の `.m2t` を受け入れる不整合がある。
+Linux GUIの入力拡張子は、現行QueueManagerの列挙条件に合わせて `.ts` と `.m2t` とし、`.m2ts` は対象外とする。
 
-これはLinux GUIの仕様へ合わせるのではなく、QueueManager側の既存バグ候補として別途修正する。実装時に `.m2t` 条件を `.m2ts` へ変更し、少なくとも次の回帰試験を追加する。
+現行の `AmatsukazeServer/Server/QueueManager.cs` では、`AddQueueRequest.Targets` が `null` の場合に行うディレクトリ自動列挙の条件が `.ts` または `.m2t` となっている。本設計ではこれをバグとは扱わず、後段の `TsInfo` / `Mpeg2TsParser` が188バイトのTSパケット（`TS_PACKET_LENGTH = 188`）を前提に処理し、192バイト経路が実装上使われていないため、188バイトTSを受け入れる入力候補として `.m2ts` を除外する現行方針と解釈する。
 
-1. `Targets == null` のディレクトリ列挙で `.ts` と `.m2ts` が追加対象になる。
-2. 同じ列挙で `.m2t` は追加対象にならない。
-3. `Targets != null` で明示した `.m2ts` が従来どおり処理される。
-4. `.TS` と `.M2TS` も大文字・小文字を区別せず処理される。
+Linux GUIは、ファイルダイアログ、ドラッグ＆ドロップ、手入力のすべてで同じ `.ts` / `.m2t` フィルターを使用する。`Targets != null` の明示Targetはサーバー側で拡張子フィルターを持たず、`TsInfo` の内容解析へ進むが、Linux GUIはサーバーのこの挙動に依存せず、`.m2ts` を送信前に除外する。
 
-この修正はLinux GUIの結合試験より前、またはGUI実装と同時並行で行う。設計作成時点では注記のみとし、QueueManagerのコード自体は変更しない。
+実装時は少なくとも次を試験する。
+
+1. `Targets == null` のディレクトリ列挙で `.ts` と `.m2t` が追加対象になる。
+2. 同じ列挙、ファイルダイアログ、ドラッグ＆ドロップで `.m2ts` が対象外になる。
+3. `.TS` と `.M2T` は大文字・小文字を区別せず処理される。
+4. 188バイトTSの `.ts` / `.m2t` サンプルがQueueManagerの `TsInfo` 解析を通過する。
+
+QueueManagerのコード自体は変更せず、Linux GUI側でこの既存条件を再現する。
+
+### 17.2 経路別の入力判定
+
+| 経路 | 拡張子による扱い | 実際の内容判定・注意点 |
+|---|---|---|
+| `AmatsukazeServer` の `AddQueueRequest.Targets == null` | `QueueManager.cs` がディレクトリから現行条件どおり `.ts` または `.m2t` を列挙 | 列挙後は `TsInfo` が188バイトTSを前提にMPEG-TSとして解析する。現行条件では `.m2ts` を自動列挙しない。なお、現行RESTアダプターは `Targets == null` を空リストへ変換してから渡すため、この分岐はREST経由ではなく、サーバー内部/APIのnull指定時の挙動である |
+| `AddQueueRequest.Targets` を明示 | RESTは存在確認だけで、拡張子フィルターなし。Linux GUIは `.ts` / `.m2t` に限定 | `QueueManager` が `TsInfo` で解析するため、通常キューは188バイトTS内容が必要。拡張子だけでは最終的な可否は決まらない |
+| WebUIタスク追加 | パス候補表示は `Extensions=".ts"` のみ | 送信時は入力文字列を `Targets` に入れるだけで、WebUI自身は拡張子を強制しない |
+| Windows GUIのファイルドロップ | 直接ファイルは無条件。ディレクトリは `EndsWith("ts")` | 既存Windows GUIでは `.ts` と `.m2ts` も末尾が `ts` のため列挙されるが、Linux GUIではQueueManager条件に合わせて `.m2ts` を除外する |
+| `AmatsukazeAddTask` | ファイル存在確認のみで拡張子制限なし | 実際のサーバー追加時に上記 `Targets` 経路へ入る |
+| `AmatsukazeCLI` の通常 `ts` / `cm` モード | `-i` の拡張子制限なし | `TsInfo`、TSパケット解析で内容を読む。コード上の通常パケット長は188バイトで、192バイト経路は使用箇所を確認できない |
+| `AmatsukazeCLI --mode g` | `-i` の拡張子制限なし | `avformat_open_input()` に形式を固定せず、同梱FFmpegのプローブ・デマルチプレクサで判定するため、対応範囲はFFmpegビルドに依存する |
+| `AmatsukazeGenLogo` / ロゴ解析 | ヘルプやGUIフィルターはTS（GUIは `.ts` / `.m2ts`） | 実処理は `TsInfo` で内容を読むため、拡張子そのものでは判定しない |
+
+以上から、Linux GUIの初版で表示・選択対象を `.ts` と `.m2t` に限定し、`.m2ts` を除外するのは現行QueueManagerとの整合上妥当である。最終的な受け付け可否はサーバー側のTS解析結果で決まり、188バイトTSとして解析できる実ファイルで結合試験する必要がある。
+
+### 17.3 出力拡張子
+
+出力形式は `MP4`、`MKV`、`M2TS`、`TS`、`TSREPLACE` の5種類で、サーバーとC++ CLIの対応は一致している。
+
+| 出力形式 | 生成拡張子 | 備考 |
+|---|---|---|
+| MP4 | `.mp4` | MP4Box等を使用 |
+| MKV | `.mkv` | mkvmerge等を使用 |
+| M2TS | `.m2ts` | tsmuxer用のmetaファイルを生成 |
+| TS | `.ts` | tsmuxer用のmetaファイルを生成 |
+| TSREPLACE | `.ts` | 中間ベース名に映像コーデック用サフィックスを付ける場合がある |
+
+関連して、Windows GUIの出力ファイル探索フォールバックは `.mp4`、`.mkv`、`.ts` だけを検索しており、`.m2ts` を含まない。これは入力判定ではないが、M2TS出力をGUIで再検出する場合の別の確認事項である。
