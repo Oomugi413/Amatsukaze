@@ -190,6 +190,23 @@ Windowsから ```AmatsukazeClient.bat``` を実行して接続します。
 AmatsukazeAddTask -ip <コンテナを実行中のPCのIPアドレス> -s <プロファイル名> -o /app/output -f /app/input/<入力tsファイル名>
 ```
 
+### Linuxからの接続 (AmatsukazeLinuxGUI)
+
+インストール先にLinux GUIが含まれる場合は、ServerCLIを起動した状態で次のように起動できます。
+
+```sh
+GDK_BACKEND=wayland /path/to/AmatsukazeLinuxGUI.sh
+```
+
+同一ホスト上のAmatsukaze Linux GUIから追加する場合は、GUIとServerCLIが同じ絶対パスを参照できるようにしてください。例えばホストの `/mnt` をコンテナーの `/mnt` へそのままbind mountします。
+
+```yaml
+volumes:
+  - /mnt:/mnt
+```
+
+この構成ではGUIから `/mnt/recording/example.ts` を指定すると、コンテナー内ServerCLIも同じ `/mnt/recording/example.ts` を参照できます。GUIはコンテナーの操作やDockerソケットを必要とせず、RESTポート32769へ接続するだけです。入力・出力ディレクトリの権限は、`RUN_UID` / `RUN_GID` で指定したコンテナー実行ユーザーに合わせてください。
+
 ## 設定
 
 デフォルトの設定は下記のとおりです。必要に応じて```compose.yml```を編集して変更してください。

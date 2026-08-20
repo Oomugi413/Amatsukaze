@@ -1,7 +1,7 @@
 # Amatsukaze Linux簡易GUI 設計・実装計画
 
 - 作成日: 2026-08-20
-- 状態: 実装前の設計案
+- 状態: 初版実装済み（P0起動・REST読み取り確認済み、実キュー追加結合試験待ち）
 - 対象: Linux版Amatsukazeを同一端末から操作する簡易GUI
 - 最優先動作環境: この開発PC（Ubuntu 26.04 LTS / GNOME Shell 50.1 / Wayland）
 

@@ -5,7 +5,7 @@
 ```bash
 sudo apt update
 sudo apt install -y build-essential git wget curl nasm cmake meson ninja-build pkg-config autoconf automake libtool \
-    libssl-dev libz-dev
+    libssl-dev libz-dev python3 python3-gi gir1.2-gtk-4.0 libgtk-4-1
 ```
 次に .NET 10.0 SDKをインストールします。下記はUbuntu 24.04の例を示します。その他の環境については、[リンク先](https://learn.microsoft.com/ja-jp/dotnet/core/install/linux)を参照してください。
 
@@ -42,6 +42,7 @@ sudo apt install -y ./avisynth_<version>_amd64_Ubuntuxx.xx.deb
 - AmatsuakzeServer, AmatsuakzeServerCLI, AmatsuakzeAddTask のビルド (C# dotnet)
 - WebUI静的ファイルの公開と配置 (`exe_files/wwwroot`)
 - インストール先への実行ファイルの配置
+- GTK 4/PyGObject版Linux GUIの構文検査・単体テストと配置 (`exe_files/AmatsukazeLinuxGUI`)
 
 ```bash
 git clone https://github.com/Oomugi413/Amatsukaze.git --recursive
@@ -60,3 +61,14 @@ cd Amatsukaze
 cd $HOME/Amatsukaze
 ./scripts/install.sh
 ```
+
+## Linux GUI
+
+ServerCLIを起動した状態で、インストール先のランチャーを実行します。
+
+```bash
+cd $HOME/Amatsukaze
+GDK_BACKEND=wayland ./AmatsukazeLinuxGUI.sh
+```
+
+初期接続先は `http://127.0.0.1:32769` です。GUIは入力として `.ts` と `.m2t` を受け付け、`.m2ts` は現行QueueManagerの条件に合わせて除外します。PyGObject/GTK 4が見つからない場合は、上記の実行依存パッケージを確認してください。
