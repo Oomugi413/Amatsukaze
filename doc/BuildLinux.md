@@ -72,3 +72,20 @@ GDK_BACKEND=wayland ./AmatsukazeLinuxGUI.sh
 ```
 
 初期接続先は `http://127.0.0.1:32769` です。GUIは入力として `.ts` と `.m2t` を受け付け、`.m2ts` は現行QueueManagerの条件に合わせて除外します。PyGObject/GTK 4が見つからない場合は、上記の実行依存パッケージを確認してください。
+
+### Ubuntuのアプリ一覧・Dockへの登録
+
+ビルド・インストール後、配布物のルートで次を一度実行すると、現在のユーザーのアプリ一覧へ登録されます。
+
+```bash
+cd $HOME/Amatsukaze
+./AmatsukazeLinuxGUI.sh --install-desktop
+```
+
+アプリ一覧から「Amatsukaze Linux GUI」を起動し、起動したアイコンを右クリックして「お気に入りに追加」を選ぶとDockへ固定できます。登録の削除は次のコマンドです。
+
+```bash
+./AmatsukazeLinuxGUI.sh --uninstall-desktop
+```
+
+登録スクリプトはroot権限を要求せず、`XDG_DATA_HOME`（未設定時は `~/.local/share`）へデスクトップエントリとアイコンを配置します。

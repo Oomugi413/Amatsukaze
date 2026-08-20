@@ -14,6 +14,23 @@ else
     echo "AmatsukazeLinuxGUIのPythonファイルが見つかりません。" >&2
     exit 1
 fi
+case "${1:-}" in
+    --install-desktop)
+        if [ "$#" -ne 1 ]; then
+            echo "Usage: $0 [--install-desktop|--uninstall-desktop]" >&2
+            exit 2
+        fi
+        exec "${APP_DIR}/Packaging/install-desktop-entry.sh"
+        ;;
+    --uninstall-desktop)
+        if [ "$#" -ne 1 ]; then
+            echo "Usage: $0 [--install-desktop|--uninstall-desktop]" >&2
+            exit 2
+        fi
+        exec "${APP_DIR}/Packaging/install-desktop-entry.sh" --uninstall
+        ;;
+esac
+
 PYTHON="/usr/bin/python3"
 
 if [ ! -x "${PYTHON}" ]; then

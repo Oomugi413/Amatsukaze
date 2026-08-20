@@ -1,7 +1,7 @@
 # Amatsukaze Linux簡易GUI 設計・実装計画
 
 - 作成日: 2026-08-20
-- 状態: 初版実装済み（P0起動・REST読み取り確認済み、実キュー追加結合試験待ち）
+- 状態: デスクトップ登録実装済み（XDG登録・desktop-file-validate確認済み、GNOME実機確認待ち）
 - 対象: Linux版Amatsukazeを同一端末から操作する簡易GUI
 - 最優先動作環境: この開発PC（Ubuntu 26.04 LTS / GNOME Shell 50.1 / Wayland）
 
@@ -100,6 +100,8 @@ Microsoftの公式説明でもWPFはWindows上だけで動作するフレーム�
 - 入力不足、接続失敗、APIエラーの画面表示
 - WebUIと同じサーバー側UI状態を利用した前回値の復元
 - GUIログの保存
+- Ubuntu/GNOMEのアプリ一覧から起動できるユーザー単位のデスクトップエントリ登録
+- 起動中のアプリをGNOME Dockへユーザー操作で固定できるアプリID・デスクトップエントリ
 
 ### 3.2 初版で実装しない機能
 
@@ -109,6 +111,7 @@ Microsoftの公式説明でもWPFはWindows上だけで動作するフレーム�
 - 別PC上のサーバーへのファイルドラッグ＆ドロップ
 - ホストとコンテナーで異なるパスを使用するDocker構成への自動パス変換
 - WebUIやWindows GUIの置き換え
+- GNOME ShellのFavorites設定を自動変更する処理（ユーザーのDockを勝手に変更しない）
 
 ### 3.3 正式対応条件
 
@@ -218,10 +221,11 @@ AmatsukazeLinuxGUI/
 │   ├── log_service.py
 │   └── task_add_service.py
 ├── Assets/
-│   └── アプリアイコン
+│   └── amatsukaze-linux-gui.png
 ├── Packaging/
 │   ├── AmatsukazeLinuxGUI.sh
-│   └── AmatsukazeLinuxGUI.desktop（将来オプション）
+│   ├── AmatsukazeLinuxGUI.desktop.in
+│   └── install-desktop-entry.sh
 └── Tests/
     ├── test_api_client.py
     ├── test_dto.py
@@ -406,7 +410,7 @@ GUI固有設定はXDG Base Directoryに従って保存する。
 
 | ファイル | 予定する変更 |
 |---|---|
-| `scripts/build.sh` | Python構文検査を行い、GUIモジュールとランチャーを配布物へコピー |
+| `scripts/build.sh` | Python構文検査を行い、GUIモジュール、ランチャー、デスクトップ登録用ファイルを配布物へコピー |
 | `doc/BuildLinux.md` | GUIのビルド、起動、必要なLinuxパッケージを追記 |
 | `docker/readme.md` | 同一パスbind mount、ポート公開、UID/GID、GUI接続方法を追記 |
 
@@ -423,6 +427,25 @@ Pythonアプリは.NETソリューションへ追加しない。既存REST API�
 - 利用者が明示した `GDK_BACKEND` は尊重し、他Linux環境ではGTKが対応するX11バックエンドも使用可能とする。
 
 Ubuntu/Debian系の実行依存として、少なくとも `python3`、`python3-gi`、`gir1.2-gtk-4.0`、`libgtk-4-1` を `doc/BuildLinux.md` と配布ドキュメントへ明記する。他ディストリビューションについては対応するPyGObject/GTK 4パッケージ名を例示する。libadwaitaは初版の必須依存にしない。
+
+### 10.2 Ubuntuアプリ一覧・Dockへの登録
+
+Ubuntu GNOMEのアプリ一覧に表示するため、freedesktop.orgのデスクトップエントリ仕様に準拠した `jp.amatsukaze.LinuxGUI.desktop` を提供する。エントリは次の属性を持つ。
+
+- `Type=Application`
+- `Name=Amatsukaze Linux GUI`
+- `Exec=` はインストール先の `AmatsukazeLinuxGUI.sh` を指す絶対パス
+- `Icon=amatsukaze-linux-gui` とし、同じユーザーデータ領域のhicolorアイコンを使用する
+- `Terminal=false`、`StartupNotify=true`、`StartupWMClass=jp.amatsukaze.LinuxGUI`
+- `Categories=AudioVideo;Video;`
+
+配布物には絶対パスを埋め込む前のテンプレートと、現在の配布物の場所を解決してユーザー単位で登録する `install-desktop-entry.sh` を含める。登録先は `XDG_DATA_HOME` が設定されていれば `${XDG_DATA_HOME}/applications` と `${XDG_DATA_HOME}/icons/hicolor/192x192/apps`、未設定なら `~/.local/share/applications` と `~/.local/share/icons/hicolor/192x192/apps` とする。root権限やシステム全体の `/usr/share/applications` への書き込みは要求しない。
+
+インストールスクリプトは対象ディレクトリを作成し、テンプレートの `Exec` を実際の絶対パスへ展開し、`Icon` 名に対応するPNGをhicolorディレクトリへ配置してから、デスクトップエントリとアイコンを `0644` で保存する。`update-desktop-database` が利用できる場合だけ実行し、存在しなくても登録処理は成功扱いとする。アンインストール指定時は、同じIDのエントリとアイコンだけを削除する。
+
+インストール先の実パスに改行やタブなどの制御文字が含まれる場合、`.desktop`仕様で `Exec` を表現できないため、登録処理をエラーにして不完全なエントリを残さない。
+
+デスクトップエントリをユーザーのアプリケーションディレクトリへ登録すると、GNOMEのアプリ一覧から起動できる。Dockへの固定はGNOME ShellのFavorites設定を自動変更せず、アプリ一覧から起動したアイコンを右クリックして「お気に入りに追加」する手順を文書化する。これにより、Waylandセッションのユーザー設定を外部から書き換えない。
 
 ## 11. 実装フェーズ
 
@@ -471,9 +494,11 @@ Docker対応を後から追加するのではなく、フェーズ0からホス�
 2. ランチャーと必要なGTK/PyGObjectランタイム依存を整備する。
 3. `doc/BuildLinux.md` へ依存パッケージ、起動方法、Wayland確認方法を追記する。
 4. `docker/readme.md` と `docker/compose.sample.yml` へ同一パスbind mount型GUI接続例を追記する。
-5. 既存のLinuxパッケージ作成CIで成果物を確認する。
+5. `.desktop`テンプレート、ユーザー単位の登録スクリプト、hicolorアイコンを配布物へ含める。
+6. `doc/BuildLinux.md` とGUI READMEへアプリ一覧登録、Dock固定、削除方法を追記する。
+7. 既存のLinuxパッケージ作成CIで成果物を確認する。
 
-**完了条件:** 通常のLinuxパッケージ作成手順だけでGUIを含む配布物が生成され、ホスト上ServerCLIと同一パスbind mount型Dockerの両方の起動・接続条件が文書化されていること。
+**完了条件:** 通常のLinuxパッケージ作成手順だけでGUIとデスクトップ登録用ファイルを含む配布物が生成され、ユーザー単位の登録後にUbuntu GNOMEのアプリ一覧から起動できること、ホスト上ServerCLIと同一パスbind mount型Dockerの起動・接続条件が文書化されていること。
 
 ### フェーズ4: 結合試験とリリース判定
 
@@ -494,7 +519,7 @@ Docker対応を後から追加するのではなく、フェーズ0からホス�
 - キュー一覧、進捗、キャンセル、ログ表示
 - プロファイル編集
 - サーバー側パス候補APIを使うリモート接続モード
-- `.desktop` ファイルとデスクトップメニューへの登録
+- システム全体（`/usr/share/applications`）への管理者向け登録
 
 サーバー自動起動を追加する場合も、GUIプロセスへサーバーを埋め込まない。既存 `AmatsukazeServerCLI` を独立プロセスとして起動し、GUI終了後も実行中タスクを継続できるライフサイクルにする。
 
@@ -524,6 +549,8 @@ Docker対応を後から追加するのではなく、フェーズ0からホス�
 - `python3 -m unittest discover AmatsukazeLinuxGUI/Tests`
 - 既存 `scripts/build.sh` による配布物生成
 - 配布物内ランチャーの依存確認と起動
+- `.desktop`テンプレートの必須キー、`Exec`絶対パス、`Icon`名、アプリIDの検証
+- 一時XDGデータディレクトリへの登録・削除と、アイコンの配置確認
 - `git diff --check` と既存テスト
 
 ### 12.3 手動結合試験
@@ -545,6 +572,9 @@ Docker対応を後から追加するのではなく、フェーズ0からホス�
 - サーバー停止、再起動、誤ポート、タイムアウト
 - 入力ファイルまたは出力先が送信直前に消えた場合
 - GUIを閉じてもServerCLIの処理が継続すること
+- 一時XDGデータディレクトリへ登録したエントリがアプリ一覧用の正しい場所に存在すること
+- 登録されたエントリからランチャーを起動でき、Waylandセッションで同じアプリIDにまとめられること
+- GNOMEアプリ一覧から起動後、Dockの「お気に入りに追加」で固定できること（Favoritesの自動変更は行わない）
 
 ## 13. 受け入れ条件
 
@@ -565,9 +595,11 @@ Docker対応を後から追加するのではなく、フェーズ0からホス�
 13. 二重クリックで同じタスクが重複登録されない。
 14. 一括追加をキャンセルした場合、部分的に追加済みとなり得ることが画面で分かる。
 15. GUIを終了してもサーバーと実行中タスクへ影響しない。
-16. GUI固有の実装ファイルが `AmatsukazeLinuxGUI/` 以下にまとまっている。
-17. 既存ファイルの変更を、配布・起動・Docker説明などに必要な最小限へ限定する。
-18. 既存のServerCLI、WebUI、AddTaskのビルドと基本動作が維持される。
+16. ユーザー単位の登録スクリプト実行後、Ubuntu GNOMEのアプリ一覧にGUIが表示される。
+17. アプリ一覧から起動したGUIが正しいランチャー、アイコン、`jp.amatsukaze.LinuxGUI`アプリIDを使用する。
+18. GUI固有の実装ファイルが `AmatsukazeLinuxGUI/` 以下にまとまっている。
+19. 既存ファイルの変更を、配布・起動・デスクトップ登録・Docker説明などに必要な最小限へ限定する。
+20. 既存のServerCLI、WebUI、AddTaskのビルドと基本動作が維持される。
 
 ## 14. リスクと対策
 
@@ -586,6 +618,10 @@ Docker対応を後から追加するのではなく、フェーズ0からホス�
 | 既存APIのエラー形式が一定でない | WebUIと同等の抽出処理をGUI内に閉じ込め、予期しない本文はログへ残す |
 | `CancelAddQueueAsync()` がリクエストIDを受け取らない | 自動キャンセルせず、Linux GUI自身の送信が処理中の場合だけ明示確認後に呼び出す。複数クライアント同時操作は制約として文書化する |
 | 実行環境にGTK 4またはPyGObjectがない | ランチャーの開始時に依存を検査し、必要なディストリビューションパッケージ名を表示する |
+| `.desktop`の絶対パスが配布先ごとに異なる | テンプレートを登録スクリプトで実際の配布物パスへ展開し、固定パスのエントリをリポジトリへ置かない |
+| GNOME Dockのお気に入りを意図せず変更する | Favorites設定は変更せず、アプリ一覧への登録とユーザー操作による固定だけを提供する |
+| `update-desktop-database`がない | 外部コマンドを必須にせず、XDG標準ディレクトリへ正しいファイルを配置する |
+| 配布物のパスに`.desktop`で表現できない制御文字がある | 登録前に検出してエラーにし、壊れたアプリ一覧エントリを作らない |
 
 ## 15. 公式資料と調査根拠
 
@@ -610,6 +646,7 @@ Docker対応を後から追加するのではなく、フェーズ0からホス�
 3. ServerCLIのREST既定ポートとポート競合時の挙動を実機で確認する。
 4. WebUIのタスク追加DTOとUI項目に変更がないか確認する。
 5. フェーズ0の技術検証を完了してから、配布統合を含む本実装へ進む。
+6. `XDG_DATA_HOME` または `~/.local/share` のアプリケーション・アイコンディレクトリへ登録でき、生成した `.desktop` が検証ツールを通ることを確認する。
 
 PyGObject固有の解消困難な問題が見つかった場合も、ネイティブWaylandを優先してGTK 4自体は維持し、GirCoreによるC#実装、次にgtkmmによるC++実装の順で再評価する。AvaloniaやWindows WPF全体の移植へ自動的に切り替えない。
 

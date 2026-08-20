@@ -269,13 +269,18 @@ install -D -t "${INSTALL_DIR}/exe_files" "${BUILD_DIR}/build_ffnk/AmatsukazeCLI/
 install -D -t "${INSTALL_DIR}/exe_files" "${BUILD_DIR}/build_ffnk/AmatsukazeGenLogo/AmatsukazeGenLogo"
 install -D -t "${INSTALL_DIR}/exe_files" "${BUILD_DIR}/build_ffnk/Amatsukaze/libAmatsukaze.so"
 install -D -t "${INSTALL_DIR}/exe_files" "${BUILD_DIR}/build_ff612/Amatsukaze/libAmatsukaze2.so"
-# GTK 4/PyGObject GUI（OSのPythonから実行するため、Python本体へ凍結しない）
+# GTK 4/PyGObject GUI（OSのPythonから実行するため、Python本体へ凍結しない）。
+# .desktopテンプレートとアイコンはユーザー単位の登録スクリプトから利用する。
 cp -r "${PROJECT_ROOT}/AmatsukazeLinuxGUI/amatsukaze_linux_gui" "${INSTALL_DIR}/exe_files/AmatsukazeLinuxGUI/"
 # compileallが生成したキャッシュは配布物へ含めない。
 find "${INSTALL_DIR}/exe_files/AmatsukazeLinuxGUI" -type d -name __pycache__ -prune -exec rm -rf {} +
 install -m 755 -D "${PROJECT_ROOT}/AmatsukazeLinuxGUI/amatsukaze_linux_gui.py" "${INSTALL_DIR}/exe_files/AmatsukazeLinuxGUI/amatsukaze_linux_gui.py"
 install -m 644 -D "${PROJECT_ROOT}/AmatsukazeLinuxGUI/README.md" "${INSTALL_DIR}/exe_files/AmatsukazeLinuxGUI/README.md"
 install -m 755 -D "${PROJECT_ROOT}/AmatsukazeLinuxGUI/Packaging/AmatsukazeLinuxGUI.sh" "${INSTALL_DIR}/AmatsukazeLinuxGUI.sh"
+install -m 755 -D "${PROJECT_ROOT}/AmatsukazeLinuxGUI/Packaging/AmatsukazeLinuxGUI.sh" "${INSTALL_DIR}/exe_files/AmatsukazeLinuxGUI/Packaging/AmatsukazeLinuxGUI.sh"
+install -m 755 -D "${PROJECT_ROOT}/AmatsukazeLinuxGUI/Packaging/install-desktop-entry.sh" "${INSTALL_DIR}/exe_files/AmatsukazeLinuxGUI/Packaging/install-desktop-entry.sh"
+install -m 644 -D "${PROJECT_ROOT}/AmatsukazeLinuxGUI/Packaging/AmatsukazeLinuxGUI.desktop.in" "${INSTALL_DIR}/exe_files/AmatsukazeLinuxGUI/Packaging/AmatsukazeLinuxGUI.desktop.in"
+install -m 644 -D "${PROJECT_ROOT}/AmatsukazeLinuxGUI/Assets/amatsukaze-linux-gui.png" "${INSTALL_DIR}/exe_files/AmatsukazeLinuxGUI/Assets/amatsukaze-linux-gui.png"
 # ニコニコ実況コメント取得・ASS変換スクリプト（Linux用）
 install -m 755 -D -t "${INSTALL_DIR}/exe_files" ./scripts/nicojk_ass.py
 # danmaku2ass（コメントXML→ASS変換、GPL-3.0）: なければダウンロード
