@@ -12,9 +12,16 @@
 #include "ReaderWriterFFmpeg.h"
 #include "TranscodeSetting.h"
 #include "FilteredSource.h"
+#include <atomic>
 #include <functional>
 
 class EncoderArgumentGenerator;
+
+bool isSoftwareSplitEncoder(ENUM_ENCODER encoder);
+
+// エンコーダフィルタのタイムコードに埋め込むチャンク境界コメントのタグ
+// (分割エンコードの連結時に書き込み、CFR/VFR判定時に該当フレーム間隔を除外する)
+#define ENCODER_FILTER_CHUNK_BOUNDARY_TAG "amt-chunk-boundary:"
 
 class Y4MWriter {
     static const char* getPixelFormat(VideoInfo vi);
@@ -33,7 +40,7 @@ protected:
 class Y4MEncodeWriter : AMTObject, NonCopyable {
     static const char* getYUV(VideoInfo vi);
 public:
-    Y4MEncodeWriter(AMTContext& ctx, const tstring& encoder_args, VideoInfo vi, VideoFormat fmt, bool disablePowerThrottoling, bool captureOutputOnly = false, StdRedirectedSubProcess::LineCallback lineCallback = StdRedirectedSubProcess::LineCallback(), bool sarInContainerOnly = false);
+    Y4MEncodeWriter(AMTContext& ctx, const tstring& encoder_args, VideoInfo vi, VideoFormat fmt, bool disablePowerThrottoling, bool captureOutputOnly = false, StdRedirectedSubProcess::LineCallback lineCallback = StdRedirectedSubProcess::LineCallback(), bool sarInContainerOnly = false, const tstring& filterArgs = tstring());
     ~Y4MEncodeWriter();
 
     void inputFrame(const PVideoFrame& frame);
@@ -59,7 +66,9 @@ private:
     };
 
     std::unique_ptr<MyVideoWriter> y4mWriter_;
+    std::unique_ptr<StdRedirectedSubProcess> filterProcess_;
     std::unique_ptr<StdRedirectedSubProcess> process_;
+    std::atomic<int> brokenY4MDelimiterCount_;
 };
 
 class AMTFilterVideoEncoder : public AMTObject {
@@ -70,7 +79,9 @@ public:
     void encode(
         PClip source, VideoFormat outfmt, const std::vector<double>& timeCodes,
         EncoderArgumentGenerator& argGen, const std::vector<int>& passList,
-        const std::vector<BitrateZone>& bitrateZones, double vfrBitrateScale,
+        const std::vector<BitrateZone>& bitrateZones,
+        const std::vector<EncoderZone>& cmzones, bool useCMChunkSplit,
+        double vfrBitrateScale,
         const tstring& timecodePath, int vfrTimingFps, const tstring& baseOutputPath,
         EncodeFileKey key, int serviceId, const EncoderOptionInfo& eoInfo,
         const int pipeParallel, const bool disablePowerThrottoling, IScriptEnvironment* env,
@@ -82,6 +93,8 @@ private:
         EncoderArgumentGenerator& argGen,
         const std::vector<double>& timeCodes,
         const std::vector<BitrateZone>& bitrateZones,
+        const std::vector<EncoderZone>& cmzones,
+        bool useCMChunkSplit,
         double vfrBitrateScale,
         const tstring& timecodePath,
         int vfrTimingFps,
@@ -184,4 +197,3 @@ private:
 
     void onAudioPacket(AVPacket& packet);
 };
-

@@ -10,6 +10,7 @@
              xmlns:c="clr-namespace:Amatsukaze.Components" 
              xmlns:Models="clr-namespace:Amatsukaze.Models" x:Class="Amatsukaze.Views.SettingPanel" 
              mc:Ignorable="d" 
+             IsVisibleChanged="SettingPanel_IsVisibleChanged"
              d:DesignHeight="1900" d:DesignWidth="600" d:Background="White"
              d:DataContext="{d:DesignInstance {x:Type vm:SettingViewModel}}">
     
@@ -125,8 +126,31 @@
                             </Style>
                         </CheckBox.Style>
                     </CheckBox>
-                    <CheckBox Height="16" Margin="0,4"  Content="Amatsukaze起動時にアクティブなアイテムがあるときはキューを停止する" 
-                              IsChecked="{Binding Model.Setting.PauseOnStarted, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <CheckBox Grid.Column="0" Height="16" Margin="0,4"  Content="Amatsukaze起動時にアクティブなアイテムがあるときはキューを停止する" 
+                                  IsChecked="{Binding Model.Setting.PauseOnStarted, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                        <!-- 常時表示。更新を検知したときだけ赤字にする。押すとWebUIの更新画面を開く -->
+                        <Button Grid.Column="1" Padding="10,2" Margin="6,4"
+                                VerticalAlignment="Center"
+                                Command="{Binding OpenUpdatePageCommand}"
+                                ToolTip="実行ファイルのダウンロード・更新を行います。更新があるときは赤字になります。">
+                            <Button.Style>
+                                <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding Model.HasUpdate}" Value="True">
+                                            <Setter Property="Foreground" Value="{DynamicResource AMT.UpdateAttentionForegroundBrush}"/>
+                                            <Setter Property="FontWeight" Value="Bold"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </Button.Style>
+                            <TextBlock TextAlignment="Center"><Run Text="実行ファイル"/><LineBreak/><Run Text="ダウンロード・更新"/></TextBlock>
+                        </Button>
+                    </Grid>
                 </StackPanel>
 
                 <StackPanel Grid.Row="1" Grid.Column="0">

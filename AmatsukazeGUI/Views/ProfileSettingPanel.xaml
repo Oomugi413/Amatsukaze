@@ -443,6 +443,18 @@
                                     </DockPanel>
                                 </StackPanel>
                             </DataTemplate>
+                            <DataTemplate DataType="{x:Type m:DisplayEncoderFilter}">
+                                <StackPanel>
+                                    <v:EncoderFilterSettingPanel DataContext="{Binding EncoderFilterSetting}"/>
+                                    <TextBlock Margin="0,6,0,0" Text="追加コマンド" />
+                                    <TextBox Height="80" Margin="0,3" AcceptsReturn="True" TextWrapping="Wrap"
+                                             VerticalScrollBarVisibility="Auto"
+                                             Text="{Binding FilterOption, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                             ToolTip="{Binding FilterOptionToolTip}" />
+                                    <TextBlock Margin="0,3" TextWrapping="Wrap"
+                                               Text="--vpp-* 等のフィルタオプションを記述します。エンコーダがこのフィルタと同じ場合はエンコーダオプションに結合して1プロセスで処理されます。" />
+                                </StackPanel>
+                            </DataTemplate>
                             <DataTemplate DataType="{x:Type m:DisplayNoFilter}">
                                 <DockPanel />
                             </DataTemplate>
@@ -801,6 +813,12 @@
                                      Text="{Binding Model.SelectedProfile.MaxFadeLength, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
                         </WrapPanel>
                     </CheckBox>
+                    <WrapPanel Orientation="Horizontal" ToolTip="指定秒数未満の短い区間は出力しません。0の場合は既定値の5秒を使用します。">
+                        <TextBlock VerticalAlignment="Center" Text="出力する最短区間:"/>
+                        <TextBox Margin="4,3" Width="72"
+                                 Text="{Binding Model.SelectedProfile.MinOutputDuration, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                        <TextBlock VerticalAlignment="Center" Text="秒"/>
+                    </WrapPanel>
                 </StackPanel>
 
                 <StackPanel Grid.Row="23" Grid.Column="0" Margin="0,20,0,0"

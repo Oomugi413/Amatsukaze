@@ -23,9 +23,9 @@ jobs:
       JOINLOGO_URL: https://github.com/yobibi/join_logo_scp/releases/download/v5.1.1/join_logo_scp_51_1.zip
       AVSCUDA_URL: https://github.com/rigaya/AviSynthCUDAFilters/releases/download/0.7.3/AviSynthCUDAFilters_Release_0.7.3.zip
       LSMASH_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20250907-045307/lsmash_20200404.7z
-      X264_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260813-214905/x264_3223_x64.zip
-      X265_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260813-214905/x265_4.3%2B13_x64.zip
-      SVT_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260813-214905/SvtAv1EncApp_4.2.0-76_x64_clang.zip
+      X264_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260829-082206/x264_3223_x64.zip
+      X265_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260829-082206/x265_4.3%2B22_x64.zip
+      SVT_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260829-082206/SvtAv1EncApp_4.2.0-98_x64_clang.zip
       NNEDI3_URL: https://github.com/rigaya/NNEDI3/releases/download/0.00/nnedi3_0.00_x64.zip
       BASE_PKG_URL: https://github.com/rigaya/Amatsukaze/releases/download/1.0.8.5/AmatsukazeBasePkg_20260802.7z
     steps:
@@ -97,6 +97,7 @@ jobs:
           curl.exe -fL --retry 3 --retry-delay 10 -o deps\\x265.zip "%X265_URL%"
           curl.exe -fL --retry 3 --retry-delay 10 -o deps\\svt.zip "%SVT_URL%"
           curl.exe -fL --retry 3 --retry-delay 10 -o deps\\nnedi3.zip "%NNEDI3_URL%"
+          git clone --depth 1 --branch 0.05 --single-branch https://github.com/rigaya/SCRenamePy.git deps\\screname
           echo --- deps contents (after Download) ---
           tree /f deps
 
@@ -204,6 +205,22 @@ jobs:
           if exist defaults\\profile robocopy defaults\\profile package\\profile /E /NFL /NDL /NJH /NJS
           if exist defaults\\drcs\\drcs_map.txt copy /y defaults\\drcs\\drcs_map.txt package\\exe_files
           if exist defaults\\exe_files\\plugins64\\*.avsi copy /y defaults\\exe_files\\plugins64\\*.avsi package\\exe_files\\plugins64
+
+          rem SCRenamePy 0.05タグの全ファイル（.gitを除外）
+          if not exist deps\\screname\\SCRename.py (
+            echo SCRenamePyのクローン先が見つかりません。
+            exit /b 1
+          )
+          if not exist package\\exe_files\\SCRenamePy mkdir package\\exe_files\\SCRenamePy
+          robocopy deps\\screname package\\exe_files\\SCRenamePy /E /XD .git /NFL /NDL /NJH /NJS
+          if errorlevel 8 (
+            echo SCRenamePyの配置に失敗しました。
+            exit /b 1
+          )
+          if not exist package\\exe_files\\SCRenamePy\\SCRename.py (
+            echo SCRename.pyの配置を確認できません。
+            exit /b 1
+          )
 
           rem join_logo + JL
           for /r deps\\join_logo %%f in (join_logo_scp.exe) do copy /y "%%f" package\\exe_files

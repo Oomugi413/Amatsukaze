@@ -927,6 +927,28 @@ namespace Amatsukaze.Server
             };
         }
 
+        private static EncoderFilterSetting DefaultEncoderFilterSetting()
+        {
+            return new EncoderFilterSetting()
+            {
+                KnnStrength = 0.08,
+                NlmeansSigma = 0.005,
+                PmdStrength = 100,
+                DenoiseDctSigma = 4.0,
+                SmoothQP = 12,
+                Fft3dSigma = 1.0,
+                Convolution3dThresh = 3.0,
+                MsmoothStrength = 3,
+                ResizeWidth = 1280,
+                ResizeHeight = 720,
+                UnsharpWeight = 0.5,
+                EdgeLevelStrength = 5.0,
+                WarpSharpDepth = 16.0,
+                MSharpenStrength = 1.0,
+                OutputDepth = EncoderFilterOutputDepth.Bit10
+            };
+        }
+
         public static ProfileSetting NormalizeProfile(ProfileSetting profile)
         {
             if(profile == null)
@@ -937,6 +959,7 @@ namespace Amatsukaze.Server
                     BitrateCM = 0.5,
                     CMQualityOffset = 0,
                     OutputMask = 1,
+                    MinOutputDuration = 5,
                     DisableChapter = true, // デフォルトはチャプター解析無効
                     DisableSubs = true, // デフォルトは字幕無効
                     DisableHashCheck = true,
@@ -962,6 +985,10 @@ namespace Amatsukaze.Server
                 profile.FilterOption = FilterOption.Custom;
                 profile.FilterSetting = DefaultFilterSetting();
             }
+            if (profile.EncoderFilterSetting == null)
+            {
+                profile.EncoderFilterSetting = DefaultEncoderFilterSetting();
+            }
             if(profile.FilterSetting.AutoVfrParallel == 0)
             {
                 // 初期値
@@ -977,6 +1004,10 @@ namespace Amatsukaze.Server
             if (profile.EncoderParallel <= 0)
             {
                 profile.EncoderParallel = 1;
+            }
+            if (profile.MinOutputDuration < 0)
+            {
+                profile.MinOutputDuration = 0;
             }
             return profile;
         }

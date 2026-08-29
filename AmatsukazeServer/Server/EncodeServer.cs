@@ -1,6 +1,7 @@
 ﻿#define PROFILE
 using Amatsukaze.Lib;
 using Amatsukaze.Server.Rest;
+using Amatsukaze.Server.Update;
 using Amatsukaze.Shared;
 using System;
 using System.Collections.Generic;
@@ -59,6 +60,7 @@ namespace Amatsukaze.Server
         private MultiUserClient multiClient;
         private RestStateStore restState;
         private RestApiHost restApiHost;
+        internal UpdateManager UpdateManager { get; private set; }
 
         private Action finishRequested;
 
@@ -291,6 +293,19 @@ namespace Amatsukaze.Server
             }
         }
 
+        internal DateTime? LastUpdateCheckedAt {
+            get { return UIState_.LastUpdateCheckedAt; }
+        }
+
+        internal void SetLastUpdateCheckedAt(DateTime value)
+        {
+            if (UIState_.LastUpdateCheckedAt != value)
+            {
+                UIState_.LastUpdateCheckedAt = value;
+                uiStateUpdated = true;
+            }
+        }
+
         public EncodeServer(int port, IUserClient client, Action finishRequested)
         {
 #if PROFILE
@@ -488,6 +503,7 @@ namespace Amatsukaze.Server
                 AppData_.setting.NumGPU, AppData_.setting.MaxGPUResources);
 
             pauseScheduler = new PauseScheduler(this, workerPool);
+            UpdateManager = new UpdateManager(this);
 
 #if PROFILE
             prof.PrintTime("EncodeServer 2");
@@ -623,6 +639,8 @@ namespace Amatsukaze.Server
                     Util.AddLog($"[REST] APIサーバ起動失敗: {ex.GetType().Name}: {ex.Message}", ex);
                 }
             }
+            // 更新チェックはサーバー初期化の完了後にバックグラウンドで開始する
+            UpdateManager.Start();
         }
 
         #region IDisposable Support
@@ -637,6 +655,8 @@ namespace Amatsukaze.Server
                 if (disposing)
                 {
                     // TODO: マネージ状態を破棄します (マネージ オブジェクト)。
+
+                    UpdateManager?.Dispose();
 
                     // キュー状態を保存する
                     try
@@ -1136,10 +1156,48 @@ namespace Amatsukaze.Server
         }
         #endregion
 
+        private static readonly HashSet<string> AutoPathExcludedDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "wwwroot",
+            "plugins64",
+            "7z",
+            "cmd",
+        };
+
+        private static IEnumerable<string> EnumerateAutoPathSearchDirectories(string basePath)
+        {
+            yield return basePath;
+
+            var currentDirectories = new[] { basePath };
+            for (int depth = 0; depth < 2; depth++)
+            {
+                var nextDirectories = new List<string>();
+                foreach (var currentDirectory in currentDirectories)
+                {
+                    foreach (var directory in Directory.EnumerateDirectories(currentDirectory))
+                    {
+                        var directoryName = Path.GetFileName(directory);
+                        if (AutoPathExcludedDirectories.Contains(directoryName) ||
+                            directoryName.StartsWith(".", StringComparison.Ordinal))
+                        {
+                            continue;
+                        }
+
+                        yield return directory;
+                        nextDirectories.Add(directory);
+                    }
+                }
+                currentDirectories = nextDirectories.ToArray();
+            }
+        }
+
         private static string GetExePath(string basePath, string pattern, bool recursive = false)
         {
-            System.IO.SearchOption option = recursive ? System.IO.SearchOption.AllDirectories : System.IO.SearchOption.TopDirectoryOnly;
-            foreach (var path in Directory.GetFiles(basePath, "*", option))
+            IEnumerable<string> paths = recursive
+                ? Directory.GetFiles(basePath, "*", System.IO.SearchOption.AllDirectories)
+                : EnumerateAutoPathSearchDirectories(basePath).SelectMany(
+                    directory => Directory.GetFiles(directory, "*", System.IO.SearchOption.TopDirectoryOnly));
+            foreach (var path in paths)
             {
                 var fname = Path.GetFileName(path);
                 if (fname.StartsWith(pattern)
@@ -1503,6 +1561,20 @@ namespace Amatsukaze.Server
             }
         }
 
+        private static void NormalizeUpdateSettings(Setting setting)
+        {
+            if (setting == null)
+            {
+                return;
+            }
+            if (setting.UpdateCheckIntervalHours <= 0)
+            {
+                setting.UpdateCheckIntervalHours = 24;
+            }
+            setting.UpdateDisabledTargets ??= new List<string>();
+            setting.UpdateProxy ??= string.Empty;
+        }
+
         private Setting GetDefaultSetting()
         {
             var setting = SetDefaultPath(new Setting()
@@ -1511,10 +1583,15 @@ namespace Amatsukaze.Server
                 NumParallelLogoAnalysis = 0,
                 DeleteOldLogsDays = 180,
                 AutoLogoPendingDisabled = false,
-                DeleteTaskWorkDirOnQueueRemove = false
+                DeleteTaskWorkDirOnQueueRemove = false,
+                UpdateCheckEnabled = true,
+                UpdateCheckIntervalHours = 24,
+                UpdateDisabledTargets = new List<string>(),
+                UpdateProxy = string.Empty
             });
             NormalizeTrimAdjustSettings(setting);
             NormalizeAutoLogoPendingSettings(setting);
+            NormalizeUpdateSettings(setting);
             return setting;
         }
 
@@ -1564,6 +1641,7 @@ namespace Amatsukaze.Server
             }
             NormalizeTrimAdjustSettings(AppData_.setting);
             NormalizeAutoLogoPendingSettings(AppData_.setting);
+            NormalizeUpdateSettings(AppData_.setting);
             if (AppData_.scriptData == null)
             {
                 AppData_.scriptData = new MakeScriptData();
@@ -2108,7 +2186,7 @@ namespace Amatsukaze.Server
                             .Append("\"");
                     }
 
-                    var encoderOption = GetEncoderOption(profile);
+                    var encoderOption = ProfileSettingExtensions.NormalizeCommandLineOption(GetEncoderOption(profile));
                     if (string.IsNullOrEmpty(encoderOption) == false)
                     {
                         sb.Append(" -eo \"")
@@ -2186,6 +2264,10 @@ namespace Amatsukaze.Server
                     {
                         sb.Append(" --splitsub");
                     }
+                    if (profile.MinOutputDuration > 0)
+                    {
+                        sb.Append(" --min-output-duration ").Append(profile.MinOutputDuration);
+                    }
                     if (!profile.DisableChapter)
                     {
                         sb.Append(" --chapter");
@@ -2239,6 +2321,20 @@ namespace Amatsukaze.Server
                                 .Append("\"");
                         }
                     }
+                    else if (ProfileSettingExtensions.GetFilterEncoderType(profile.FilterOption) is EncoderType filterEncoderType)
+                    {
+                        sb.Append(" -eft ")
+                            .Append(GetEncoderName(filterEncoderType))
+                            .Append(" -ef \"")
+                            .Append(GetEncoderPath(filterEncoderType, setting))
+                            .Append("\" -efo \"")
+                            .Append(ProfileSettingExtensions.GetFilterEncoderOption(profile))
+                            .Append("\"");
+                        if (profile.EncoderFilterSetting?.EnableDeinterlace == true)
+                        {
+                            sb.Append(" -efd");
+                        }
+                    }
 
                     if (profile.AutoBuffer)
                     {
@@ -2274,7 +2370,7 @@ namespace Amatsukaze.Server
                             .Append(GetAudioEncoderPath(profile.AudioEncoderType, setting))
                             .Append("\"");
 
-                        var audioEncoderOption = GetAudioEncoderOption(profile);
+                        var audioEncoderOption = ProfileSettingExtensions.NormalizeCommandLineOption(GetAudioEncoderOption(profile));
                         if (string.IsNullOrEmpty(audioEncoderOption) == false)
                         {
                             sb.Append(" -aeo \"")
@@ -2651,6 +2747,31 @@ namespace Amatsukaze.Server
                 if (string.IsNullOrEmpty(encoderPath))
                 {
                     throw new ArgumentException("エンコーダパスが設定されていません");
+                }
+
+                var filterEncoderType = ProfileSettingExtensions.GetFilterEncoderType(profile.FilterOption);
+                if (filterEncoderType.HasValue)
+                {
+                    string filterEncoderPath = GetEncoderPath(filterEncoderType.Value, setting);
+                    if (string.IsNullOrEmpty(filterEncoderPath))
+                    {
+                        throw new ArgumentException(filterEncoderType.Value + "フィルタのエンコーダパスが設定されていません");
+                    }
+                    if (string.IsNullOrWhiteSpace(ProfileSettingExtensions.GetFilterEncoderOption(profile)))
+                    {
+                        Util.AddLog("警告: エンコーダフィルタのオプションが空です（フィルタなしと同じ動作になります）", null);
+                    }
+                    // 本エンコーダが分割並列を自前で行うエンコーダ(QSVEnc/NVEnc/VCEEnc)の場合、
+                    // 別プロセスのフィルタがフレーム数を変更するとチャンクの開始フレーム位置がずれるため併用できない
+                    if (filterEncoderType.Value != profile.EncoderType
+                        && profile.EncoderParallel > 1 && !profile.TwoPass
+                        && (profile.EncoderType == EncoderType.QSVEnc
+                            || profile.EncoderType == EncoderType.NVEnc
+                            || profile.EncoderType == EncoderType.VCEEnc))
+                    {
+                        throw new ArgumentException(profile.EncoderType +
+                            "では、本エンコーダと異なるエンコーダフィルタとエンコード分割並列を併用できません");
+                    }
                 }
 
                 if (profile.OutputFormat == FormatType.MP4)
@@ -3590,6 +3711,7 @@ namespace Amatsukaze.Server
                     SetDefaultPath(data.Setting);
                     CheckSetting(null, data.Setting);
                     NormalizeAutoLogoPendingSettings(data.Setting);
+                    NormalizeUpdateSettings(data.Setting);
                     AppData_.setting = data.Setting;
                     workerPool.SetNumParallel(data.Setting.NumParallel);
                     SetScheduleParam(AppData_.setting.SchedulingEnabled,
@@ -3722,7 +3844,14 @@ namespace Amatsukaze.Server
         {
             if (request.IsQueue)
             {
-                workerPool.SetPause(request.Pause, false);
+                if (request.Pause == false && workerPool.MaintenancePaused)
+                {
+                    await NotifyError("更新の適用中のため再開できません", false);
+                }
+                else
+                {
+                    workerPool.SetPause(request.Pause, false);
+                }
             }
             else
             {
@@ -3745,6 +3874,17 @@ namespace Amatsukaze.Server
             Task task = RequestState();
             await task;
         }
+
+        /// <summary>
+        /// 更新の適用中だけキューを停止する
+        /// </summary>
+        internal Task SetMaintenancePause(bool pause)
+        {
+            workerPool.SetMaintenancePause(pause);
+            return RequestState();
+        }
+
+        internal bool MaintenancePaused => workerPool.MaintenancePaused;
 
         public Task CancelAddQueue()
         {
@@ -4140,6 +4280,7 @@ namespace Amatsukaze.Server
                 EncoderSuspended = workers.Select(w => w.UserSuspended).ToArray(),
                 Running = nowEncoding,
                 ScheduledPause = workerPool.ScheduledPaused,
+                MaintenancePaused = workerPool.MaintenancePaused,
                 ScheduledSuspend = workers.FirstOrDefault()?.ScheduledSuspended ?? false,
                 Progress = Progress
             };
@@ -4271,6 +4412,24 @@ namespace Amatsukaze.Server
                 return Client.OnLogFile(ReadCheckLogFIle(req.CheckLogItem.CheckStartDate));
             }
             return Task.FromResult(0);
+        }
+
+        public Task RequestLogFilePath(LogFileRequest req)
+        {
+            string path = null;
+            if (req?.LogItem != null)
+            {
+                path = Path.GetFullPath(GetLogFileBase(req.LogItem.EncodeStartDate) + ".txt");
+            }
+            else if (req?.CheckLogItem != null)
+            {
+                path = Path.GetFullPath(GetCheckLogFileBase(req.CheckLogItem.CheckStartDate) + ".txt");
+            }
+            return Client.OnLogFilePath(new LogFilePathResponse()
+            {
+                RequestId = req?.RequestId,
+                Path = path
+            });
         }
 
         public Task RequestDrcsImages()

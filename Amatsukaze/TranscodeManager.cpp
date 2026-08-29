@@ -16,6 +16,7 @@
 #include "rgy_mutex.h"
 #include "Subtitle.h"
 #include "WaveWriter.h"
+#include <cmath>
 #include "TsInfo.h"
 #include <filesystem>
 
@@ -86,6 +87,181 @@ static void writeTStringArray(const File& file, const std::vector<tstring>& stri
     file.writeValue((int64_t)strings.size());
     for (const auto& str : strings) {
         writeTString(file, str);
+    }
+}
+
+// タイムコードファイルの最大サイズ (1行10バイト強として約150万フレーム分)
+static const int64_t MAX_TIMECODE_FILE_SIZE = 16 * 1024 * 1024;
+
+// タイムコードのコメント行からチャンク境界の出力フレーム番号を読み取る
+static void parseChunkBoundaryComment(const std::string& comment, std::vector<int>& boundaries) {
+    const size_t tagPos = comment.find(ENCODER_FILTER_CHUNK_BOUNDARY_TAG);
+    if (tagPos == std::string::npos) {
+        return;
+    }
+    size_t pos = tagPos + strlen(ENCODER_FILTER_CHUNK_BOUNDARY_TAG);
+    while (pos < comment.size()) {
+        const size_t first = comment.find_first_of("0123456789", pos);
+        if (first == std::string::npos) break;
+        const size_t last = comment.find_first_not_of("0123456789", first);
+        boundaries.push_back(std::atoi(comment.substr(first, last - first).c_str()));
+        if (last == std::string::npos) break;
+        pos = last;
+    }
+}
+
+static std::vector<double> readEncoderFilterTimecodeFile(const tstring& path, std::vector<int>* boundaries = nullptr) {
+    std::string text;
+    {
+        File input(path, _T("rb"));
+        const int64_t fileSize = input.size();
+        if (fileSize <= 0 || fileSize > MAX_TIMECODE_FILE_SIZE) {
+            THROW(FormatException, "エンコーダフィルタのタイムコードが空または大きすぎます");
+        }
+        text.resize((size_t)fileSize);
+        if (input.read(MemoryChunk((uint8_t*)text.data(), (size_t)fileSize)) != (size_t)fileSize) {
+            THROW(RuntimeException, "エンコーダフィルタのタイムコードを読み込めません");
+        }
+    }
+
+    std::vector<double> timestamps;
+    size_t begin = 0;
+    int lineNumber = 0;
+    while (begin < text.size()) {
+        const size_t end = text.find('\n', begin);
+        std::string line = text.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        begin = (end == std::string::npos) ? text.size() : end + 1;
+        lineNumber++;
+        const size_t first = line.find_first_not_of(" \t\r");
+        if (first == std::string::npos || line[first] == '#') {
+            if (first != std::string::npos && boundaries != nullptr) {
+                parseChunkBoundaryComment(line, *boundaries);
+            }
+            continue;
+        }
+        try {
+            size_t parsed = 0;
+            const double timestamp = std::stod(line.substr(first), &parsed);
+            if (!std::isfinite(timestamp)
+                || line.find_first_not_of(" \t\r", first + parsed) != std::string::npos) {
+                THROW(FormatException, "エンコーダフィルタのタイムコード形式が不正です");
+            }
+            timestamps.push_back(timestamp);
+        } catch (const Exception&) {
+            throw;
+        } catch (...) {
+            THROWF(FormatException, "エンコーダフィルタのタイムコード形式が不正です (%d行目)", lineNumber);
+        }
+    }
+    if (timestamps.empty()) {
+        THROW(FormatException, "エンコーダフィルタのタイムコードにフレーム情報がありません");
+    }
+    return timestamps;
+}
+
+// エンコーダフィルタ出力タイムコードの実測結果
+struct EncoderFilterTimecodeInfo {
+    bool isVFR;             // フレーム間隔が一定でない
+    int numFrames;          // 実際に出力されたフレーム数
+    double frameDurationMs; // CFR時の1フレームの表示時間(ms)
+};
+
+// タイムコードの実測値からCFR/VFRとフレームレートを判定する
+// フィルタのオプション文字列からフレームレート変化を推測すると、
+// 解析漏れがあったときに気づけないまま不整合な出力になるため、常に実測値で判定する
+//
+// boundaries には分割エンコードのチャンク境界にあたる出力フレーム番号を渡す。
+// チャンク境界の時刻は入力フレーム番号から求めるため、フレームレートが変化していると
+// 境界のフレーム間隔だけが前後とずれる。この間隔は判定から除外する。
+//
+// 境界以外のフレーム間隔にわずかでもばらつきがあればVFRとして扱う。
+// CFRと誤判定するとタイムコードが反映されず音ズレになるが、逆にVFR扱いにしても
+// タイムコードをそのまま反映するだけなので実害がないため、判定は厳しめにしておく。
+static EncoderFilterTimecodeInfo analyzeEncoderFilterTimecode(
+    const std::vector<double>& timestamps, const std::vector<int>& boundaries = std::vector<int>()) {
+    EncoderFilterTimecodeInfo info = {};
+    info.numFrames = (int)timestamps.size();
+    if (timestamps.size() < 3) {
+        // 判定材料が足りないのでCFRとして扱う
+        info.frameDurationMs = (timestamps.size() == 2) ? (timestamps[1] - timestamps[0]) : 0.0;
+        return info;
+    }
+    // intervals[i] = timestamps[i + 1] - timestamps[i]
+    // チャンク境界のフレーム番号 b に対応する間隔は intervals[b - 1]
+    std::vector<bool> ignored(timestamps.size() - 1, false);
+    for (const auto boundary : boundaries) {
+        if (boundary >= 1 && (size_t)boundary <= ignored.size()) {
+            ignored[boundary - 1] = true;
+        }
+    }
+    std::vector<double> intervals;
+    intervals.reserve(timestamps.size() - 1);
+    for (size_t i = 1; i < timestamps.size(); i++) {
+        if (!ignored[i - 1]) {
+            intervals.push_back(timestamps[i] - timestamps[i - 1]);
+        }
+    }
+    if (intervals.empty()) {
+        return info;
+    }
+    // 平均ではなく中央値を基準にする
+    std::vector<double> sorted = intervals;
+    std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+    const double median = sorted[sorted.size() / 2];
+    if (!(median > 0.0)) {
+        info.isVFR = true;
+        return info;
+    }
+    // タイムベースの丸めによる微小なゆらぎのみCFRとみなす
+    // (30fpsと24fpsの差は8.3ms、120fps基準の丸め誤差でも1ms未満なので十分に区別できる)
+    const double tolerance = std::max(median * 0.01, 0.05);
+    for (const auto interval : intervals) {
+        if (std::abs(interval - median) > tolerance) {
+            info.isVFR = true;
+            return info;
+        }
+    }
+    info.frameDurationMs = median;
+    return info;
+}
+
+// 実測したフレームレート比を分母8以下の単純な分数で近似する
+// (4/5=24fps化、2/1=60fps化、1/2=間引き等を想定)
+static bool approximateFpsRatio(double ratio, int& outMul, int& outDiv) {
+    if (!(ratio > 0.0)) {
+        return false;
+    }
+    double bestErr = std::numeric_limits<double>::max();
+    int bestMul = 0, bestDiv = 0;
+    for (int div = 1; div <= 8; div++) {
+        const int mul = (int)std::lround(ratio * div);
+        if (mul <= 0) continue;
+        const double err = std::abs((double)mul / div - ratio);
+        if (err < bestErr) {
+            bestErr = err;
+            bestMul = mul;
+            bestDiv = div;
+        }
+    }
+    // 0.5%以上ずれる場合は単純な分数では表せない
+    if (bestMul == 0 || bestErr > ratio * 0.005) {
+        return false;
+    }
+    outMul = bestMul;
+    outDiv = bestDiv;
+    return true;
+}
+
+static void writeNormalizedEncoderFilterTimecode(const tstring& path, const std::vector<double>& timestamps) {
+    File output(path, _T("wb"));
+    const char header[] = "# timecode format v2\n";
+    output.write(MemoryChunk((uint8_t*)header, sizeof(header) - 1));
+    // 既存のタイムコード出力 (Encoder.cpp createChunkTimecodeFile) と同様、
+    // 先頭フレームが0になるように基準を合わせてから整数msに丸める
+    const double base = timestamps.front();
+    for (const auto timestamp : timestamps) {
+        const std::string line = std::to_string((long long)std::llround(timestamp - base)) + "\n";
+        output.write(MemoryChunk((uint8_t*)line.data(), line.size()));
     }
 }
 
@@ -1162,7 +1338,8 @@ tstring EncoderArgumentGenerator::GenEncoderOptions(
     int vfrTimingFps,
     EncodeFileKey key, int pass, int serviceID,
     const EncoderOptionInfo& eoInfo,
-    const tstring& outPathOverride) {
+    const tstring& outPathOverride,
+    bool chunkIsCM) {
     VIDEO_STREAM_FORMAT srcFormat = reformInfo_.getVideoStreamFormat();
     double srcBitrate = getSourceBitrate(key.video);
     const tstring outPath = (outPathOverride.size() > 0)
@@ -1172,8 +1349,8 @@ tstring EncoderArgumentGenerator::GenEncoderOptions(
         setting_.getEncoder(),
         setting_.getEncoderPath(),
         replaceOptions(setting_.getOptions(
-            numFrames,
-            srcFormat, srcBitrate, false, pass, zones, setting_.getEncVideoOptionFilePath(key), vfrBitrateScale, key, eoInfo),
+            numFrames, srcFormat, srcBitrate, false, pass, zones,
+            setting_.getEncVideoOptionFilePath(key), vfrBitrateScale, key, eoInfo, chunkIsCM),
             outfmt, setting_, key, serviceID),
         outfmt,
         timecodepath,
@@ -1202,6 +1379,21 @@ double EncoderArgumentGenerator::getSourceBitrate(int fileId) const {
     // ビットレート計算
     const auto& info = reformInfo_.getSrcVideoInfo(fileId);
     return ((double)info.first * 8 / 1000) / ((double)info.second / MPEG_CLOCK_HZ);
+}
+
+// 各ゾーンに、本エンコーダのタイムライン上の表示時刻を設定する
+// エンコーダフィルタが別プロセスの場合、フレーム番号ではずれるため時刻でゾーンを指定する
+// Amatsukazeはy4mをヘッダFPSのCFRとして書き出し(Y4MWriterはFRAME行に時刻を付加しない)、
+// エンコーダフィルタはその時刻軸のままXts=で本エンコーダへ伝えるため、フレーム番号/FPSでよい
+// (AVS由来のVFRタイムコードとエンコーダフィルタは併用不可のため、VFRを考慮する必要はない)
+static void FillBitrateZoneTimes(
+    std::vector<BitrateZone>& zones,
+    const VideoInfo& outvi) {
+    const double tick = (double)outvi.fps_denominator / outvi.fps_numerator;
+    for (auto& zone : zones) {
+        zone.startSec = zone.startFrame * tick;
+        zone.endSec = zone.endFrame * tick;
+    }
 }
 
 /* static */ std::vector<BitrateZone> MakeBitrateZones(
@@ -1241,12 +1433,15 @@ double EncoderArgumentGenerator::getSourceBitrate(int fileId) const {
                     bitrateZones.emplace_back(cmzones[i], setting.getBitrateCM(), setting.getCMQualityOffset());
                 }
             } else {
-                return MakeVFRBitrateZones(
+                bitrateZones = MakeVFRBitrateZones(
                     timeCodes, cmzones, setting.getBitrateCM(),
                     outvi.fps_numerator, outvi.fps_denominator,
                     setting.getX265TimeFactor(), 0.05); // 全体で5%までの差なら許容する
             }
         }
+    }
+    if (setting.isZoneTimeBased()) {
+        FillBitrateZoneTimes(bitrateZones, outvi);
     }
     return bitrateZones;
 }
@@ -1277,16 +1472,42 @@ void DoBadThing() {
     bool isNoEncode = (setting.getMode() == _T("cm"));
 
     auto eoInfo = ParseEncoderOption(setting.getEncoder(), setting.getEncoderOptions());
+    ctx.info(_T("[本エンコーダ設定]"));
     PrintEncoderInfo(ctx, eoInfo);
+    if (setting.isEncoderFilterEnabled()) {
+        const tstring& filterOptions = setting.getEncoderFilterOptions();
+        if (filterOptions.find(_T("--output-res")) != tstring::npos
+            || filterOptions.find(_T("--crop")) != tstring::npos
+            || filterOptions.find(_T("--vpp-pad")) != tstring::npos) {
+            ctx.warn(_T("エンコーダフィルタによる解像度変更はコンテナのメタデータ (解像度/SAR) に反映されません"));
+        }
+    }
+    if (setting.isEncoderFilterSeparate()) {
+        // エンコーダフィルタのオプション文字列は解析しない。
+        // インタレース解除の有無はGUI設定から明示的に受け取り、
+        // フレームレート・フレーム数の変化はエンコード後に実測タイムコードから判定する。
+        if (eoInfo.deint != ENCODER_DEINT_NONE && setting.isEncoderFilterDeinterlace()) {
+            THROW(ArgumentException, "本エンコーダとエンコーダフィルタの両方でインタレース解除が指定されています");
+        }
+    }
     const int cliParallel = setting.getEncoderParallel();
     const int encoderParallel = (cliParallel > 1) ? cliParallel : ((eoInfo.parallel > 1) ? eoInfo.parallel : 1);
+    if (setting.isEncoderFilterSeparate() && encoderParallel > 1 && !isSoftwareSplitEncoder(setting.getEncoder())) {
+        THROW(ArgumentException, "別プロセスのエンコーダフィルタとネイティブ分割並列エンコードは併用できません。フィルタがフレーム数を変更するとchunk-handlesの開始フレームが本エンコーダの出力フレーム位置と一致しないためです");
+    }
     if (setting.isTwoPass() && encoderParallel > 1) {
         THROW(ArgumentException, "2passエンコード時は分割エンコードを使用できません (--enc-parallel / --parallel は無効です)");
     }
+    if (setting.isEncoderFilterSeparate() && setting.isTwoPass()) {
+        ctx.warn(_T("エンコーダフィルタを別プロセスで使用する2passエンコードでは、フィルタ処理も2回実行されます"));
+    }
 
     // チェック
-    if (!isNoEncode && !setting.isFormatVFRSupported() && eoInfo.afsTimecode) {
-        THROW(FormatException, "M2TS/TS出力はVFRをサポートしていません");
+    if (!isNoEncode && eoInfo.afsTimecode) {
+        // 本エンコーダ自身が出力したタイムコードを回収する仕組みがないため、
+        // そのまま通すとVFR情報が失われた出力になってしまう
+        THROW(ArgumentException, "エンコーダ自身でのVFR出力には対応していません。"
+            "エンコーダフィルタに本エンコーダとは別のエンコーダを指定してください");
     }
     if (setting.getFormat() == FORMAT_TSREPLACE) {
         auto cmtypes = setting.getCMTypes();
@@ -1496,7 +1717,8 @@ void DoBadThing() {
             ctx.info(_T("[チャプター生成]"));
             for (const auto& key : reformInfo.getOutFileKeys()) {
                 const auto& fileIn = reformInfo.getEncodeFile(key);
-                if (fileIn.duration >= MPEG_CLOCK_HZ /*1秒以下なら出力しない*/ && chapterMakers[key.video]) {
+                if (fileIn.duration >= (int64_t)setting.getMinOutputDuration() * MPEG_CLOCK_HZ
+                    && chapterMakers[key.video]) {
                     chapterMakers[key.video]->exec(key);
                     const auto path = setting.getTmpChapterPath(key);
                     if (File::exists(path)) {
@@ -1514,9 +1736,10 @@ void DoBadThing() {
 
     const auto& allKeys = reformInfo.getOutFileKeys();
     std::vector<EncodeFileKey> keys;
-    // 1秒以下なら出力しない
+    // 指定秒数未満の短い区間は出力しない
+    const int64_t minOutputDuration = (int64_t)setting.getMinOutputDuration() * MPEG_CLOCK_HZ;
     std::copy_if(allKeys.begin(), allKeys.end(), std::back_inserter(keys),
-        [&](EncodeFileKey key) { return reformInfo.getEncodeFile(key).duration >= MPEG_CLOCK_HZ; });
+        [&](EncodeFileKey key) { return reformInfo.getEncodeFile(key).duration >= minOutputDuration; });
 
     std::vector<EncodeFileOutput> outFileInfo(keys.size());
 
@@ -1822,6 +2045,15 @@ void DoBadThing() {
 
             if (timeCodes.size() > 0) {
                 // フィルタによるVFRが有効
+                // AVS由来のVFRタイムコードはフレーム番号ベースのため、エンコーダフィルタで
+                // フレーム数が変わると本エンコーダの入力フレームと対応が取れなくなる
+                // フィルタの内容次第では変わらないが、内容に依存した判定は取りこぼすと
+                // 不整合に気づけないため、エンコーダフィルタ使用時は一律で併用不可とする
+                // なお、GUI/WebUIではAVSフィルタとエンコーダフィルタは排他選択のため通常該当しない
+                // (CLIから両方を指定した場合に備えた防御)
+                if (setting.isEncoderFilterSeparate()) {
+                    THROW(ArgumentException, "AVS由来のVFRタイムコードとエンコーダフィルタは併用できません");
+                }
                 if (eoInfo.afsTimecode) {
                     THROW(ArgumentException, "エンコーダとフィルタの両方でVFRタイムコードが出力されています。");
                 }
@@ -1846,6 +2078,28 @@ void DoBadThing() {
             }
 
             auto bitrateZones = MakeBitrateZones(timeCodes, encoderZones, setting, eoInfo, outvi);
+            // CMビットレート調整を、CM境界でチャンク分割することで行うか
+            // ゾーン指定が使えない/使ってもフレーム番号がずれる場合に、
+            // CM境界でチャンクを分けて、チャンクごとにビットレート/品質を指定する
+            // ゾーンでのCM調整が使えない条件
+            //  - SVT-AV1: そもそもゾーン指定がない
+            //  - エンコーダフィルタ使用時: フィルタでフレーム数が変わるとゾーンのフレーム番号がずれる
+            //    フィルタの内容次第では変わらないが、内容に依存した判定は取りこぼすと
+            //    ずれに気づけないため、エンコーダフィルタ使用時は常にチャンク分割で対応する
+            //    ただしQSVEnc/NVEncは時刻指定ゾーン(isZoneTimeBased)でずれずに指定できるため対象外
+            const bool cmZoneUnusable = !setting.isZoneAvailable()
+                || (setting.isEncoderFilterSeparate() && !setting.isZoneTimeBased());
+            // 分割エンコードが可能な条件
+            // 2pass、およびAVS由来VFRとエンコーダフィルタの併用では分割エンコードができない
+            const bool canSplitEncode = isSoftwareSplitEncoder(setting.getEncoder()) && !setting.isTwoPass();
+            // CM分離時はファイル単位でCM調整できるため、CMが混在するファイルのみ対象
+            // (前後CMカットは中間のCMが残るため、CMを残す場合と同様に対象となる)
+            const bool cmMixedInFile = (key.cm == CMTYPE_BOTH || key.cm == CMTYPE_EDGE_TRIM);
+            const bool useCMChunkSplit = setting.isBitrateCMEnabled() && cmMixedInFile
+                && !encoderZones.empty() && cmZoneUnusable && canSplitEncode;
+            if (useCMChunkSplit) {
+                ctx.info(_T("CM境界でチャンク分割してCMビットレート調整を行います"));
+            }
             auto vfrBitrateScale = AdjustVFRBitrate(timeCodes, outvi.fps_numerator, outvi.fps_denominator);
             const tstring baseTimecodePath = fileOut.timecode;
             const tstring baseOutputPath = setting.getEncVideoFilePath(key);
@@ -1861,10 +2115,66 @@ void DoBadThing() {
             };
 
             encoder.encode(filterClip, outfmt,
-                timeCodes, *argGen, passList, bitrateZones, vfrBitrateScale,
+                timeCodes, *argGen, passList, bitrateZones, encoderZones, useCMChunkSplit, vfrBitrateScale,
                 baseTimecodePath, fileOut.vfrTimingFps, baseOutputPath,
                 key, serviceId, eoInfo, encoderParallel, disablePowerThrottoling,
                 env, filterFactory, setting.getEncoder());
+            if (setting.isEncoderFilterSeparate() && File::exists(setting.getEncoderFilterTimecodePath(key))) {
+                // フィルタ出力のタイムコードを実測し、CFR/VFRとフレームレートを判定する
+                const tstring encoderFilterTimecodePath = setting.getEncoderFilterTimecodePath(key);
+                std::vector<int> chunkBoundaries;
+                const auto timestamps = readEncoderFilterTimecodeFile(encoderFilterTimecodePath, &chunkBoundaries);
+                const auto tcInfo = analyzeEncoderFilterTimecode(timestamps, chunkBoundaries);
+                ctx.infoF(_T("エンコーダフィルタ出力フレーム数: %d"), tcInfo.numFrames);
+                if (setting.isEncoderFilterDeinterlace()) {
+                    fileOut.vfmt.progressive = true;
+                }
+                // CFRであってもフレームレートが変化しているなら、コンテナのフレームレートを
+                // 書き換えるのではなく実測タイムコードをそのまま反映する。
+                // 実測比を単純な分数で近似する方式は誤差が全フレームに累積するため、
+                // 番組が長いほど音ズレが大きくなるのに対し、タイムコードの反映は
+                // 各フレームの時刻をそのまま渡すので誤差が累積しない。
+                int fpsMul = 1, fpsDiv = 1;
+                bool fpsChanged = false;
+                if (!tcInfo.isVFR && tcInfo.frameDurationMs > 0.0 && fileOut.vfmt.frameRateNum > 0) {
+                    const double inFrameMs = 1000.0 * fileOut.vfmt.frameRateDenom / fileOut.vfmt.frameRateNum;
+                    const double ratio = inFrameMs / tcInfo.frameDurationMs;
+                    if (std::abs(ratio - 1.0) > 0.001) {
+                        fpsChanged = true;
+                        if (approximateFpsRatio(ratio, fpsMul, fpsDiv)) {
+                            ctx.infoF(_T("エンコーダフィルタによるフレームレート変化を検出しました (入力の%d/%d倍)"), fpsMul, fpsDiv);
+                        } else {
+                            ctx.infoF(_T("エンコーダフィルタによるフレームレート変化を検出しました (入力の%.4f倍)"), ratio);
+                        }
+                    }
+                }
+
+                if (tcInfo.isVFR || fpsChanged) {
+                    if (setting.isFormatVFRSupported()) {
+                        writeNormalizedEncoderFilterTimecode(encoderFilterTimecodePath, timestamps);
+                        fileOut.timecode = encoderFilterTimecodePath;
+                        // timelineeditorの丸めで16～17ms間隔が同一timestampにならないよう、
+                        // encoder filterのVFR timebaseは常に120000/1001とする。
+                        fileOut.vfrTimingFps = 120;
+                        ctx.info(_T("エンコーダフィルタのタイムコードを整数msに正規化しました (タイムベース: 120000/1001)"));
+                    } else if (tcInfo.isVFR) {
+                        THROW(FormatException, "M2TS/TS出力はVFRをサポートしていません");
+                    } else if (fpsMul != fpsDiv) {
+                        // VFR非対応フォーマットなのでタイムコードを反映できない。
+                        // 次善策としてコンテナのフレームレートを書き換える
+                        fileOut.vfmt.mulDivFps(fpsMul, fpsDiv);
+                        ctx.warn(_T("M2TS/TS出力ではタイムコードを反映できないため、"
+                            _T("コンテナのフレームレートのみ変更します")));
+                    } else {
+                        ctx.warn(_T("M2TS/TS出力ではタイムコードを反映できず、"
+                            _T("フレームレート変化を単純な分数でも表せないため、"
+                            _T("コンテナのフレームレートは入力のままとします"))));
+                    }
+                }
+            } else if (setting.isEncoderFilterSeparate()) {
+                ctx.warn(_T("エンコーダフィルタがタイムコードを出力しませんでした。"
+                    _T("フレームレートの変化はコンテナのメタデータに反映されません")));
+            }
         } catch (const AvisynthError& avserror) {
             THROWF(AviSynthException, "%s", avserror.msg);
         }
@@ -1966,7 +2276,7 @@ void DoBadThing() {
     thSetPowerThrottling->abortThread();
 
     // 出力結果を表示
-    reformInfo.printOutputMapping([&](EncodeFileKey key) {
+    reformInfo.printOutputMapping(keys, [&](EncodeFileKey key) {
         const auto& file = reformInfo.getEncodeFile(key);
         return setting.getOutFilePath(file.outKey, file.keyMax, getActualOutputFormat(key, reformInfo, setting), eoInfo.format);
         });

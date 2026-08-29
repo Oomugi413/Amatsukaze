@@ -12,7 +12,6 @@
 #include <string>
 #include <memory>
 #include <limits>
-#include <smmintrin.h>
 
 #include "TsSplitter.h"
 #include "Encoder.h"
@@ -131,7 +130,8 @@ public:
         int vfrTimingFps,
         EncodeFileKey key, int pass, int serviceID,
         const EncoderOptionInfo& eoInfo,
-        const tstring& outPathOverride = tstring());
+        const tstring& outPathOverride = tstring(),
+        bool chunkIsCM = false);
 
     // src, target
     std::pair<double, double> printBitrate(AMTContext& ctx, EncodeFileKey key) const;

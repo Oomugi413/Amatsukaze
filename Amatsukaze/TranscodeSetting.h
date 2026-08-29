@@ -31,13 +31,23 @@ struct EncoderZone {
     int endFrame;
 };
 
+// BitrateZoneの表示時刻が未算出であることを示す値
+constexpr double BITRATE_ZONE_SEC_UNSET = -1.0;
+
 struct BitrateZone : EncoderZone {
     double bitrate;
     double qualityOffset;
+    // ゾーンの表示時刻(秒)
+    // 負値(BITRATE_ZONE_SEC_UNSET)は未算出を表し、その場合はフレーム番号指定にフォールバックする
+    double startSec;
+    double endSec;
 
     BitrateZone();
     BitrateZone(EncoderZone zone);
     BitrateZone(EncoderZone zone, double bitrate, double qualityOffset);
+
+    // 表示時刻が算出済みかどうか
+    bool hasTimeRange() const;
 };
 
 namespace av {
@@ -92,6 +102,13 @@ tstring makeEncoderArgs(
     int vfrTimingFps,
     const ENUM_FORMAT format,
     const tstring& outpath);
+
+tstring makeEncoderFilterArgs(
+    const tstring& binpath,
+    const tstring& options,
+    const VideoFormat& fmt,
+    const tstring& timecodepath,
+    ENUM_ENCODER outputEncoder);
 
 enum ENUM_AUDIO_ENCODER {
     AUDIO_ENCODER_NONE,
@@ -204,6 +221,12 @@ struct Config {
     ENUM_ENCODER encoder;
     tstring encoderPath;
     tstring encoderOptions;
+    ENUM_ENCODER encoderFilter; // エンコーダフィルタ。無効時は (ENUM_ENCODER)-1
+    tstring encoderFilterPath;
+    tstring encoderFilterOptions;
+    // エンコーダフィルタでインタレース解除を行うか
+    // (フィルタのオプション文字列を解析して推測すると取りこぼすため、GUI側の設定を明示的に受け取る)
+    bool encoderFilterDeinterlace;
     // 追加オプションをコンテナに記録する（mp4/mkv出力時のみ有効）
     bool muxerAddEncoderCmd;
     // SAR比をエンコーダに渡さず、mp4/mkvコンテナのみに記録する
@@ -252,6 +275,7 @@ struct Config {
     int audioBitrateInKbps;
     int numEncodeBufferFrames;
     int encoderParallel;
+    int minOutputDuration;
     // CM解析用設定
     std::vector<tstring> logoPath;
     std::vector<tstring> eraseLogoPath;
@@ -332,6 +356,18 @@ public:
     tstring getEncoderPath() const;
 
     tstring getEncoderOptions() const;
+
+    bool isEncoderFilterEnabled() const;
+
+    bool isEncoderFilterSeparate() const;
+
+    ENUM_ENCODER getEncoderFilter() const;
+
+    tstring getEncoderFilterPath() const;
+
+    tstring getEncoderFilterOptions() const;
+
+    bool isEncoderFilterDeinterlace() const;
 
     bool getMuxerAddEncoderCmd() const;
 
@@ -415,6 +451,8 @@ public:
     int getNumEncodeBufferFrames() const;
 
     int getEncoderParallel() const;
+
+    int getMinOutputDuration() const;
 
     const std::vector<tstring>& getLogoPath() const;
 
@@ -534,6 +572,8 @@ public:
 
     tstring getAvsTimecodePath(EncodeFileKey key) const;
 
+    tstring getEncoderFilterTimecodePath(EncodeFileKey key) const;
+
     tstring getFilterAvsPath(EncodeFileKey key) const;
 
     tstring getEncStatsFilePath(EncodeFileKey key) const;
@@ -555,6 +595,8 @@ public:
     tstring getTmpChapterExePath(int vindex) const;
 
     tstring getTmpChapterExeOutPath(int vindex) const;
+
+    tstring getTmpChapterExeErrPath(int vindex) const;
 
     tstring getTmpTrimAVSPath(int vindex) const;
 
@@ -612,6 +654,9 @@ public:
 
     bool isZoneWithQualityAvailable() const;
 
+    // ゾーンを時刻(秒)で指定するか
+    bool isZoneTimeBased() const;
+
     bool isEncoderSupportVFR() const;
 
     bool isBitrateCMEnabled() const;
@@ -620,7 +665,7 @@ public:
         int numFrames,
         VIDEO_STREAM_FORMAT srcFormat, double srcBitrate, bool pulldown,
         int pass, const std::vector<BitrateZone>& zones, const tstring& optionFilePath, double vfrBitrateScale,
-        EncodeFileKey key, const EncoderOptionInfo& eoInfo) const;
+        EncodeFileKey key, const EncoderOptionInfo& eoInfo, bool chunkIsCM = false) const;
 
     void dump() const;
 

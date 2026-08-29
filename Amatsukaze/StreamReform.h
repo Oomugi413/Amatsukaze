@@ -25,6 +25,22 @@
 // 90kHzでも60*1000/1001fpsの1フレームの時間は整数で表せない
 // だからと言って27MHzでは数値が大きすぎる
 
+struct VFRFrameInterval {
+    double ptsInterval;
+    double repeatFactor;
+};
+
+struct VFRDetectionResult {
+    bool detected;
+    double mainInterval;
+    double secondaryInterval;
+    int validCount;
+    int mainCount;
+    int secondaryCount;
+};
+
+VFRDetectionResult AnalyzeVFRFrameIntervals(const std::vector<VFRFrameInterval>& intervals);
+
 struct FileAudioFrameInfo : public AudioFrameInfo {
     int audioIdx;
     int codedDataSize;
@@ -254,6 +270,9 @@ public:
 
     void printOutputMapping(std::function<tstring(EncodeFileKey)> getFileName) const;
 
+    void printOutputMapping(const std::vector<EncodeFileKey>& outputKeys,
+        std::function<tstring(EncodeFileKey)> getFileName) const;
+
     // 以下デバッグ用 //
 
     void serialize(const tstring& path);
@@ -426,5 +445,3 @@ public:
     void genWebVTT(const EncodeFileKey& key, const ConfigWrapper& setting,
         std::vector<PsisiarcTask>& psisiarcTasks);
 };
-
-

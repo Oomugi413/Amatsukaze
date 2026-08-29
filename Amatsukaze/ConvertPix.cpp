@@ -52,6 +52,30 @@ void Convert2_16_to_12(void* dstU, void* dstV, const void* top, const void* bott
     Convert2<uint16_t, uint16_t, uint32_t, 12, 16, false>((uint16_t*)dstU, (uint16_t*)dstV, (const uint16_t*)top, (const uint16_t*)bottom, w, h, dpitch, tpitch, bpitch);
 }
 
+#ifndef ENABLE_X86_SIMD
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+#define ENABLE_X86_SIMD 1
+#else
+#define ENABLE_X86_SIMD 0
+#endif
+#endif
+
+#if !ENABLE_X86_SIMD
+// ARMではAVX2版と同じ公開関数をスカラー実装へフォールバックする
+void Convert1_16_to_10_AVX2(void* dst, const void* top, const void* bottom, int w, int h, int dpitch, int tpitch, int bpitch) {
+    Convert1_16_to_10(dst, top, bottom, w, h, dpitch, tpitch, bpitch);
+}
+void Convert1_16_to_12_AVX2(void* dst, const void* top, const void* bottom, int w, int h, int dpitch, int tpitch, int bpitch) {
+    Convert1_16_to_12(dst, top, bottom, w, h, dpitch, tpitch, bpitch);
+}
+void Convert2_16_to_10_AVX2(void* dstU, void* dstV, const void* top, const void* bottom, int w, int h, int dpitch, int tpitch, int bpitch) {
+    Convert2_16_to_10(dstU, dstV, top, bottom, w, h, dpitch, tpitch, bpitch);
+}
+void Convert2_16_to_12_AVX2(void* dstU, void* dstV, const void* top, const void* bottom, int w, int h, int dpitch, int tpitch, int bpitch) {
+    Convert2_16_to_12(dstU, dstV, top, bottom, w, h, dpitch, tpitch, bpitch);
+}
+#endif
+
 ConvertPixFuncs::ConvertPixFuncs() :
     convert1(nullptr),
     convert2(nullptr),

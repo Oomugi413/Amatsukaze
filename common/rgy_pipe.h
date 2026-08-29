@@ -47,6 +47,7 @@ enum RGYPipeMode : uint32_t {
     PIPE_MODE_ENABLE    = 0x01,
     PIPE_MODE_ENABLE_FP = 0x02,
     PIPE_MODE_MUXED     = 0x04, //Stderrのモードに使用し、StderrをStdOutに混合する
+    PIPE_MODE_EXTERNAL  = 0x08, // 外部から与えたハンドルを使用し、パイプ生成を行わない
 };
 
 static RGYPipeMode operator|(RGYPipeMode a, RGYPipeMode b) {
@@ -77,6 +78,17 @@ typedef HANDLE PROCESS_HANDLE;
 typedef int PIPE_HANDLE;
 typedef pid_t PROCESS_HANDLE;
 #endif
+
+// パイプハンドルを閉じる (0は何もしない)
+static inline void closePipeHandle(PIPE_HANDLE handle) {
+    if (handle) {
+#if defined(_WIN32) || defined(_WIN64)
+        CloseHandle(handle);
+#else
+        ::close(handle);
+#endif
+    }
+}
 
 struct RGYPipeSet {
     PIPE_HANDLE h_read;
@@ -111,6 +123,17 @@ public:
     }
     void setStdErrBufferSize(uint32_t size) {
         m_pipe.stdErr.bufferSize = size;
+    }
+    // 子プロセスのstdinに使う読み取り側ハンドルを外部から与える
+    void setExternalStdIn(PIPE_HANDLE hRead) {
+        m_pipe.stdIn.h_read = hRead;
+        m_pipe.stdIn.mode |= PIPE_MODE_EXTERNAL;
+    }
+    // stdoutの読み取り端を取り出し、このオブジェクトから所有権を移す
+    PIPE_HANDLE detachStdOutReadHandle() {
+        const auto hRead = m_pipe.stdOut.h_read;
+        m_pipe.stdOut.h_read = (PIPE_HANDLE)0;
+        return hRead;
     }
     virtual int run(const tstring& cmd_line, const TCHAR *exedir, uint32_t priority, bool hidden, bool minimized, bool new_console = false) = 0;
     virtual int run(const std::vector<tstring>& args, const TCHAR *exedir, uint32_t priority, bool hidden, bool minimized, bool new_console = false) = 0;

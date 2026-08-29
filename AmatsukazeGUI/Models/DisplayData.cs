@@ -1,5 +1,6 @@
 ﻿using Amatsukaze.Components;
 using Amatsukaze.Server;
+using EncoderFilterHelp = Amatsukaze.Shared.EncoderFilterHelp;
 using Livet;
 using Livet.Commands;
 using Livet.EventListeners;
@@ -760,7 +761,7 @@ namespace Amatsukaze.Models
 
     public class DisplayFilterSetting : ViewModel
     {
-        public string Name { get { return "フィルタを設定"; } }
+        public string Name { get { return "AviSynthフィルタを設定"; } }
 
         public FilterSetting Data { get; private set; }
 
@@ -1064,7 +1065,7 @@ namespace Amatsukaze.Models
 
     public class DisplayCustomFilter : ViewModel
     {
-        public string Name { get { return "カスタムフィルタを設定"; } }
+        public string Name { get { return "AviSynthカスタムフィルタを設定"; } }
 
         public ClientModel Model { get; set; }
 
@@ -1107,6 +1108,459 @@ namespace Amatsukaze.Models
         public string Name { get { return "フィルタなし"; } }
     }
 
+    public class DisplayEncoderFilterSetting : ViewModel
+    {
+        public EncoderFilterSetting Data { get; private set; }
+
+        public string[] DeinterlaceList { get; } =
+            new[] { "afs", "kfm", "nnedi", "yadif", "bwdif", "decomb", "ivtc" };
+        public string[] DenoiseList { get; } =
+            new[] { "pmd", "knn", "nlmeans", "hqdn3d", "denoise-dct", "smooth", "fft3d", "convolution3d", "msmooth" };
+        public string[] EdgeList { get; } =
+            new[] { "edgelevel", "unsharp", "warpsharp", "msharpen" };
+        public string[] OutputDepthList { get; } = new[] { "8bit", "10bit" };
+
+        // インターレース解除のパラメータ欄はアルゴリズムごとに別のComboBoxを用意する。
+        // 1つのComboBoxでItemsSourceを差し替えると、WPFのSelectorが選択状態のリセットを
+        // 遅延実行するため、こちらで設定したSelectedIndexが後から-1で上書きされて空欄になる。
+        public string[] AfsPresetList { get; } =
+            new[] { "default", "triple", "double", "anime", "cinema", "min_afterimg", "24fps", "30fps" };
+        public string[] KfmModeList { get; } = new[] { "vfr", "60", "24" };
+        public string[] DeintModeList { get; } = new[] { "normal", "bob" };
+
+        // 出力ビット深度の設定元となるプロファイル（エンコーダ種別の参照用）
+        private ProfileSetting Profile { get; set; }
+
+        public DisplayEncoderFilterSetting(ProfileSetting profile)
+        {
+            Profile = profile;
+            Data = profile.EncoderFilterSetting;
+        }
+
+        // ポップアップヘルプ（文言はEncoderFilterHelpでWebUIと共有）
+        public string DeinterlaceToolTip { get { return EncoderFilterHelp.Deinterlace; } }
+
+        public string DeinterlaceAlgorithmToolTip
+        {
+            get { return EncoderFilterHelp.DeinterlaceAlgorithm(Data.DeinterlaceAlgorithm.ToString()); }
+        }
+
+        public string DeinterlaceParamToolTip
+        {
+            get { return EncoderFilterHelp.DeinterlaceParam(Data.DeinterlaceAlgorithm.ToString()); }
+        }
+
+        public string DenoiseToolTip { get { return EncoderFilterHelp.Denoise; } }
+
+        public string DenoiseAlgorithmToolTip
+        {
+            get { return EncoderFilterHelp.DenoiseAlgorithm(Data.DenoiseAlgorithm.ToString()); }
+        }
+
+        public string DenoiseValueToolTip
+        {
+            get { return EncoderFilterHelp.DenoiseValue(Data.DenoiseAlgorithm.ToString()); }
+        }
+
+        public string ResizeToolTip { get { return EncoderFilterHelp.Resize; } }
+
+        public string EdgeEnhanceToolTip { get { return EncoderFilterHelp.EdgeEnhance; } }
+
+        public string EdgeAlgorithmToolTip
+        {
+            get { return EncoderFilterHelp.EdgeAlgorithm(Data.EdgeAlgorithm.ToString()); }
+        }
+
+        public string DebandToolTip { get { return EncoderFilterHelp.Deband; } }
+
+        // 出力ビット深度のポップアップヘルプ（エンコーダ種別で内容が変わる）
+        public string OutputDepthToolTip
+        {
+            get
+            {
+                return EncoderFilterHelp.OutputDepth(
+                    Profile != null && Profile.EncoderType == EncoderType.SVTAV1);
+            }
+        }
+
+        // エンコーダ種別の変更をポップアップヘルプに反映する
+        public void UpdateOutputDepthToolTip()
+        {
+            RaisePropertyChanged("OutputDepthToolTip");
+        }
+
+        public bool EnableDeinterlace
+        {
+            get { return Data.EnableDeinterlace; }
+            set
+            {
+                if (Data.EnableDeinterlace == value) return;
+                Data.EnableDeinterlace = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public int DeinterlaceAlgorithm
+        {
+            get { return (int)Data.DeinterlaceAlgorithm; }
+            set
+            {
+                if (Data.DeinterlaceAlgorithm == (EncoderFilterDeinterlace)value) return;
+                Data.DeinterlaceAlgorithm = (EncoderFilterDeinterlace)value;
+                RaisePropertyChanged();
+                RaisePropertyChanged("AfsPresetVisible");
+                RaisePropertyChanged("AfsPresetIndex");
+                RaisePropertyChanged("KfmModeVisible");
+                RaisePropertyChanged("KfmModeIndex");
+                RaisePropertyChanged("DeintModeVisible");
+                RaisePropertyChanged("DeintModeIndex");
+                RaisePropertyChanged("DeinterlaceAlgorithmToolTip");
+                RaisePropertyChanged("DeinterlaceParamToolTip");
+            }
+        }
+
+        public bool AfsPresetVisible
+        {
+            get { return Data.DeinterlaceAlgorithm == EncoderFilterDeinterlace.Afs; }
+        }
+
+        public int AfsPresetIndex
+        {
+            get { return (int)Data.AfsPreset; }
+            set
+            {
+                if (value < 0 || value >= AfsPresetList.Length) return;
+                if (Data.AfsPreset == (EncoderFilterAfsPreset)value) return;
+                Data.AfsPreset = (EncoderFilterAfsPreset)value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool KfmModeVisible
+        {
+            get { return Data.DeinterlaceAlgorithm == EncoderFilterDeinterlace.KFM; }
+        }
+
+        public int KfmModeIndex
+        {
+            get { return (int)Data.KfmMode; }
+            set
+            {
+                if (value < 0 || value >= KfmModeList.Length) return;
+                if (Data.KfmMode == (EncoderFilterKfmMode)value) return;
+                Data.KfmMode = (EncoderFilterKfmMode)value;
+                RaisePropertyChanged();
+            }
+        }
+
+        // nnedi/yadif/bwdifは選択肢が同じnormal/bobなので1つのComboBoxを共用する
+        public bool DeintModeVisible
+        {
+            get
+            {
+                return Data.DeinterlaceAlgorithm == EncoderFilterDeinterlace.NNEDI ||
+                    Data.DeinterlaceAlgorithm == EncoderFilterDeinterlace.Yadif ||
+                    Data.DeinterlaceAlgorithm == EncoderFilterDeinterlace.Bwdif;
+            }
+        }
+
+        public int DeintModeIndex
+        {
+            get
+            {
+                switch (Data.DeinterlaceAlgorithm)
+                {
+                    case EncoderFilterDeinterlace.NNEDI: return (int)Data.NnediMode;
+                    case EncoderFilterDeinterlace.Yadif: return (int)Data.YadifMode;
+                    case EncoderFilterDeinterlace.Bwdif: return (int)Data.BwdifMode;
+                    default: return 0;
+                }
+            }
+            set
+            {
+                if (value < 0 || value >= DeintModeList.Length) return;
+                switch (Data.DeinterlaceAlgorithm)
+                {
+                    case EncoderFilterDeinterlace.NNEDI:
+                        if (Data.NnediMode == (EncoderFilterDeintMode)value) return;
+                        Data.NnediMode = (EncoderFilterDeintMode)value;
+                        break;
+                    case EncoderFilterDeinterlace.Yadif:
+                        if (Data.YadifMode == (EncoderFilterDeintMode)value) return;
+                        Data.YadifMode = (EncoderFilterDeintMode)value;
+                        break;
+                    case EncoderFilterDeinterlace.Bwdif:
+                        if (Data.BwdifMode == (EncoderFilterDeintMode)value) return;
+                        Data.BwdifMode = (EncoderFilterDeintMode)value;
+                        break;
+                    default:
+                        return;
+                }
+                RaisePropertyChanged();
+            }
+        }
+
+        public bool EnableDenoise
+        {
+            get { return Data.EnableDenoise; }
+            set
+            {
+                if (Data.EnableDenoise == value) return;
+                Data.EnableDenoise = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public int DenoiseAlgorithm
+        {
+            get { return (int)Data.DenoiseAlgorithm; }
+            set
+            {
+                if (Data.DenoiseAlgorithm == (EncoderFilterDenoise)value) return;
+                Data.DenoiseAlgorithm = (EncoderFilterDenoise)value;
+                RaisePropertyChanged();
+                RaisePropertyChanged("DenoiseValue");
+                RaisePropertyChanged("DenoiseValueLabel");
+                RaisePropertyChanged("DenoiseValueVisible");
+                RaisePropertyChanged("DenoiseAlgorithmToolTip");
+                RaisePropertyChanged("DenoiseValueToolTip");
+            }
+        }
+
+        public double DenoiseValue
+        {
+            get
+            {
+                switch (Data.DenoiseAlgorithm)
+                {
+                    case EncoderFilterDenoise.KNN: return Data.KnnStrength;
+                    case EncoderFilterDenoise.NLMeans: return Data.NlmeansSigma;
+                    case EncoderFilterDenoise.PMD: return Data.PmdStrength;
+                    case EncoderFilterDenoise.DenoiseDct: return Data.DenoiseDctSigma;
+                    case EncoderFilterDenoise.Smooth: return Data.SmoothQP;
+                    case EncoderFilterDenoise.FFT3D: return Data.Fft3dSigma;
+                    case EncoderFilterDenoise.Convolution3D: return Data.Convolution3dThresh;
+                    case EncoderFilterDenoise.MSmooth: return Data.MsmoothStrength;
+                    default: return 0;
+                }
+            }
+            set
+            {
+                switch (Data.DenoiseAlgorithm)
+                {
+                    case EncoderFilterDenoise.KNN: if (Data.KnnStrength == value) return; Data.KnnStrength = value; break;
+                    case EncoderFilterDenoise.NLMeans: if (Data.NlmeansSigma == value) return; Data.NlmeansSigma = value; break;
+                    case EncoderFilterDenoise.PMD: if (Data.PmdStrength == value) return; Data.PmdStrength = value; break;
+                    case EncoderFilterDenoise.DenoiseDct: if (Data.DenoiseDctSigma == value) return; Data.DenoiseDctSigma = value; break;
+                    case EncoderFilterDenoise.Smooth:
+                        int smooth = (int)Math.Round(value);
+                        if (Data.SmoothQP == smooth) return;
+                        Data.SmoothQP = smooth;
+                        break;
+                    case EncoderFilterDenoise.FFT3D: if (Data.Fft3dSigma == value) return; Data.Fft3dSigma = value; break;
+                    case EncoderFilterDenoise.Convolution3D: if (Data.Convolution3dThresh == value) return; Data.Convolution3dThresh = value; break;
+                    case EncoderFilterDenoise.MSmooth:
+                        int msmooth = (int)Math.Round(value);
+                        if (Data.MsmoothStrength == msmooth) return;
+                        Data.MsmoothStrength = msmooth;
+                        break;
+                    default: return;
+                }
+                RaisePropertyChanged();
+            }
+        }
+
+        public string DenoiseValueLabel
+        {
+            get
+            {
+                switch (Data.DenoiseAlgorithm)
+                {
+                    case EncoderFilterDenoise.KNN: return "強さ (0.0 - 1.0)";
+                    case EncoderFilterDenoise.NLMeans: return "強さ (0.0以上)";
+                    case EncoderFilterDenoise.PMD: return "強さ (0 - 100)";
+                    case EncoderFilterDenoise.DenoiseDct: return "σ (0.0以上)";
+                    case EncoderFilterDenoise.Smooth: return "qp (1 - 63)";
+                    case EncoderFilterDenoise.FFT3D: return "強度 (0.0 - 100.0)";
+                    case EncoderFilterDenoise.Convolution3D: return "強度 (0.0 - 255.0)";
+                    case EncoderFilterDenoise.MSmooth: return "強さ (0 - 20)";
+                    default: return "";
+                }
+            }
+        }
+
+        public bool DenoiseValueVisible { get { return Data.DenoiseAlgorithm != EncoderFilterDenoise.HQDN3D; } }
+
+        public bool EnableResize
+        {
+            get { return Data.EnableResize; }
+            set { if (Data.EnableResize == value) return; Data.EnableResize = value; RaisePropertyChanged(); }
+        }
+
+        public int ResizeWidth
+        {
+            get { return Data.ResizeWidth; }
+            set { if (Data.ResizeWidth == value) return; Data.ResizeWidth = value; RaisePropertyChanged(); }
+        }
+
+        public int ResizeHeight
+        {
+            get { return Data.ResizeHeight; }
+            set { if (Data.ResizeHeight == value) return; Data.ResizeHeight = value; RaisePropertyChanged(); }
+        }
+
+        public bool EnableEdgeEnhance
+        {
+            get { return Data.EnableEdgeEnhance; }
+            set { if (Data.EnableEdgeEnhance == value) return; Data.EnableEdgeEnhance = value; RaisePropertyChanged(); }
+        }
+
+        public int EdgeAlgorithm
+        {
+            get { return (int)Data.EdgeAlgorithm; }
+            set
+            {
+                if (Data.EdgeAlgorithm == (EncoderFilterEdge)value) return;
+                Data.EdgeAlgorithm = (EncoderFilterEdge)value;
+                RaisePropertyChanged();
+                RaisePropertyChanged("EdgeValue");
+                RaisePropertyChanged("EdgeValueLabel");
+                RaisePropertyChanged("EdgeAlgorithmToolTip");
+            }
+        }
+
+        public double EdgeValue
+        {
+            get
+            {
+                switch (Data.EdgeAlgorithm)
+                {
+                    case EncoderFilterEdge.EdgeLevel: return Data.EdgeLevelStrength;
+                    case EncoderFilterEdge.WarpSharp: return Data.WarpSharpDepth;
+                    case EncoderFilterEdge.MSharpen: return Data.MSharpenStrength;
+                    default: return Data.UnsharpWeight;
+                }
+            }
+            set
+            {
+                switch (Data.EdgeAlgorithm)
+                {
+                    case EncoderFilterEdge.EdgeLevel: if (Data.EdgeLevelStrength == value) return; Data.EdgeLevelStrength = value; break;
+                    case EncoderFilterEdge.WarpSharp: if (Data.WarpSharpDepth == value) return; Data.WarpSharpDepth = value; break;
+                    case EncoderFilterEdge.MSharpen: if (Data.MSharpenStrength == value) return; Data.MSharpenStrength = value; break;
+                    default: if (Data.UnsharpWeight == value) return; Data.UnsharpWeight = value; break;
+                }
+                RaisePropertyChanged();
+            }
+        }
+
+        public string EdgeValueLabel
+        {
+            get
+            {
+                switch (Data.EdgeAlgorithm)
+                {
+                    case EncoderFilterEdge.EdgeLevel: return "特性 (-31 - 31)";
+                    case EncoderFilterEdge.WarpSharp: return "深度 (-128 - 128)";
+                    case EncoderFilterEdge.MSharpen: return "深度 (0.0 - 1.0)";
+                    default: return "強さ (0 - 10)";
+                }
+            }
+        }
+
+        public bool EnableDeband
+        {
+            get { return Data.EnableDeband; }
+            set { if (Data.EnableDeband == value) return; Data.EnableDeband = value; RaisePropertyChanged(); }
+        }
+
+        public bool EnableOutputDepth
+        {
+            get { return Data.EnableOutputDepth; }
+            set { if (Data.EnableOutputDepth == value) return; Data.EnableOutputDepth = value; RaisePropertyChanged(); }
+        }
+
+        public int OutputDepth
+        {
+            get { return (int)Data.OutputDepth; }
+            set
+            {
+                if (Data.OutputDepth == (EncoderFilterOutputDepth)value) return;
+                Data.OutputDepth = (EncoderFilterOutputDepth)value;
+                RaisePropertyChanged();
+            }
+        }
+    }
+
+    public class DisplayEncoderFilter : ViewModel
+    {
+        public string Name
+        {
+            get
+            {
+                switch (EncoderType)
+                {
+                    case EncoderType.QSVEnc: return "QSVEncフィルタの設定";
+                    case EncoderType.NVEnc: return "NVEncフィルタの設定";
+                    case EncoderType.VCEEnc: return "VCEEncフィルタの設定";
+                    default: return "エンコーダフィルタの設定";
+                }
+            }
+        }
+
+        public ProfileSetting Data { get; private set; }
+
+        public EncoderType EncoderType { get; private set; }
+
+        public DisplayEncoderFilterSetting EncoderFilterSetting { get; private set; }
+
+        public DisplayEncoderFilter(ProfileSetting data, EncoderType encoderType,
+            DisplayEncoderFilterSetting encoderFilterSetting)
+        {
+            Data = data;
+            EncoderType = encoderType;
+            EncoderFilterSetting = encoderFilterSetting;
+        }
+
+        // 追加コマンド欄のポップアップヘルプ（文言はEncoderFilterHelpでWebUIと共有）
+        public string FilterOptionToolTip { get { return EncoderFilterHelp.FilterOption; } }
+
+        public string FilterOption
+        {
+            get
+            {
+                switch (EncoderType)
+                {
+                    case EncoderType.QSVEnc: return Data.QSVEncFilterOption;
+                    case EncoderType.NVEnc: return Data.NVEncFilterOption;
+                    case EncoderType.VCEEnc: return Data.VCEEncFilterOption;
+                    default: return null;
+                }
+            }
+            set
+            {
+                switch (EncoderType)
+                {
+                    case EncoderType.QSVEnc:
+                        if (Data.QSVEncFilterOption == value) return;
+                        Data.QSVEncFilterOption = value;
+                        break;
+                    case EncoderType.NVEnc:
+                        if (Data.NVEncFilterOption == value) return;
+                        Data.NVEncFilterOption = value;
+                        break;
+                    case EncoderType.VCEEnc:
+                        if (Data.VCEEncFilterOption == value) return;
+                        Data.VCEEncFilterOption = value;
+                        break;
+                    default:
+                        return;
+                }
+                RaisePropertyChanged();
+            }
+        }
+    }
+
     public class DisplayProfile : ViewModel
     {
         public ProfileSetting Data { get; private set; }
@@ -1114,6 +1568,8 @@ namespace Amatsukaze.Models
         public DisplayFilterSetting Filter { get; private set; }
 
         public DisplayCustomFilter CustomFilter { get; private set; }
+
+        public DisplayEncoderFilterSetting EncoderFilterSetting { get; private set; }
 
         public ClientModel Model { get; private set; }
 
@@ -1126,6 +1582,7 @@ namespace Amatsukaze.Models
             Data = data;
             Filter = new DisplayFilterSetting(data.FilterSetting, model);
             CustomFilter = new DisplayCustomFilter() { Model = model, Data = data };
+            EncoderFilterSetting = new DisplayEncoderFilterSetting(data);
             Model = model;
             Resources = resources;
 
@@ -1133,7 +1590,10 @@ namespace Amatsukaze.Models
             {
                 new DisplayNoFilter(),
                 Filter,
-                CustomFilter
+                CustomFilter,
+                new DisplayEncoderFilter(data, EncoderType.QSVEnc, EncoderFilterSetting),
+                new DisplayEncoderFilter(data, EncoderType.NVEnc, EncoderFilterSetting),
+                new DisplayEncoderFilter(data, EncoderType.VCEEnc, EncoderFilterSetting)
             };
 
             CompositeDisposable.Add(new PropertyChangedEventListener(
@@ -1209,6 +1669,7 @@ namespace Amatsukaze.Models
                 RaisePropertyChanged("EncoderOption");
                 RaisePropertyChanged("CMQualityOffsetEnabled");
                 RaisePropertyChanged("ForceSAREnabled");
+                EncoderFilterSetting.UpdateOutputDepthToolTip();
             }
         }
         #endregion
@@ -1349,6 +1810,20 @@ namespace Amatsukaze.Models
                     return;
                 Data.EncoderParallel = value;
                 UpdateWarningText();
+                RaisePropertyChanged();
+            }
+        }
+        #endregion
+
+        #region MinOutputDuration変更通知プロパティ
+        public int MinOutputDuration
+        {
+            get { return Data.MinOutputDuration; }
+            set
+            {
+                if (Data.MinOutputDuration == value)
+                    return;
+                Data.MinOutputDuration = value;
                 RaisePropertyChanged();
             }
         }

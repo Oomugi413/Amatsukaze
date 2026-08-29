@@ -289,6 +289,9 @@ ARG ARCH=amd64
 ARG BUILD_MODE=release
 ARG ENABLE_FASTER_WHISPER=0
 ARG ENABLE_VCEENCC=0
+ARG SEVENZIP_VER=26.02
+ARG SEVENZIP_PKG=7z2602
+ARG SEVENZIP_ARCHIVE_SHA256=41aaba7b1235304ab5aa0624530c67ae829496cd29e875925271efdccc28c03e
 
 # 環境変数の設定
 ENV DEBIAN_FRONTEND=noninteractive
@@ -307,9 +310,9 @@ ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics
 ENV VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_egl_icd.json
 
-ENV QSVENCC_VER=8.26
-ENV NVENCC_VER=9.31.1
-ENV VCEENCC_VER=9.12
+ENV QSVENCC_VER=8.28
+ENV NVENCC_VER=9.33.1
+ENV VCEENCC_VER=9.14
 ENV AMDGPU_INSTALL_VER=25.35.1
 ENV AMDGPU_INSTALL_DEB_VER=7.2.1.70201-1
 ENV TSREPLACE_VER=0.19
@@ -484,9 +487,9 @@ RUN git clone --depth 1 -b 0.04 https://github.com/rigaya/SCRenamePy.git tmp_SCR
     && mv tmp_SCRenamePy/SCRename.* exe_files/SCRenamePy/ \
     && rm -rf tmp_SCRenamePy
 
-RUN wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260813-214905/x264_3223_amd64_linux.tar.xz -O x264.tar.xz \
-    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260813-214905/x265_4.3%2B13_amd64_linux.tar.xz -O x265.tar.xz \
-    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260813-214905/SvtAv1EncApp_4.2.0-76_amd64_linux_clang.tar.xz -O svt-av1.tar.xz \
+RUN wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260829-082206/x264_3223_amd64_linux.tar.xz -O x264.tar.xz \
+    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260829-082206/x265_4.3%2B22_amd64_linux.tar.xz -O x265.tar.xz \
+    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260829-082206/SvtAv1EncApp_4.2.0-98_amd64_linux_clang.tar.xz -O svt-av1.tar.xz \
     && tar -xf x264.tar.xz -C /app/exe_files \
     && tar -xf x265.tar.xz -C /app/exe_files \
     && tar -xf svt-av1.tar.xz -C /app/exe_files \
@@ -509,6 +512,14 @@ RUN /app/scripts/install.sh /app \
         test -e "/app/exe_files/plugins64/${plugin}" || exit 1; \
     done \
     && ls /app/exe_files/plugins64/libyadifmod2*.so >/dev/null 2>&1
+
+# アーカイブ展開用 7-Zip CLI（Linux x64、静的リンク版）
+RUN wget https://github.com/ip7z/7zip/releases/download/${SEVENZIP_VER}/${SEVENZIP_PKG}-linux-x64.tar.xz -O ${SEVENZIP_PKG}-linux-x64.tar.xz \
+    && echo "${SEVENZIP_ARCHIVE_SHA256}  ${SEVENZIP_PKG}-linux-x64.tar.xz" | sha256sum -c - \
+    && mkdir -p /app/exe_files/7z \
+    && tar -xf ${SEVENZIP_PKG}-linux-x64.tar.xz -C /app/exe_files/7z 7zzs License.txt \
+    && chmod 755 /app/exe_files/7z/7zzs \
+    && rm ${SEVENZIP_PKG}-linux-x64.tar.xz
 
 # for debug
 #COPY Amatsukaze_Ubuntu24.04_r926.tar.xz /app

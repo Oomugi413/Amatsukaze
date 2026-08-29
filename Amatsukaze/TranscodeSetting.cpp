@@ -16,18 +16,34 @@
 BitrateZone::BitrateZone() :
     EncoderZone(),
     bitrate(0.0),
-    qualityOffset(0.0) {}
+    qualityOffset(0.0),
+    startSec(BITRATE_ZONE_SEC_UNSET),
+    endSec(BITRATE_ZONE_SEC_UNSET) {}
 BitrateZone::BitrateZone(EncoderZone zone) :
     EncoderZone(zone),
     bitrate(0.0),
-    qualityOffset(0.0) {}
+    qualityOffset(0.0),
+    startSec(BITRATE_ZONE_SEC_UNSET),
+    endSec(BITRATE_ZONE_SEC_UNSET) {}
 BitrateZone::BitrateZone(EncoderZone zone, double bitrate, double qualityOffset) :
     EncoderZone(zone),
     bitrate(bitrate),
-    qualityOffset(qualityOffset) {}
+    qualityOffset(qualityOffset),
+    startSec(BITRATE_ZONE_SEC_UNSET),
+    endSec(BITRATE_ZONE_SEC_UNSET) {}
+
+bool BitrateZone::hasTimeRange() const {
+    return startSec >= 0.0 && endSec >= 0.0;
+}
 
 // カラースペース3セット
 // FFmpegの列挙値を各エンコーダが受理する文字列へ変換する
+
+// HWエンコーダ(QSVEnc/NVEnc/VCEEnc)に指定するタイムベース
+// 24000/1001, 30000/1001, 60000/1001, 120000/1001, 25, 30 のいずれのフレーム間隔も
+// 整数tickで表現できるため、VFR時にタイムスタンプの丸め誤差が発生しない
+static const int HWENC_TIMEBASE_NUM = 1;
+static const int HWENC_TIMEBASE_DEN = 120000;
 
 static bool isHWEncoder(ENUM_ENCODER encoder) {
     return encoder == ENCODER_QSVENC || encoder == ENCODER_NVENC || encoder == ENCODER_VCEENC;
@@ -206,6 +222,14 @@ double BitrateSetting::getTargetBitrate(VIDEO_STREAM_FORMAT format, double srcBi
         break;
     }
 
+    // タイムベースを明示指定する
+    // 指定しない場合は入力フレームレートから自動決定されるが、
+    // 分母が半端な値になるとVFRのタイムスタンプに丸め誤差が乗るため固定する
+    // optionsより前に置いているので、ユーザが明示指定した場合はそちらが優先される
+    if (isHWEncoder(encoder)) {
+        sb.append(_T(" --timebase %d/%d"), HWENC_TIMEBASE_NUM, HWENC_TIMEBASE_DEN);
+    }
+
     if (encoder == ENCODER_SVTAV1) {
         sb.append(_T(" %s -b \"%s\" --progress 2"), options, outpath);
     } else {
@@ -248,6 +272,42 @@ double BitrateSetting::getTargetBitrate(VIDEO_STREAM_FORMAT format, double srcBi
         sb.append(_T(" --tcfile-in \"%s\" --timebase %d/%d"), timecodepath, timebase.second, timebase.first);
     }
 
+    return sb.str();
+}
+
+/* static */ tstring makeEncoderFilterArgs(
+    const tstring& binpath,
+    const tstring& options,
+    const VideoFormat& fmt,
+    const tstring& timecodepath,
+    ENUM_ENCODER outputEncoder) {
+    StringBuilderT sb;
+
+    sb.append(_T("\"%s\" --y4m -i -"), binpath);
+    if (!fmt.progressive) {
+        // y4mのインタレースフラグが認識されないため明示する
+        sb.append(_T(" --interlace tff"));
+    }
+    // タイムベースを明示指定する (理由はmakeEncoderArgsのコメント参照)
+    // エンコーダフィルタは常にHWエンコーダなので無条件に付加する
+    sb.append(_T(" --timebase %d/%d"), HWENC_TIMEBASE_NUM, HWENC_TIMEBASE_DEN);
+    if (!options.empty()) {
+        sb.append(_T(" %s"), options);
+    }
+    // HWEncのraw codec出力は、出力形式をrawと明示しない限り内蔵Y4M writerを使用する。
+    sb.append(_T(" -c raw"));
+    if (isHWEncoder(outputEncoder)) {
+        // HWEnc同士ではFRAME行のXts/Xdur拡張を読み取れるため、VFRの表示時刻を次段へ伝える。
+        // x264/x265/SVT-AV1はこの独自拡張に対応しないので付加しない。
+        sb.append(_T(" --y4m-timestamp"));
+    }
+    sb.append(_T(" -o -"));
+    if (!timecodepath.empty()) {
+        sb.append(_T(" --timecode \"%s\""), timecodepath);
+    }
+    // 進捗表示と結果サマリだけ抑制し、
+    // フィルタが実際にどう適用されたか、どのGPUが選択されたかはログに残す
+    sb.append(_T(" --log-level core_progress=error,core_result=error"));
     return sb.str();
 }
 
@@ -709,6 +769,12 @@ ConfigWrapper::ConfigWrapper(
     : AMTObject(ctx)
     , conf(conf)
     , tmpDir(ctx, conf.workDir, conf.noRemoveTmp, conf.resumeDir) {
+    if (this->conf.encoderFilter != (ENUM_ENCODER)-1
+        && this->conf.encoderFilter != ENCODER_QSVENC
+        && this->conf.encoderFilter != ENCODER_NVENC
+        && this->conf.encoderFilter != ENCODER_VCEENC) {
+        THROW(ArgumentException, "エンコーダフィルタにはQSVEnc、NVEnc、VCEEncのみ指定できます");
+    }
     if (this->conf.encoderParallel <= 0) {
         this->conf.encoderParallel = 1;
     }
@@ -765,7 +831,39 @@ tstring ConfigWrapper::getEncoderPath() const {
 }
 
 tstring ConfigWrapper::getEncoderOptions() const {
+    // 同じエンコーダならフィルタオプションを前置して1プロセスで処理する
+    if (isEncoderFilterEnabled() && !isEncoderFilterSeparate() && conf.encoderFilterOptions.size() > 0) {
+        return conf.encoderOptions.size() > 0
+            ? conf.encoderFilterOptions + _T(" ") + conf.encoderOptions
+            : conf.encoderFilterOptions;
+    }
     return conf.encoderOptions;
+}
+
+bool ConfigWrapper::isEncoderFilterEnabled() const {
+    return conf.encoderFilter == ENCODER_QSVENC
+        || conf.encoderFilter == ENCODER_NVENC
+        || conf.encoderFilter == ENCODER_VCEENC;
+}
+
+bool ConfigWrapper::isEncoderFilterSeparate() const {
+    return isEncoderFilterEnabled() && conf.encoderFilter != conf.encoder;
+}
+
+ENUM_ENCODER ConfigWrapper::getEncoderFilter() const {
+    return conf.encoderFilter;
+}
+
+tstring ConfigWrapper::getEncoderFilterPath() const {
+    return conf.encoderFilterPath;
+}
+
+tstring ConfigWrapper::getEncoderFilterOptions() const {
+    return conf.encoderFilterOptions;
+}
+
+bool ConfigWrapper::isEncoderFilterDeinterlace() const {
+    return conf.encoderFilterDeinterlace;
 }
 
 bool ConfigWrapper::getMuxerAddEncoderCmd() const {
@@ -942,6 +1040,10 @@ int ConfigWrapper::getNumEncodeBufferFrames() const {
 
 int ConfigWrapper::getEncoderParallel() const {
     return conf.encoderParallel;
+}
+
+int ConfigWrapper::getMinOutputDuration() const {
+    return conf.minOutputDuration;
 }
 
 const std::vector<tstring>& ConfigWrapper::getLogoPath() const {
@@ -1177,6 +1279,11 @@ tstring ConfigWrapper::getAvsTimecodePath(EncodeFileKey key) const {
         tmpDir.path(), key.video, key.format, key.div, GetCMSuffix(key.cm)) + _T(".timecode.txt"));
 }
 
+tstring ConfigWrapper::getEncoderFilterTimecodePath(EncodeFileKey key) const {
+    return regtmp(StringFormat(_T("%s/v%d-%d-%d%s.encoderfilter.timecode.txt"),
+        tmpDir.path(), key.video, key.format, key.div, GetCMSuffix(key.cm)));
+}
+
 tstring ConfigWrapper::getFilterAvsPath(EncodeFileKey key) const {
     auto str = StringFormat(_T("%s/vfilter%d-%d-%d%s.avs"),
         tmpDir.path(), key.video, key.format, key.div, GetCMSuffix(key.cm));
@@ -1235,6 +1342,10 @@ tstring ConfigWrapper::getTmpChapterExePath(int vindex) const {
 
 tstring ConfigWrapper::getTmpChapterExeOutPath(int vindex) const {
     return regtmp(StringFormat(_T("%s/chapter_exe_o%d.txt"), tmpDir.path(), vindex));
+}
+
+tstring ConfigWrapper::getTmpChapterExeErrPath(int vindex) const {
+    return regtmp(StringFormat(_T("%s/chapter_exe_e%d.txt"), tmpDir.path(), vindex));
 }
 
 tstring ConfigWrapper::getTmpTrimAVSPath(int vindex) const {
@@ -1468,6 +1579,14 @@ bool ConfigWrapper::isZoneWithQualityAvailable() const {
     return conf.encoder == ENCODER_NVENC || conf.encoder == ENCODER_QSVENC;
 }
 
+bool ConfigWrapper::isZoneTimeBased() const {
+    // エンコーダフィルタが別プロセスの場合、本エンコーダの入力はフィルタ出力フレームとなるため、
+    // フィルタがフレーム数を変えるとゾーンのフレーム番号がずれる (VFRでは事前補正も不可能)
+    // QSVEnc/NVEncは--dynamic-rcの時刻指定に対応しており、
+    // フィルタ出力y4mのタイムスタンプ(--y4m-timestamp)で実時刻が伝わるため、時刻でゾーンを指定する
+    return isEncoderFilterSeparate() && isZoneWithQualityAvailable();
+}
+
 bool ConfigWrapper::isEncoderSupportVFR() const {
     return conf.encoder == ENCODER_X264;
 }
@@ -1476,13 +1595,27 @@ bool ConfigWrapper::isBitrateCMEnabled() const {
     return conf.bitrateCM != 1.0 || conf.cmQualityOffset != 0.0;
 }
 
+// --dynamic-rcに渡す区間指定を生成する
+// フレーム番号指定は両端閉区間 [start, end] のため終端は-1する
+// 時刻指定は半開区間 [start, end) のため終端はそのまま渡す
+static std::string makeDynamicRcRange(const BitrateZone& zone, bool timeBased) {
+    char buf[128];
+    if (timeBased && zone.hasTimeRange()) {
+        snprintf(buf, sizeof(buf), "start-time=%f,end-time=%f", zone.startSec, zone.endSec);
+    } else {
+        snprintf(buf, sizeof(buf), "%d:%d", zone.startFrame, zone.endFrame - 1);
+    }
+    return std::string(buf);
+}
+
 tstring ConfigWrapper::getOptions(
     int numFrames,
     VIDEO_STREAM_FORMAT srcFormat, double srcBitrate, bool pulldown,
     int pass, const std::vector<BitrateZone>& zones, const tstring& optionFilePath, double vfrBitrateScale,
-    EncodeFileKey key, const EncoderOptionInfo& eoInfo) const {
+    EncodeFileKey key, const EncoderOptionInfo& eoInfo, bool chunkIsCM) const {
     StringBuilderT sb;
-    sb.append(_T("%s"), conf.encoderOptions);
+    const auto encoderOptions = getEncoderOptions();
+    sb.append(_T("%s"), encoderOptions);
     double targetBitrate = 0;
     if (conf.autoBitrate) {
         targetBitrate = conf.bitrate.getTargetBitrate(srcFormat, srcBitrate);
@@ -1490,7 +1623,7 @@ tstring ConfigWrapper::getOptions(
             // タイムコード非対応エンコーダにおけるビットレートのVFR調整
             targetBitrate *= vfrBitrateScale;
         }
-        if (key.cm == CMTYPE_CM && !isZoneAvailable()) {
+        if ((key.cm == CMTYPE_CM && !isZoneAvailable()) || chunkIsCM) {
             targetBitrate *= conf.bitrateCM;
         }
         double maxBitrate = std::max(targetBitrate * 2, srcBitrate);
@@ -1534,13 +1667,15 @@ tstring ConfigWrapper::getOptions(
         } else if (isZoneWithQualityAvailable() && optionFilePath.length() > 0) {
             //ctx.info("getOptions: ApplyZone QSVEnc/NVEnc");
             // QSVEnc/NVEnc
+            // 経路B(エンコーダフィルタが別プロセス)ではフレーム番号がずれるため時刻でゾーンを指定する
+            const bool zoneTimeBased = isZoneTimeBased();
             if (conf.autoBitrate) {
                 // --dynamic-rcが増えすぎた時に備え、ファイル渡しする
                 std::unique_ptr<FILE, std::function<void(FILE*)>> fp(_tfopen(optionFilePath.c_str(), _T("w")), [](FILE* f) { if (f) fclose(f); });
                 for (int i = 0; i < (int)zones.size(); i++) {
                     const auto& zone = zones[i];
-                    fprintf(fp.get(), " --dynamic-rc %d:%d,vbr=%d\n",
-                        zone.startFrame, zone.endFrame - 1, (int)std::round(targetBitrate * zone.bitrate));
+                    fprintf(fp.get(), " --dynamic-rc %s,vbr=%d\n",
+                        makeDynamicRcRange(zone, zoneTimeBased).c_str(), (int)std::round(targetBitrate * zone.bitrate));
                 }
                 sb.append(_T(" --option-file \"%s\""), optionFilePath);
             } else if (auto rcMode = getRCMode(conf.encoder, eoInfo.rcMode); rcMode) {
@@ -1552,8 +1687,8 @@ tstring ConfigWrapper::getOptions(
                 if (rcMode->isBitrateMode) {
                     for (int i = 0; i < (int)zones.size(); i++) {
                         const auto& zone = zones[i];
-                        fprintf(fp.get(), " --dynamic-rc %d:%d,%s=%d\n",
-                            zone.startFrame, zone.endFrame - 1, rcMode->name,
+                        fprintf(fp.get(), " --dynamic-rc %s,%s=%d\n",
+                            makeDynamicRcRange(zone, zoneTimeBased).c_str(), rcMode->name,
                             (int)std::round(eoInfo.rcModeValue[0] * zone.bitrate));
                         addOptFileCmd = true;
                     }
@@ -1563,18 +1698,18 @@ tstring ConfigWrapper::getOptions(
                         if (zone.qualityOffset == 0.0) continue;
                         addOptFileCmd = true;
                         if (std::string(rcMode->name) == "cqp") {
-                            fprintf(fp.get(), " --dynamic-rc %d:%d,%s=%d:%d:%d\n",
-                                zone.startFrame, zone.endFrame - 1, rcMode->name,
+                            fprintf(fp.get(), " --dynamic-rc %s,%s=%d:%d:%d\n",
+                                makeDynamicRcRange(zone, zoneTimeBased).c_str(), rcMode->name,
                                 std::min(std::max((int)std::round(eoInfo.rcModeValue[0] + zone.qualityOffset), rcValueMin), rcValueMax),
                                 std::min(std::max((int)std::round(eoInfo.rcModeValue[1] + zone.qualityOffset), rcValueMin), rcValueMax),
                                 std::min(std::max((int)std::round(eoInfo.rcModeValue[2] + zone.qualityOffset), rcValueMin), rcValueMax));
                         } else if (rcMode->isFloat) {
-                            fprintf(fp.get(), " --dynamic-rc %d:%d,%s=%f\n",
-                                zone.startFrame, zone.endFrame - 1, rcMode->name,
+                            fprintf(fp.get(), " --dynamic-rc %s,%s=%f\n",
+                                makeDynamicRcRange(zone, zoneTimeBased).c_str(), rcMode->name,
                                 std::min(std::max(eoInfo.rcModeValue[0] + zone.qualityOffset, (double)rcValueMin), (double)rcValueMax));
                         } else {
-                            fprintf(fp.get(), " --dynamic-rc %d:%d,%s=%d\n",
-                                zone.startFrame, zone.endFrame - 1, rcMode->name,
+                            fprintf(fp.get(), " --dynamic-rc %s,%s=%d\n",
+                                makeDynamicRcRange(zone, zoneTimeBased).c_str(), rcMode->name,
                                 std::min(std::max((int)std::round(eoInfo.rcModeValue[0] + zone.qualityOffset), rcValueMin), rcValueMax));
                         }
                     }
@@ -1587,7 +1722,7 @@ tstring ConfigWrapper::getOptions(
     }
     // x264/x265は--zonesで品質オフセットは指定できない、またSVT-AV1にはそもそもzonesがない
     // しかし、CM分離時は--crfを直接上書きすることで対応可能
-    if (key.cm == CMTYPE_CM
+    if ((key.cm == CMTYPE_CM || chunkIsCM)
         && (conf.encoder == ENCODER_X264 || conf.encoder == ENCODER_X265 || conf.encoder == ENCODER_SVTAV1)) {
         //ctx.infoF("getOptions: ApplyZone CM eoInfo.rcMode %s, cmQualityOffset %f", eoInfo.rcMode, conf.cmQualityOffset);
         if (auto rcMode = getRCMode(conf.encoder, eoInfo.rcMode); rcMode && !rcMode->isBitrateMode && conf.cmQualityOffset != 0.0) {
@@ -1634,6 +1769,11 @@ void ConfigWrapper::dump() const {
         (conf.useMKVWhenSubExist) ? _T(" (字幕ありではMKV)") : _T(""));
     ctx.infoF(_T("エンコーダ: %s (%s)"), conf.encoderPath, encoderToString(conf.encoder));
     ctx.infoF(_T("エンコーダオプション: %s"), conf.encoderOptions);
+    if (isEncoderFilterEnabled()) {
+        ctx.infoF(_T("エンコーダフィルタ: %s (%s)"), conf.encoderFilterPath, encoderToString(conf.encoderFilter));
+        ctx.infoF(_T("エンコーダフィルタオプション: %s"), conf.encoderFilterOptions);
+        ctx.infoF(_T("エンコーダフィルタインタレ解除: %s"), conf.encoderFilterDeinterlace ? _T("あり") : _T("なし"));
+    }
     if (conf.userSAR.first > 0 && conf.userSAR.second > 0) {
         ctx.infoF(_T("ユーザー指定SAR: %d:%d"), conf.userSAR.first, conf.userSAR.second);
     }
@@ -1647,6 +1787,7 @@ void ConfigWrapper::dump() const {
         conf.twoPass ? _T("2パス") : _T("1パス"),
         cmOutMaskToString(conf.cmoutmask).c_str());
     ctx.infoF(_T("エンコード分割並列: %d"), conf.encoderParallel);
+    ctx.infoF(_T("出力する最短区間: %d秒"), conf.minOutputDuration);
     const bool logoRequiredForChapter = conf.chapter && (!conf.noLogoInCM || !conf.noDelogo);
     ctx.infoF(_T("チャプター解析: %s%s"),
         conf.chapter ? _T("有効") : _T("無効"),

@@ -21,6 +21,8 @@ using System.Text.Json;
 using Microsoft.Win32;
 using System.Windows.Media;
 using Amatsukaze.Lib;
+using System.Net.Http;
+using System.Windows.Threading;
 
 namespace Amatsukaze.Models
 {
@@ -63,7 +65,16 @@ namespace Amatsukaze.Models
         private string currentNewAutoSelect;
 
         private const int ReceiveLogLimit = 5;
+        // サーバー側の /api/update/status はメモリ上の状態を返すだけでネットワークアクセスを伴わないため、
+        // 接続直後は10秒間隔で3回ポーリングして起動時チェックへ追い付き、その後は5分間隔で更新する。
+        private static readonly TimeSpan UpdateStatusCatchUpInterval = TimeSpan.FromSeconds(10);
+        private const int UpdateStatusCatchUpCount = 3;
+        private static readonly TimeSpan UpdateStatusRefreshInterval = TimeSpan.FromMinutes(5);
+        private static readonly TimeSpan UpdateStatusRequestTimeout = TimeSpan.FromSeconds(5);
         private readonly Dictionary<string, int> receiveLogCounter = new Dictionary<string, int>();
+        private readonly DispatcherTimer updateStatusTimer;
+        private int updateStatusCatchUpRemaining;
+        private int updateStatusRefreshRunning;
 
         private void TraceReceive(string name, string detail = null)
         {
@@ -124,6 +135,23 @@ namespace Amatsukaze.Models
                 return 0;
             }
         }
+
+        #region HasUpdate変更通知プロパティ
+        private bool _HasUpdate;
+
+        // 更新チェックで更新が見つかっているか。基本設定の更新ボタンの強調表示に使う。
+        public bool HasUpdate
+        {
+            get { return _HasUpdate; }
+            private set
+            {
+                if (_HasUpdate == value)
+                    return;
+                _HasUpdate = value;
+                RaisePropertyChanged();
+            }
+        }
+        #endregion
 
         public EndPoint LocalIP {
             get {
@@ -197,6 +225,7 @@ namespace Amatsukaze.Models
 
         #region CurrentLogFile変更通知プロパティ
         private string _CurrentLogFile = "ここに表示するにはログパネルの項目をダブルクリックしてください";
+        private string pendingLogPathRequestId;
 
         public string CurrentLogFile
         {
@@ -788,6 +817,14 @@ namespace Amatsukaze.Models
 
             AddLog("クライアント起動");
 
+            // 生成スレッドに依存しないよう、UIのDispatcherを明示して紐付ける
+            updateStatusTimer = new DispatcherTimer(DispatcherPriority.Normal,
+                DispatcherHelper.UIDispatcher)
+            {
+                Interval = UpdateStatusRefreshInterval,
+            };
+            updateStatusTimer.Tick += UpdateStatusTimer_Tick;
+
             ProfileListView = new ListCollectionView(ProfileList);
             ProfileListView.SortDescriptions.Add(new SortDescription("SortKey", ListSortDirection.Ascending));
             ProfileListView.IsLiveSorting = true;
@@ -805,6 +842,90 @@ namespace Amatsukaze.Models
             requestLogoThread = RequestLogoThread();
         }
 
+        private void StartUpdateStatusPolling()
+        {
+            _ = DispatcherHelper.UIDispatcher.InvokeAsync(() =>
+            {
+                if (disposedValue || RestApiPort <= 0)
+                {
+                    return;
+                }
+                updateStatusCatchUpRemaining = UpdateStatusCatchUpCount;
+                updateStatusTimer.Interval = UpdateStatusCatchUpInterval;
+                if (!updateStatusTimer.IsEnabled)
+                {
+                    updateStatusTimer.Start();
+                }
+                _ = RefreshUpdateStatusAsync();
+            });
+        }
+
+        private async void UpdateStatusTimer_Tick(object sender, EventArgs e)
+        {
+            if (updateStatusCatchUpRemaining > 0)
+            {
+                updateStatusCatchUpRemaining--;
+                if (updateStatusCatchUpRemaining == 0)
+                {
+                    updateStatusTimer.Interval = UpdateStatusRefreshInterval;
+                }
+            }
+            await RefreshUpdateStatusAsync();
+        }
+
+        public void RequestUpdateStatusRefresh()
+        {
+            _ = DispatcherHelper.UIDispatcher.InvokeAsync(() =>
+            {
+                if (disposedValue || RestApiPort <= 0)
+                {
+                    return;
+                }
+                _ = RefreshUpdateStatusAsync();
+            });
+        }
+
+        private async Task RefreshUpdateStatusAsync()
+        {
+            if (Interlocked.Exchange(ref updateStatusRefreshRunning, 1) != 0)
+            {
+                return;
+            }
+            try
+            {
+                var baseUrl = WebUILauncher.TryGetBaseUrl(this);
+                if (baseUrl == null)
+                {
+                    if (!disposedValue) HasUpdate = false;
+                    return;
+                }
+                using var client = new HttpClient { Timeout = UpdateStatusRequestTimeout };
+                using var response = await client.GetAsync($"{baseUrl}/api/update/status");
+                response.EnsureSuccessStatusCode();
+                await using var stream = await response.Content.ReadAsStreamAsync();
+                // Amatsukaze.Shared には Amatsukaze.Server と同名の型（ServerInfo等）があるため、
+                // using は追加せず完全修飾で参照する
+                var status = await JsonSerializer.DeserializeAsync<Amatsukaze.Shared.UpdateStatusView>(stream,
+                    new JsonSerializerOptions
+                    {
+                        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                    });
+                if (!disposedValue)
+                {
+                    HasUpdate = status != null &&
+                        (status.HasUpdate || status.HasPendingSelfUpdate);
+                }
+            }
+            catch
+            {
+                if (!disposedValue) HasUpdate = false;
+            }
+            finally
+            {
+                Interlocked.Exchange(ref updateStatusRefreshRunning, 0);
+            }
+        }
+
         #region IDisposable Support
         private bool disposedValue = false; // 重複する呼び出しを検出するには
 
@@ -816,6 +937,7 @@ namespace Amatsukaze.Models
                 {
                     // TODO: マネージ状態を破棄します (マネージ オブジェクト)。
                     requestLogoQ.Complete();
+                    updateStatusTimer.Stop();
 
                     if (Server is ServerAdapter)
                     {
@@ -1234,6 +1356,7 @@ namespace Amatsukaze.Models
             rd["AMT.SelectionBrush"] = new SolidColorBrush(selection);
             rd["AMT.SelectionForegroundBrush"] = new SolidColorBrush(selectionFg);
             rd["AMT.DisabledForegroundBrush"] = new SolidColorBrush(Color.FromRgb(0x80, 0x80, 0x80));
+            rd["AMT.UpdateAttentionForegroundBrush"] = new SolidColorBrush(isDark ? Color.FromRgb(0xFF, 0x9A, 0xA2) : Color.FromRgb(0xB4, 0x23, 0x18));
             rd["AMT.AccentBrush"] = accentBrush;
 
             // 挿入インジケータ(ドラッグ時の挿入線)の色
@@ -1666,6 +1789,7 @@ namespace Amatsukaze.Models
                 RaisePropertyChanged("FinishActionList");
                 RaisePropertyChanged(nameof(ServerCpuCoreCount));
                 _Setting.IsServerLinux = IsServerLinux;
+                StartUpdateStatusPolling();
             }
             if (data.AddQueueBatFiles != null)
             {
@@ -1735,6 +1859,35 @@ namespace Amatsukaze.Models
         public Task OnLogFile(string str)
         {
             CurrentLogFile = str;
+            return Task.FromResult(0);
+        }
+
+        public Task RequestLogFilePath(LogFileRequest request)
+        {
+            if (request == null || Server == null)
+            {
+                return Task.FromResult(0);
+            }
+            pendingLogPathRequestId = Guid.NewGuid().ToString("N");
+            request.RequestId = pendingLogPathRequestId;
+            return Server.RequestLogFilePath(request);
+        }
+
+        public Task OnLogFilePath(LogFilePathResponse response)
+        {
+            if (DispatchIfRequired(() => OnLogFilePath(response)))
+            {
+                return Task.FromResult(0);
+            }
+            if (response == null || response.RequestId != pendingLogPathRequestId)
+            {
+                return Task.FromResult(0);
+            }
+            pendingLogPathRequestId = null;
+            if (string.IsNullOrEmpty(response.Path) == false)
+            {
+                App.SetClipboardText(response.Path);
+            }
             return Task.FromResult(0);
         }
 
@@ -1919,6 +2072,7 @@ namespace Amatsukaze.Models
                 profile.BitrateCM = data.Profile.BitrateCM;
                 profile.TwoPass = data.Profile.TwoPass;
                 profile.SplitSub = data.Profile.SplitSub;
+                profile.MinOutputDuration = data.Profile.MinOutputDuration;
                 profile.OutputMask = profile.OutputOptionList.FirstOrDefault(s => s.Mask == data.Profile.OutputMask);
                 profile.JLSCommandFile = data.Profile.JLSCommandFile;
                 profile.JLSOption = data.Profile.JLSOption;
