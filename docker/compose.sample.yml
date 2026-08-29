@@ -3,8 +3,9 @@ services:
         image: amatsukaze
         container_name: amatsukaze
         build:
-          context: ./
-          dockerfile: Dockerfile
+          # リポジトリルートのローカルソースをDockerfileへ渡す
+          context: ..
+          dockerfile: docker/Dockerfile
           args:
             ENABLE_FASTER_WHISPER: "0"  # Faster-Whisper-XXLを含める場合は "1" に変更
             ENABLE_VCEENCC: "0"  # VCEEncCを含める場合は "1" に変更
@@ -27,6 +28,8 @@ services:
           - ./profile:/app/profile
           - ./input:/app/input
           - ./output:/app/output
+          # Linux GUIから同じ絶対パスで参照する場合の例
+          - /mnt:/mnt
           - /tmp:/tmp
         # QSVEncC/VCEEncCを使うための設定
         # /dev/driが環境にない場合は無効化が必要

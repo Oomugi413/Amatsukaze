@@ -184,6 +184,7 @@ private:
 
 // 逐次読み込みを別スレッドで先行させ、利用側の処理とファイルI/Oを並行実行する。
 // read() は単一スレッドから呼び、返された領域は次の read() 呼び出しまで有効。
+// maxLengthを指定した場合、先読みバッファを維持したまま利用側へ渡す単位だけを制限する。
 // 終了時に同期read中の場合、そのreadがOSから戻るまでデストラクタは待機する。
 class ReadAheadFile : NonCopyable {
 public:
@@ -191,6 +192,7 @@ public:
     ~ReadAheadFile();
 
     MemoryChunk read();
+    MemoryChunk read(size_t maxLength);
     int64_t size() const;
 
 private:

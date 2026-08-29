@@ -2427,7 +2427,7 @@ namespace Amatsukaze.Server.Rest
 
             try
             {
-                using var req = new HttpRequestMessage(HttpMethod.Get, "https://api.github.com/repos/rigaya/Amatsukaze/releases/latest");
+                using var req = new HttpRequestMessage(HttpMethod.Get, "https://api.github.com/repos/Oomugi413/Amatsukaze/releases/latest");
                 using var res = await GithubClient.SendAsync(req);
                 if (!res.IsSuccessStatusCode)
                 {
