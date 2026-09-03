@@ -1,0 +1,36 @@
+/home/oomugi413/git/Amatsukaze/docker/profile/NVENC-HEVC-4K-1080p-23f-colormap-codex.profile
+によるエンコードログは/home/oomugi413/git/Amatsukaze/.codex/log_codex_23f.log のとおり。一方、
+/home/oomugi413/git/Amatsukaze/docker/profile/NVENC-HEVC-4K-1080p-23f-colormap.profile
+によるエンコードログは/home/oomugi413/git/Amatsukaze/.codex/log_origin_23f.txt
+となり、新しいオプションは元のプロファイルに比べてとくにエンコード速度が変わっていない（遅い気もする）。
+10bitから8bitにするのは余計な負担ということか（プロファイルは今回変更しない）
+
+NVENC-HEVC-4K-1080p-23f-colormap.profileは正常に動いているので動かさないで。
+
+
+
+
+
+のエンコードは正常。そのうえで、コーデックの若干異なる下のファイルならどうか？
+・エンコードするファイルは/mnt/recording/20260626_4KTest_NHKBSP4K-enc.logのエンコードに使用したものと同じ。
+・Stream #0:1に1920x1080の映像があるが無視する。（デフォルトで無視する設定になっているはず）
+Input #0, mpegts, from '/mnt/recording/20260626_4KTest_NHKBSP4K.ts':
+  Duration: 00:18:08.62, start: 40068.571978, bitrate: 22018 kb/s
+  Program 101 
+    Metadata:
+      service_name    : NHK?!!?BSP4K
+      service_provider: NHK
+  Stream #0:0[0x100]: Video: hevc (Main 10) (HEVC / 0x43564548), yuv420p10le(tv, bt2020nc/bt2020/arib-std-b67), 3840x2160 [SAR 1:1 DAR 16:9], 59.94 fps, 59.94 tbr, 90k tbn, start 40069.156856
+  Stream #0:1[0x101]: Video: hevc (Main 10) (HEVC / 0x43564548), yuv420p10le(tv, bt2020nc/bt2020/arib-std-b67), 1920x1080 [SAR 1:1 DAR 16:9], 59.94 fps, 59.94 tbr, 90k tbn, start 40069.090111
+  Stream #0:2[0x110]: Audio: aac (LC) ([15][0][0][0] / 0x000F), 48000 Hz, 5.1, fltp, 318 kb/s, start 40068.614644
+  Stream #0:3[0x111]: Audio: aac (LC) ([15][0][0][0] / 0x000F), 48000 Hz, stereo, fltp, 253 kb/s, start 40068.571978
+  Stream #0:4[0x114]: Audio: aac (LC) ([15][0][0][0] / 0x000F), 48000 Hz, stereo, fltp, 62 kb/s, start 40068.726144
+  Stream #0:5[0x138]: Data: bin_data ([6][0][0][0] / 0x0006), start 40068.571978
+  No Program
+  Stream #0:6[0x12]: Data: epg, start 40068.571978
+
+以上の条件が整っていれば、前のファイルとコマンドが全く異なっていても構わない。必要であれば、/home/oomugi413/git/Amatsukaze/docker/profile/NVENC-HEVC-4K-1080p-23f-basic-codex.profile にprofile案を記載してほしい。NVENC-HEVC-4K-1080p-23f-colormap-codex.profileは正常に動いているので動かさないで。
+
+ここまでに解決したエラーの内容と解決策はまとめて
+/home/oomugi413/git/Amatsukaze/.codex/error-and-fix1.md
+にある。

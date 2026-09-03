@@ -26,6 +26,18 @@ if ! dotnet --list-sdks | awk '{print $1}' | grep -Eq '^10\.'; then
     exit 1
 fi
 
+# Linux GUIはOSのPython、PyGObject、GTK 4を使用するため、ビルド時には
+# GUI固有の構文検査とGTK非依存テストだけを実行する。
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 コマンドが見つかりません。AmatsukazeLinuxGUIの実行依存を確認してください。"
+    exit 1
+fi
+(
+    cd "${PROJECT_ROOT}" || exit 1
+    python3 -m compileall -q "${PROJECT_ROOT}/AmatsukazeLinuxGUI" || exit 1
+    python3 -m unittest discover -q "${PROJECT_ROOT}/AmatsukazeLinuxGUI/Tests" || exit 1
+) || exit 1
+
 # デバッグビルドのオプションをチェック
 DEBUG_BUILD=false
 if [ "$2" = "--debug" ] || [ "$3" = "--debug" ]; then
@@ -220,6 +232,7 @@ mkdir -p "${INSTALL_DIR}/bat"
 mkdir -p "${INSTALL_DIR}/drcs"
 mkdir -p "${INSTALL_DIR}/exe_files"
 mkdir -p "${INSTALL_DIR}/exe_files/plugins64"
+mkdir -p "${INSTALL_DIR}/exe_files/AmatsukazeLinuxGUI"
 mkdir -p "${INSTALL_DIR}/logo"
 mkdir -p "${INSTALL_DIR}/profile"
 mkdir -p "${INSTALL_DIR}/scripts"
@@ -232,6 +245,18 @@ install -D -t "${INSTALL_DIR}/exe_files" "${BUILD_DIR}/build_ffnk/AmatsukazeCLI/
 install -D -t "${INSTALL_DIR}/exe_files" "${BUILD_DIR}/build_ffnk/AmatsukazeGenLogo/AmatsukazeGenLogo"
 install -D -t "${INSTALL_DIR}/exe_files" "${BUILD_DIR}/build_ffnk/Amatsukaze/libAmatsukaze.so"
 install -D -t "${INSTALL_DIR}/exe_files" "${BUILD_DIR}/build_ff612/Amatsukaze/libAmatsukaze2.so"
+# GTK 4/PyGObject GUI（OSのPythonから実行するため、Python本体へ凍結しない）。
+# .desktopテンプレートとアイコンはユーザー単位の登録スクリプトから利用する。
+cp -r "${PROJECT_ROOT}/AmatsukazeLinuxGUI/amatsukaze_linux_gui" "${INSTALL_DIR}/exe_files/AmatsukazeLinuxGUI/"
+# compileallが生成したキャッシュは配布物へ含めない。
+find "${INSTALL_DIR}/exe_files/AmatsukazeLinuxGUI" -type d -name __pycache__ -prune -exec rm -rf {} +
+install -m 755 -D "${PROJECT_ROOT}/AmatsukazeLinuxGUI/amatsukaze_linux_gui.py" "${INSTALL_DIR}/exe_files/AmatsukazeLinuxGUI/amatsukaze_linux_gui.py"
+install -m 644 -D "${PROJECT_ROOT}/AmatsukazeLinuxGUI/README.md" "${INSTALL_DIR}/exe_files/AmatsukazeLinuxGUI/README.md"
+install -m 755 -D "${PROJECT_ROOT}/AmatsukazeLinuxGUI/Packaging/AmatsukazeLinuxGUI.sh" "${INSTALL_DIR}/AmatsukazeLinuxGUI.sh"
+install -m 755 -D "${PROJECT_ROOT}/AmatsukazeLinuxGUI/Packaging/AmatsukazeLinuxGUI.sh" "${INSTALL_DIR}/exe_files/AmatsukazeLinuxGUI/Packaging/AmatsukazeLinuxGUI.sh"
+install -m 755 -D "${PROJECT_ROOT}/AmatsukazeLinuxGUI/Packaging/install-desktop-entry.sh" "${INSTALL_DIR}/exe_files/AmatsukazeLinuxGUI/Packaging/install-desktop-entry.sh"
+install -m 644 -D "${PROJECT_ROOT}/AmatsukazeLinuxGUI/Packaging/AmatsukazeLinuxGUI.desktop.in" "${INSTALL_DIR}/exe_files/AmatsukazeLinuxGUI/Packaging/AmatsukazeLinuxGUI.desktop.in"
+install -m 644 -D "${PROJECT_ROOT}/AmatsukazeLinuxGUI/Assets/amatsukaze-linux-gui.png" "${INSTALL_DIR}/exe_files/AmatsukazeLinuxGUI/Assets/amatsukaze-linux-gui.png"
 # ニコニコ実況コメント取得・ASS変換スクリプト（Linux用）
 install -m 755 -D -t "${INSTALL_DIR}/exe_files" ./scripts/nicojk_ass.py
 # danmaku2ass（コメントXML→ASS変換、GPL-3.0）: なければダウンロード

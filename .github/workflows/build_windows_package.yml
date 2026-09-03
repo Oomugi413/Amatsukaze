@@ -1,5 +1,8 @@
 name: Build Windows Package
 
+permissions:
+  contents: write
+
 on:
   push:
     branches:
@@ -119,6 +122,10 @@ jobs:
           tree ffmpeg_lgpl
           if not exist lib mkdir lib
           7z x -y -o"%OUT%\lib" "%DEPS%\deplib.7z"
+          if not exist lib\\x64\\AviSynth.lib (
+            echo Required dependency lib\\x64\\AviSynth.lib was not found after extracting DEPLIB_URL.
+            exit /b 1
+          )
           if not exist deps\\join_logo mkdir deps\\join_logo
           7z x -y -o"%DEPS%\join_logo" "%DEPS%\join_logo.zip"
           if not exist deps\\avscuda mkdir deps\\avscuda
