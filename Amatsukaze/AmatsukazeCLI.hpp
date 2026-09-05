@@ -46,7 +46,7 @@ static void printHelp(const tchar* bin) {
         "  -s|--serviceid <数値> 処理するサービスIDを指定[]\n"
         "  -w|--work   <パス>  一時ファイルパス[./]\n"
         "  -et|--encoder-type <タイプ>  使用エンコーダタイプ[x264]\n"
-        "                      対応エンコーダ: x264,x265,QSVEnc,NVEnc,VCEEnc,SVT-AV1\n"
+        "                      対応エンコーダ: x264,x265,QSVEnc,NVEnc,VCEEnc,SVT-AV1,x262\n"
         "  -e|--encoder <パス> エンコーダパス[x264.exe]\n"
         "  -eo|--encoder-option <オプション> エンコーダへ渡すオプション[]\n"
         "                      入力ファイルの解像度、アスペクト比、インタレースフラグ、\n"
@@ -74,14 +74,15 @@ static void printHelp(const tchar* bin) {
         "  -ae|--audio-encoder <パス> 音声エンコーダ[]"
         "  -aeo|--audio-encoder-option <オプション> 音声エンコーダへ渡すオプション[]\n"
         "  -fmt|--format <フォーマット> 出力フォーマット[mp4]\n"
-        "                      対応フォーマット: mp4,mkv,m2ts,ts\n"
+        "                      対応フォーマット: mp4,mkv,m2ts,ts,tsreplace\n"
         "  --use-mkv-when-sub-exists 字幕がある場合にはmkv出力を強制する\n"
-        "  -m|--muxer  <パス>  L-SMASHのmuxerまたはmkvmergeまたはtsMuxeRへのパス[muxer.exe]\n"
+        "  -m|--muxer  <パス>  L-SMASHのmuxer、mkvmerge、tsMuxeRまたはtsreplaceへのパス[muxer.exe]\n"
         "  -t|--timelineeditor  <パス>  timelineeditorへのパス（MP4でVFR出力する場合に必要）[timelineeditor.exe]\n"
         "  --mp4box <パス>     mp4boxへのパス（MP4で字幕処理する場合に必要）[mp4box.exe]\n"
         "  --mkvmerge <パス>   mkvmergeへのパス（--use-mkv-when-sub-exists使用時に必要）[mkvmerge.exe]\n"
         "  --tsreplace-remove-typed  tsreplace実行時に--remove-typedを指定する\n"
         "  --mux-ts-temp        tsreplace時に入力TSの一時コピーを作成してmuxを高速化する\n"
+        "  --mpeg2-partial      カット境界再エンコードを有効にする（現在はMPEG-2/x262のみ）\n"
         "  -f|--filter <パス>  フィルタAvisynthスクリプトへのパス[]\n"
         "  -pf|--postfilter <パス>  ポストフィルタAvisynthスクリプトへのパス[]\n"
         "  --mpeg2decoder <デコーダ>  MPEG2用デコーダ[default]\n"
@@ -187,6 +188,8 @@ static ENUM_ENCODER encoderFtomString(const tstring& str) {
         return ENCODER_VCEENC;
     } else if (str == _T("svt-av1") || str == _T("SVT-AV1")) {
         return ENCODER_SVTAV1;
+    } else if (str == _T("x262")) {
+        return ENCODER_X262;
     }
     return (ENUM_ENCODER)-1;
 }
@@ -282,6 +285,7 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
     conf.tsreplaceRemoveTypeD = false;
     conf.muxTsTemp = false;
     conf.useMKVWhenSubExist = false;
+    conf.mpeg2Partial = false;
     conf.outputChapter = false;
     bool nicojk = false;
     conf.webvtt = false;
@@ -414,6 +418,8 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
             conf.muxTsTemp = true;
         } else if (key == _T("--use-mkv-when-sub-exists")) {
             conf.useMKVWhenSubExist = true;
+        } else if (key == _T("--mpeg2-partial")) {
+            conf.mpeg2Partial = true;
         } else if (key == _T("--chapter")) {
             conf.chapter = true;
         } else if (key == _T("--output-chapter")) {
@@ -629,6 +635,36 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
         conf.nicojkmask = 0;
     }
 
+    if (conf.encoder == ENCODER_X262
+        && conf.format != FORMAT_MKV && conf.format != FORMAT_TSREPLACE) {
+        THROW(ArgumentException, "x262はMKVまたはTS (replace)出力でのみ使用できます");
+    }
+
+    if (conf.mpeg2Partial) {
+        if (conf.encoder != ENCODER_X262 || conf.format != FORMAT_TSREPLACE) {
+            THROW(ArgumentException, "--mpeg2-partialにはx262とTS (replace)出力が必要です");
+        }
+        if (conf.cmoutmask != (1 << CMTYPE_NONCM)
+            || (!conf.chapter && conf.trimavsPath.empty())) {
+            THROW(ArgumentException, "--mpeg2-partialにはCMカット本編のみ出力が必要です");
+        }
+        if (!conf.filterScriptPath.empty() || !conf.postFilterScriptPath.empty()
+            || !conf.noDelogo || !conf.eraseLogoPath.empty()) {
+            THROW(ArgumentException, "--mpeg2-partialではフィルタ、ロゴ消しを使用できません");
+        }
+        if (conf.twoPass || conf.encoderParallel != 1
+            || conf.encoderOptions.find(_T("--parallel")) != tstring::npos
+            || conf.encoderOptions.find(_T("--zones")) != tstring::npos) {
+            THROW(ArgumentException, "--mpeg2-partialでは2pass、分割並列、zonesを使用できません");
+        }
+        if (!conf.preEncBatchFile.empty()) {
+            THROW(ArgumentException, "--mpeg2-partialではエンコード前バッチを使用できません");
+        }
+        if (conf.useMKVWhenSubExist) {
+            THROW(ArgumentException, "--mpeg2-partialでは字幕存在時のMKV切替を使用できません");
+        }
+    }
+
     // muxerのデフォルト値
     if (conf.muxerPath.size() == 0) {
         if (conf.format == FORMAT_MP4) {
@@ -712,6 +748,15 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
         conf.mkvmergePath = search(conf.mkvmergePath);
         conf.muxerPath = search(conf.muxerPath);
         conf.timelineditorPath = search(conf.timelineditorPath);
+        // x262のTS (replace)出力は、raw MPEG-2 ESにmkvmergeで時刻情報を付けてから
+        // matroskaとしてtsreplaceへ渡す(makeMuxerArgs)。ただしカット境界再エンコードは
+        // timestamp付きMPEG-TSを直接tsreplaceへ渡すのでmkvmergeを一切使わない。
+        // フル再エンコードへのフォールバックも廃止したため、カット境界再エンコード有効時は
+        // 必ずこの経路になる。
+        if (conf.encoder == ENCODER_X262 && conf.format == FORMAT_TSREPLACE
+            && !conf.mpeg2Partial && !File::exists(conf.mkvmergePath)) {
+            THROW(ArgumentException, "x262のTS (replace)出力にはmkvmergeパスが必要です");
+        }
     }
 
     if (conf.srcFilePathOrg.size() == 0) {

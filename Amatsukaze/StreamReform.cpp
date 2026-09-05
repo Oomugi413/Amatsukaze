@@ -370,6 +370,36 @@ const VideoFrameInfo& StreamReformInfo::getVideoFrameInfo(int frameIndex) const 
     return videoFrameList_[frameIndex];
 }
 
+int StreamReformInfo::getDtsFrameIndex(int ptsOrderIndex) const {
+    return ordredVideoFrame_.at(ptsOrderIndex);
+}
+
+std::pair<int, int> StreamReformInfo::getVideoFrameRange(int videoFileIndex) const {
+    if (videoFileIndex < 0 || videoFileIndex >= numVideoFile_) {
+        THROWF(ArgumentException, "中間映像ファイル番号が範囲外です: %d", videoFileIndex);
+    }
+
+    if (frameFormatId_.size() != videoFrameList_.size()) {
+        THROW(RuntimeException, "DTS順フレームとフォーマット対応表のサイズが一致しません");
+    }
+    // AMTSplitterの分割条件を再現せず、reformMainが確定させた
+    // frameFormatId_から範囲を求める（getEncoderIndexと同じ経路）。
+    int start = -1;
+    int end = -1;
+    for (int i = 0; i < (int)videoFrameList_.size(); ++i) {
+        if (format_[fileFormatId_[frameFormatId_[i]]].videoFileId == videoFileIndex) {
+            if (start < 0) {
+                start = i;
+            }
+            end = i + 1;
+        }
+    }
+    if (start < 0) {
+        THROWF(RuntimeException, "中間映像ファイルのフレーム範囲を取得できません: %d", videoFileIndex);
+    }
+    return std::make_pair(start, end);
+}
+
 // video frame index (DTS順) -> encoder index
 int StreamReformInfo::getEncoderIndex(int frameIndex) const {
     int fileId = frameFormatId_[frameIndex];
@@ -1470,6 +1500,61 @@ void StreamReformInfo::genCaptionStream() {
     }
 }
 
+std::vector<StreamReformInfo::KeepSegment> StreamReformInfo::getKeepSegments(const EncodeFileKey& key) const {
+    const auto& file = outFiles_.at(key.key());
+    const auto& srcFrames = filterFrameList_[key.video];
+    const auto& frames = file.videoFrames;
+    std::vector<KeepSegment> keepSegs;
+    if (frames.empty()) {
+        return keepSegs;
+    }
+
+    int segStart = 0;
+    for (int i = 1; i <= (int)frames.size(); i++) {
+        const bool boundary = (i == (int)frames.size()) || (frames[i] != frames[i - 1] + 1);
+        if (boundary) {
+            const int startIdx = frames[segStart];
+            const int endIdx = frames[i - 1];
+            const double startPts = srcFrames[startIdx].pts;
+            const double endPts = srcFrames[endIdx].pts + srcFrames[endIdx].frameDuration;
+            if (endPts > startPts) {
+                keepSegs.push_back({ startPts, endPts });
+            }
+            segStart = i;
+        }
+    }
+    return keepSegs;
+}
+
+std::string StreamReformInfo::genTSReplaceCutManifest(const EncodeFileKey& key) const {
+    const auto keepSegs = getKeepSegments(key);
+    if (keepSegs.empty()) {
+        return std::string();
+    }
+    const double outputEndPts = keepSegs.back().end;
+
+    const int64_t timestampMask = (1LL << 33) - 1;
+    const auto pts33 = [timestampMask](double pts) {
+        return (int64_t)std::llround(pts) & timestampMask;
+    };
+
+    StringBuilder manifest;
+    manifest.append("# tsreplace-cut-v2\n");
+    manifest.append("timebase=90000\n");
+    manifest.append("cut -1 %lld\n", (long long)pts33(keepSegs.front().start));
+    for (size_t i = 1; i < keepSegs.size(); i++) {
+        const int64_t absoluteStart = (int64_t)std::llround(keepSegs[i - 1].end);
+        const int64_t absoluteEnd = (int64_t)std::llround(keepSegs[i].start);
+        if (absoluteStart < absoluteEnd) {
+            manifest.append("cut %lld %lld\n",
+                (long long)(absoluteStart & timestampMask),
+                (long long)(absoluteEnd & timestampMask));
+        }
+    }
+    manifest.append("cut %lld -1\n", (long long)pts33(outputEndPts));
+    return manifest.str();
+}
+
 void StreamReformInfo::genWebVTT(const EncodeFileKey& key, const ConfigWrapper& setting,
     std::vector<PsisiarcTask>& psisiarcTasks) {
     ctx.info(_T("[WebVTT生成]"));
@@ -1535,23 +1620,8 @@ void StreamReformInfo::genWebVTT(const EncodeFileKey& key, const ConfigWrapper& 
     };
 
     if (!frames.empty()) {
-        // まず保持セグメント（映像が存在する区間）を抽出
-        struct KeepSeg { double start; double end; };
-        std::vector<KeepSeg> keepSegs;
-        int segStart = 0;
-        for (int i = 1; i <= (int)frames.size(); i++) {
-            bool boundary = (i == (int)frames.size()) || (frames[i] != frames[i - 1] + 1);
-            if (boundary) {
-                int startIdx = frames[segStart];
-                int endIdx = frames[i - 1];
-                double startPts = srcFrames[startIdx].pts - (double)dataPTS_[0]; // 90kHz基準
-                double endPts = srcFrames[endIdx].pts + srcFrames[endIdx].frameDuration - (double)dataPTS_[0]; // 終了はフレーム末尾
-                if (endPts > startPts) {
-                    keepSegs.push_back({ startPts, endPts });
-                }
-                segStart = i;
-            }
-        }
+        // 保持セグメントは絶対PTSなので、チャプター用には従来どおり先頭データPTSからの相対値へ戻す
+        const auto keepSegs = getKeepSegments(key);
 
         // 入力全体（このファイルの基準）での末尾時刻（90kHz基準）
         double totalEnd = 0.0;
@@ -1563,11 +1633,13 @@ void StreamReformInfo::genWebVTT(const EncodeFileKey& key, const ConfigWrapper& 
         // 保持セグメントの補集合（削除区間）を ix/ox で出力
         double prev = 0.0;
         for (const auto& seg : keepSegs) {
-            if (seg.start > prev) {
+            const double start = seg.start - (double)dataPTS_[0];
+            const double end = seg.end - (double)dataPTS_[0];
+            if (start > prev) {
                 writeChap(prev, "ix");
-                writeChap(seg.start, "ox");
+                writeChap(start, "ox");
             }
-            prev = seg.end;
+            prev = end;
         }
         if (totalEnd > prev) {
             writeChap(prev, "ix");

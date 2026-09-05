@@ -24,6 +24,7 @@ enum ENUM_ENCODER {
     ENCODER_NVENC,
     ENCODER_VCEENC,
     ENCODER_SVTAV1,
+    ENCODER_X262,
 };
 
 struct EncoderZone {
@@ -101,13 +102,15 @@ tstring makeEncoderArgs(
     const tstring& timecodepath,
     int vfrTimingFps,
     const ENUM_FORMAT format,
-    const tstring& outpath);
+    const tstring& outpath,
+    bool sarInContainerOnly);
 
 tstring makeEncoderFilterArgs(
     const tstring& binpath,
     const tstring& options,
     const VideoFormat& fmt,
-    const tstring& timecodepath,
+    const tstring& inputTimecodePath,
+    const tstring& outputTimecodePath,
     ENUM_ENCODER outputEncoder);
 
 enum ENUM_AUDIO_ENCODER {
@@ -132,11 +135,13 @@ std::vector<std::pair<tstring, bool>> makeMuxerArgs(
     const std::pair<int, int>& userSAR,
     const ENUM_FORMAT format,
     const tstring& binpath,
+    const tstring& mkvmergepath,
     const tstring& timelineeditorpath,
     const tstring& mp4boxpath,
     const tstring& srcTSFilePath,
     const tstring& inVideo,
     const bool encoderOutputInContainer,
+    const bool tsreplaceMpegtsInput,
     const VideoFormat& videoFormat,
     const std::vector<tstring>& inAudios,
     const tstring& tmpdir,
@@ -150,8 +155,7 @@ std::vector<std::pair<tstring, bool>> makeMuxerArgs(
     const std::vector<tstring>& subsTitles,
     const tstring& metapath,
     const bool tsreplaceRemoveTypeD,
-    bool tsreplaceEdgeTrim,
-    int64_t tsreplaceDelay,
+    const tstring& tsreplaceCutList,
     bool muxerAddEncoderCmd,
     bool sarInContainerOnly,
     const tstring& encoderName,
@@ -257,6 +261,7 @@ struct Config {
     bool tsreplaceRemoveTypeD;
     bool muxTsTemp;
     bool useMKVWhenSubExist;
+    bool mpeg2Partial;
     bool splitSub;
     bool twoPass;
     bool autoBitrate;
@@ -395,6 +400,8 @@ public:
 
     bool getUseMKVWhenSubExist() const;
 
+    bool isMpeg2PartialEnabled() const;
+
     bool isFormatVFRSupported() const;
 
     tstring getMuxerPath() const;
@@ -514,6 +521,7 @@ public:
     tstring getTmpRawTSPath() const;
     tstring getTmpTsReadExDumpPath() const;
     tstring getTmpB24CutChapterPath(EncodeFileKey key) const;
+    tstring getTmpTSReplaceCutListPath(EncodeFileKey key) const;
     tstring getTmpVTTFilePath(EncodeFileKey key, int langindex) const;
     tstring getTmpPSCFilePath(EncodeFileKey key) const;
 
@@ -658,6 +666,9 @@ public:
     bool isZoneTimeBased() const;
 
     bool isEncoderSupportVFR() const;
+
+    // 目標ビットレートにVFR補正(vfrBitrateScale)を掛ける必要があるか
+    bool isVFRBitrateScaleNeeded() const;
 
     bool isBitrateCMEnabled() const;
 

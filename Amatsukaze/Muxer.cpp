@@ -7,7 +7,6 @@
 */
 
 #include "Muxer.h"
-#include <cmath>
 
 /* static */ ENUM_FORMAT getActualOutputFormat(EncodeFileKey key, const StreamReformInfo& reformInfo, const ConfigWrapper& setting) {
     if (!setting.getUseMKVWhenSubExist() || setting.getFormat() == FORMAT_MKV) {
@@ -49,21 +48,13 @@ void AMTMuxder::mux(EncodeFileKey key,
     auto muxFormat = getActualOutputFormat(key, reformInfo_, setting_);
     auto vfmt = fileOut.vfmt;
 
-    bool tsreplaceEdgeTrim = false;
-    int64_t tsreplaceDelay = 0;
-    if (muxFormat == FORMAT_TSREPLACE && key.cm == CMTYPE_EDGE_TRIM) {
-        if (!fileIn.videoFrames.empty()) {
-            const auto& filterFrames = reformInfo_.getFilterSourceFrames(key.video);
-            int firstIndex = fileIn.videoFrames.front();
-            if (firstIndex >= 0 && firstIndex < (int)filterFrames.size()) {
-                double firstPts = filterFrames[firstIndex].pts;
-                double basePts = reformInfo_.getFirstDataPTS();
-                tsreplaceDelay = (int64_t)std::llround(firstPts - basePts);
-                if (tsreplaceDelay < 0) {
-                    tsreplaceDelay = 0;
-                }
-                tsreplaceEdgeTrim = true;
-            }
+    tstring tsreplaceCutList;
+    if (muxFormat == FORMAT_TSREPLACE && (key.cm == CMTYPE_EDGE_TRIM || key.cm == CMTYPE_NONCM)) {
+        const auto manifest = reformInfo_.genTSReplaceCutManifest(key);
+        if (!manifest.empty()) {
+            tsreplaceCutList = setting_.getTmpTSReplaceCutListPath(key);
+            WriteUTF8File(tsreplaceCutList, manifest);
+            ctx.infoF(_T("tsreplace カットリスト: %s"), tsreplaceCutList.c_str());
         }
     }
 
@@ -211,8 +202,11 @@ void AMTMuxder::mux(EncodeFileKey key,
         File::copy(srcpsc, dstpsc);
     }
 
-    const tstring tmpOut1Path = setting_.getVfrTmpFile1Path(key, (muxFormat == FORMAT_TSREPLACE) ? FORMAT_MP4 : muxFormat);
-    const tstring tmpOut2Path = setting_.getVfrTmpFile2Path(key, (muxFormat == FORMAT_TSREPLACE) ? FORMAT_MP4 : muxFormat);
+    const ENUM_FORMAT tsreplaceTempFormat = fileOut.isMpeg2Partial
+        ? FORMAT_TS
+        : (setting_.getEncoder() == ENCODER_X262 ? FORMAT_MKV : FORMAT_MP4);
+    const tstring tmpOut1Path = setting_.getVfrTmpFile1Path(key, (muxFormat == FORMAT_TSREPLACE) ? tsreplaceTempFormat : muxFormat);
+    const tstring tmpOut2Path = setting_.getVfrTmpFile2Path(key, (muxFormat == FORMAT_TSREPLACE) ? tsreplaceTempFormat : muxFormat);
 
     tstring metaFile;
     if (muxFormat == FORMAT_M2TS || muxFormat == FORMAT_TS) {
@@ -264,14 +258,14 @@ void AMTMuxder::mux(EncodeFileKey key,
         }
     }
     auto args = makeMuxerArgs(
-        setting_.getEncoder(), setting_.getUserSAR(), muxFormat, muxerPath,
+        setting_.getEncoder(), setting_.getUserSAR(), muxFormat, muxerPath, setting_.getMkvMergePath(),
         setting_.getTimelineEditorPath(), setting_.getMp4BoxPath(),
         (File::exists(setting_.getTmpRawTSPath()) ? setting_.getTmpRawTSPath() : setting_.getSrcFilePath()),
-        encVideoFile, encoderOutputInContainer(setting_.getEncoder(), muxFormat),
+        encVideoFile, encoderOutputInContainer(setting_.getEncoder(), muxFormat), fileOut.isMpeg2Partial,
         vfmt, audioFiles, setting_.getTmpDir(),
         outPath, tmpOut1Path, tmpOut2Path, chapterFile,
         fileOut.timecode, timebase, subsFiles, subsTitles, metaFile,
-        setting_.getTsreplaceRemoveTypeD(), tsreplaceEdgeTrim, tsreplaceDelay,
+        setting_.getTsreplaceRemoveTypeD(), tsreplaceCutList,
         setting_.getMuxerAddEncoderCmd(), setting_.getSARInContainerOnly(),
         encoderToString(setting_.getEncoder()),
         setting_.getEncoderOptions());
@@ -324,12 +318,12 @@ void AMTSimpleMuxder::mux(VideoFormat videoFormat, int audioCount) {
     tstring outFilePath = setting_.getOutFilePath(EncodeFileKey(), EncodeFileKey(), setting_.getFormat(), videoFormat.format);
     auto args = makeMuxerArgs(
         setting_.getEncoder(), setting_.getUserSAR(), setting_.getFormat(),
-        setting_.getMuxerPath(), setting_.getTimelineEditorPath(), setting_.getMp4BoxPath(),
+        setting_.getMuxerPath(), setting_.getMkvMergePath(), setting_.getTimelineEditorPath(), setting_.getMp4BoxPath(),
         setting_.getSrcFilePath(),
-        encVideoFile, encoderOutputInContainer(setting_.getEncoder(), setting_.getFormat()),
+        encVideoFile, encoderOutputInContainer(setting_.getEncoder(), setting_.getFormat()), false,
         videoFormat, audioFiles, setting_.getTmpDir(), outFilePath,
         tstring(), tstring(), tstring(), tstring(), std::pair<int, int>(),
-        std::vector<tstring>(), std::vector<tstring>(), tstring(), false, false, 0,
+        std::vector<tstring>(), std::vector<tstring>(), tstring(), false, tstring(),
         setting_.getMuxerAddEncoderCmd(), setting_.getSARInContainerOnly(),
         encoderToString(setting_.getEncoder()),
         setting_.getEncoderOptions());

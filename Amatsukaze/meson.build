@@ -20,6 +20,7 @@ amatsukaze_sources = [
   'LogoScan.cpp',
   'Mpeg2TsParser.cpp',
   'Mpeg2VideoParser.cpp',
+  'Mpeg2PartialEncode.cpp',
   'Muxer.cpp',
   'NicoJK.cpp',
   'OSUtil.cpp',
@@ -59,7 +60,6 @@ amatsukaze_deps = [
   ffmpeg_dep,
   avisynth_dep,
   turbojpeg_dep,
-  openssl_dep,
   zlib_dep,
   version_dep,
 ]

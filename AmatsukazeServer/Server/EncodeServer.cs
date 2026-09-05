@@ -1226,46 +1226,7 @@ namespace Amatsukaze.Server
         struct EncodeExeFileInfo
         {
             public string Path;
-            public int[] version;
-        }
-        private static int[] GetEncoderExeVersionFromFilename(string filename, EncoderType type)
-        {
-            switch (type)
-            {
-                case EncoderType.x264:
-                    // x264はx264_3186_x64.exeのような形式なので、このうち3186をintに変換して返す
-                    var match = System.Text.RegularExpressions.Regex.Match(filename, @"x264_(\d+)_");
-                    if (match.Success)
-                    {
-                        return new int[] { int.Parse(match.Groups[1].Value), 0, 0, 0 };
-                    }
-                    break;
-                case EncoderType.x265:
-                    // x265はx265_3.6+7_x64.exeのような形式なので、このうち、3, 6, 7をintに変換して配列で返す
-                    match = System.Text.RegularExpressions.Regex.Match(filename, @"x265_(\d+)\.(\d+)\+(\d+)_");
-                    if (match.Success)
-                    {
-                        return new int[] { int.Parse(match.Groups[1].Value), int.Parse(match.Groups[2].Value), 0, int.Parse(match.Groups[3].Value) };
-                    }
-                    break;
-                case EncoderType.SVTAV1:
-                    //svt-av1はSvtAv1EncApp_2.0.0-31_x64.exeのような形式なので、このうち、2, 0, 0, 31をintに変換して配列で返す
-                    match = System.Text.RegularExpressions.Regex.Match(filename, @"SvtAv1EncApp_(\d+)\.(\d+)\.(\d+)-(\d+)_");
-                    if (match.Success)
-                    {
-                        return new int[] { int.Parse(match.Groups[1].Value), int.Parse(match.Groups[2].Value), int.Parse(match.Groups[3].Value), int.Parse(match.Groups[4].Value) };
-                    }
-                    //svt-av1はSvtAv1EncApp_v1.8.0_x64のような形式もあるので、このうち、1, 8, 0, 0をintに変換して配列で返す
-                    match = System.Text.RegularExpressions.Regex.Match(filename, @"SvtAv1EncApp_v(\d+)\.(\d+)\.(\d+)_");
-                    if (match.Success)
-                    {
-                        return new int[] { int.Parse(match.Groups[1].Value), int.Parse(match.Groups[2].Value), int.Parse(match.Groups[3].Value), 0 };
-                    }
-                    break;
-                default:
-                    break;
-            }
-            return null;
+            public Version Version;
         }
 
         private static string GetEncoderExePath(string basePath, EncoderType type)
@@ -1282,6 +1243,9 @@ namespace Amatsukaze.Server
                 case EncoderType.SVTAV1:
                     pattern = "SvtAv1EncApp";
                     break;
+                case EncoderType.x262:
+                    pattern = "x262";
+                    break;
                 default:
                     return null;
             }
@@ -1291,52 +1255,45 @@ namespace Amatsukaze.Server
                 var fname = Path.GetFileName(path);
                 if (fname.StartsWith(pattern) && fname.EndsWith(".exe"))
                 {
-                    // pathの「ファイル バージョン」を取得してリストに追加する
-                    int[] version = null;
-                    // versionはa.b.c.dの形式なので、a,b,c,dをintに変換して配列にする
-                    try
+                    // バージョンを取得してリストに追加する
+                    Version version = null;
+                    if (type == EncoderType.SVTAV1)
                     {
-                        var versionStr = FileVersionInfo.GetVersionInfo(path).FileVersion;
-                        version = versionStr.Split('.').Select(int.Parse).ToArray();
+                        // SVT-AV1はファイル名を優先し、解析できない場合だけ実行して確認する
+                        version = SvtAv1Version.GetVersion(path);
                     }
-                    catch (Exception)
+                    else
                     {
-                        // バージョン情報が取得できない場合はファイル名から取得
                         try
                         {
-                            version = GetEncoderExeVersionFromFilename(fname, type);
+                            var versionStr = FileVersionInfo.GetVersionInfo(path).FileVersion;
+                            version = EncoderExeVersion.ParseFileVersion(versionStr, type);
                         }
                         catch (Exception)
-                        { }
+                        {
+                            // バージョンリソースを読み出せない実行ファイルもファイル名による判定を試す
+                        }
+                        if (version == null)
+                        {
+                            // バージョン情報が取得できない場合はファイル名から取得
+                            version = EncoderExeVersion.ParseFilename(fname, type);
+                        }
                     }
-                    exeList.Add(new EncodeExeFileInfo() { Path = path, version = version });
+                    exeList.Add(new EncodeExeFileInfo() { Path = path, Version = version });
                 }
             }
             // exeList内のバージョン情報を比較して最新のものを返す
-            var maxVersion = new int[] { 0, 0, 0, 0 };
+            var maxVersion = new Version(0, 0, 0, 0);
             string maxPath = null;
             foreach (var exe in exeList)
             {
-                if (exe.version == null)
+                if (exe.Version == null)
                 {
                     continue;
                 }
-                bool isNewer = false;
-                for (int i = 0; i < 4; i++)
+                if (exe.Version.CompareTo(maxVersion) > 0)
                 {
-                    if (exe.version[i] > maxVersion[i])
-                    {
-                        isNewer = true;
-                        break;
-                    }
-                    else if (exe.version[i] < maxVersion[i])
-                    {
-                        break;
-                    }
-                }
-                if (isNewer)
-                {
-                    maxVersion = exe.version;
+                    maxVersion = exe.Version;
                     maxPath = exe.Path;
                 }
             }
@@ -1375,6 +1332,10 @@ namespace Amatsukaze.Server
             if (string.IsNullOrEmpty(setting.SVTAV1Path))
             {
                 setting.SVTAV1Path = GetEncoderExePath(basePath, EncoderType.SVTAV1);
+            }
+            if (string.IsNullOrEmpty(setting.X262Path))
+            {
+                setting.X262Path = GetEncoderExePath(basePath, EncoderType.x262);
             }
             if (string.IsNullOrEmpty(setting.QSVEncPath))
             {
@@ -1925,6 +1886,10 @@ namespace Amatsukaze.Server
             {
                 return setting.VCEEncPath;
             }
+            else if (encoderType == EncoderType.x262)
+            {
+                return setting.X262Path;
+            }
             else
             {
                 return setting.SVTAV1Path;
@@ -1953,6 +1918,10 @@ namespace Amatsukaze.Server
             {
                 return profile.VCEEncOption;
             }
+            else if (profile.EncoderType == EncoderType.x262)
+            {
+                return profile.X262Option;
+            }
             else
             {
                 return profile.SVTAV1Option;
@@ -1980,6 +1949,10 @@ namespace Amatsukaze.Server
             else if (encoderType == EncoderType.VCEEnc)
             {
                 return "VCEEnc";
+            }
+            else if (encoderType == EncoderType.x262)
+            {
+                return "x262";
             }
             else
             {
@@ -2177,7 +2150,8 @@ namespace Amatsukaze.Server
                             .Append(profile.ForceSARHeight);
                     }
 
-                    if (profile.OutputFormat == FormatType.MP4 || profile.OutputFormat == FormatType.TSREPLACE)
+                    if (profile.OutputFormat == FormatType.MP4
+                        || (profile.OutputFormat == FormatType.TSREPLACE && profile.EncoderType != EncoderType.x262))
                     {
                         sb.Append(" --mp4box \"")
                             .Append(setting.MP4BoxPath)
@@ -2186,7 +2160,9 @@ namespace Amatsukaze.Server
                             .Append("\"");
                     }
 
-                    var encoderOption = ProfileSettingExtensions.NormalizeCommandLineOption(GetEncoderOption(profile));
+                    var encoderOption = profile.Mpeg2Partial
+                        ? null
+                        : ProfileSettingExtensions.NormalizeCommandLineOption(GetEncoderOption(profile));
                     if (string.IsNullOrEmpty(encoderOption) == false)
                     {
                         sb.Append(" -eo \"")
@@ -2221,6 +2197,14 @@ namespace Amatsukaze.Server
                     else if (profile.OutputFormat == FormatType.TSREPLACE)
                     {
                         sb.Append(" -fmt tsreplace -m \"" + setting.TsReplacePath + "\"");
+                        if (profile.EncoderType == EncoderType.x262)
+                        {
+                            sb.Append(" --mkvmerge \"").Append(setting.MKVMergePath).Append("\"");
+                        }
+                    }
+                    if (profile.Mpeg2Partial)
+                    {
+                        sb.Append(" --mpeg2-partial");
                     }
                     if (profile.OutputFormat == FormatType.MP4 && profile.UseMKVWhenSubExists)
                     {
@@ -2719,6 +2703,7 @@ namespace Amatsukaze.Server
             CheckPath("NVEnc", setting.NVEncPath);
             CheckPath("VCEEnc", setting.VCEEncPath);
             CheckPath("SVTAV1", setting.SVTAV1Path);
+            CheckPath("x262", setting.X262Path);
 
             CheckPath("L-SMASH Muxer", setting.MuxerPath);
             CheckPath("MP4Box", setting.MP4BoxPath);
@@ -2747,6 +2732,38 @@ namespace Amatsukaze.Server
                 if (string.IsNullOrEmpty(encoderPath))
                 {
                     throw new ArgumentException("エンコーダパスが設定されていません");
+                }
+
+                if (profile.EncoderType == EncoderType.x262
+                    && profile.OutputFormat != FormatType.MKV && profile.OutputFormat != FormatType.TSREPLACE)
+                {
+                    throw new ArgumentException("x262はMKVまたはTS (replace)出力でのみ使用できます。");
+                }
+
+                if (profile.Mpeg2Partial)
+                {
+                    if (profile.EncoderType != EncoderType.x262 || profile.OutputFormat != FormatType.TSREPLACE)
+                    {
+                        throw new ArgumentException("カット境界再エンコードにはx262とTS (replace)出力が必要です。");
+                    }
+                    if (profile.OutputMask != 2 || profile.DisableChapter)
+                    {
+                        throw new ArgumentException("カット境界再エンコードにはCMをカット（本編のみ）とチャプター・CM解析が必要です。");
+                    }
+                    if (profile.FilterOption != FilterOption.None || profile.EnableAudioEncode
+                        || !profile.NoDelogo || !string.IsNullOrEmpty(profile.AdditionalEraseLogo)
+                        || profile.TwoPass)
+                    {
+                        throw new ArgumentException("カット境界再エンコードではフィルタ、音声エンコード、ロゴ消し、2パスエンコードを使用できません。");
+                    }
+                    if (profile.EncoderParallel != 1)
+                    {
+                        throw new ArgumentException("カット境界再エンコードではエンコード分割並列を使用できません。");
+                    }
+                    if (!string.IsNullOrEmpty(profile.PreEncodeBatchFile) || profile.UseMKVWhenSubExists)
+                    {
+                        throw new ArgumentException("カット境界再エンコードではエンコード前バッチと字幕存在時のMKV切替を使用できません。");
+                    }
                 }
 
                 var filterEncoderType = ProfileSettingExtensions.GetFilterEncoderType(profile.FilterOption);
@@ -2805,6 +2822,10 @@ namespace Amatsukaze.Server
                     if (profile.EncoderType == EncoderType.SVTAV1)
                     {
                         throw new ArgumentException("TS (replace)使用時は、SVT-AV1は使用できません。");
+                    }
+                    if (profile.EncoderType == EncoderType.x262 && string.IsNullOrEmpty(setting.MKVMergePath))
+                    {
+                        throw new ArgumentException("x262のTS (replace)出力にはMKVMergeパスが設定されていません。");
                     }
                 }
                 else if (profile.OutputFormat == FormatType.TS || profile.OutputFormat == FormatType.M2TS)

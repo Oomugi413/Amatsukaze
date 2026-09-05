@@ -188,6 +188,16 @@ sudo apt install -y ./avisynthcudafilters_<version>_amd64_Ubuntuxx.xx.deb
     ```bash
     sudo apt install -y x264 x265 svt-av1
     ```
+
+  - x262
+
+    ```bash
+    (git clone https://code.videolan.org/videolan/x262.git \
+      && cd x262 \
+      && ./configure --enable-mpeg2 \
+      && make -j$(nproc) \
+      && sudo install -D -t /usr/local/bin x262)
+    ```
   
   - qsvencc, nvencc, vceencc
   
@@ -258,6 +268,8 @@ sudo apt install -y ./avisynthcudafilters_<version>_amd64_Ubuntuxx.xx.deb
   - tsreplace
   
     [こちら](https://github.com/rigaya/tsreplace/releases)から最新版をダウンロードしてインストールします。
+
+    x262でTS (replace)を使用する場合は、MPEG-2 Videoの置き換えに対応したtsreplaceが必要です。通常の公開版では対応していない場合があるため、対応版を使用してください。mkvmergeも必要です。
 
     ```bash
     sudo apt install -y ./tsreplace_<version>_amd64.deb

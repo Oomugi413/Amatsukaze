@@ -158,6 +158,7 @@
                     <TextBlock HorizontalAlignment="Right" Height="16" Margin="0,7" Text="x264パス"/>
                     <TextBlock HorizontalAlignment="Right" Height="16" Margin="0,7" Text="x265パス"/>
                     <TextBlock HorizontalAlignment="Right" Height="16" Margin="0,7" Text="SvtAv1EncAppパス"/>
+                    <TextBlock HorizontalAlignment="Right" Height="16" Margin="0,7" Text="x262パス"/>
                     <TextBlock HorizontalAlignment="Right" Height="16" Margin="0,7" Text="QSVEncCパス"/>
                     <TextBlock HorizontalAlignment="Right" Height="16" Margin="0,7" Text="NVEncCパス"/>
                     <TextBlock HorizontalAlignment="Right" Height="16" Margin="0,7" Text="VCEEncCパス"/>
@@ -241,6 +242,7 @@
                         <Button Height="22" Content="クリア" Margin="6,4" ToolTip="{StaticResource tooltip}" Command="{Binding ClearX264PathCommand}"/>
                         <Button Height="22" Content="クリア" Margin="6,4" ToolTip="{StaticResource tooltip}" Command="{Binding ClearX265PathCommand}"/>
                         <Button Height="22" Content="クリア" Margin="6,4" ToolTip="{StaticResource tooltip}" Command="{Binding ClearSVTAV1PathCommand}"/>
+                        <Button Height="22" Content="クリア" Margin="6,4" ToolTip="{StaticResource tooltip}" Command="{Binding ClearX262PathCommand}"/>
                         <Border Height="30"/>
                         <Border Height="30"/>
                         <Border Height="30"/>
@@ -271,6 +273,7 @@
                         <TextBox Height="22" Margin="0,4" Text="{Binding Model.Setting.X264Path, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" VerticalAlignment="Top" PreviewDragOver="TextBox_PreviewDragOver" Drop="TextBox_Drop"/>
                         <TextBox Height="22" Margin="0,4" Text="{Binding Model.Setting.X265Path, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" VerticalAlignment="Top" PreviewDragOver="TextBox_PreviewDragOver" Drop="TextBox_Drop"/>
                         <TextBox Height="22" Margin="0,4" Text="{Binding Model.Setting.SVTAV1Path, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" VerticalAlignment="Top" PreviewDragOver="TextBox_PreviewDragOver" Drop="TextBox_Drop"/>
+                        <TextBox Height="22" Margin="0,4" Text="{Binding Model.Setting.X262Path, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" VerticalAlignment="Top" PreviewDragOver="TextBox_PreviewDragOver" Drop="TextBox_Drop"/>
                         <TextBox Height="22" Margin="0,4" Text="{Binding Model.Setting.QSVEncPath, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" VerticalAlignment="Top" PreviewDragOver="TextBox_PreviewDragOver" Drop="TextBox_Drop"/>
                         <TextBox Height="22" Margin="0,4" Text="{Binding Model.Setting.NVEncPath, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" VerticalAlignment="Top" PreviewDragOver="TextBox_PreviewDragOver" Drop="TextBox_Drop"/>
                         <TextBox Height="22" Margin="0,4" Text="{Binding Model.Setting.VCEEncPath, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" VerticalAlignment="Top" PreviewDragOver="TextBox_PreviewDragOver" Drop="TextBox_Drop"/>

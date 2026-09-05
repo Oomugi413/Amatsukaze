@@ -552,8 +552,7 @@ namespace Amatsukaze.Server.Rest
                     Targets = data.Targets != null
                         ? data.Targets.Select(t => new Amatsukaze.Server.AddQueueItem
                         {
-                            Path = t.Path,
-                            Hash = t.Hash
+                            Path = t.Path
                         }).ToList()
                         : new List<Amatsukaze.Server.AddQueueItem>(),
                     Outputs = data.Outputs != null
@@ -794,7 +793,7 @@ namespace Amatsukaze.Server.Rest
                     HevcDecoderList = ProfileSettingExtensions.HEVCDecoderList.ToList(),
                     FormatList = ProfileSettingExtensions.FormatList.ToList(),
                     OutputOptionList = outputOptions,
-                    TsreplaceOutputMasks = new List<int> { 1, 8 },
+                    TsreplaceOutputMasks = new List<int> { 1, 2, 8 },
                     PreBatFiles = state.GetPreBatFiles(),
                     PreEncodeBatFiles = state.GetPreEncodeBatFiles(),
                     PostBatFiles = state.GetPostBatFiles(),

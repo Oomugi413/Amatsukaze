@@ -1669,6 +1669,7 @@ namespace Amatsukaze.Models
                 RaisePropertyChanged("EncoderOption");
                 RaisePropertyChanged("CMQualityOffsetEnabled");
                 RaisePropertyChanged("ForceSAREnabled");
+                UpdateMpeg2PartialAvailability();
                 EncoderFilterSetting.UpdateOutputDepthToolTip();
             }
         }
@@ -1685,6 +1686,7 @@ namespace Amatsukaze.Models
                     case EncoderType.NVEnc: return Data.NVEncOption;
                     case EncoderType.VCEEnc: return Data.VCEEncOption;
                     case EncoderType.SVTAV1: return Data.SVTAV1Option;
+                    case EncoderType.x262: return Data.X262Option;
                 }
                 return null;
             }
@@ -1720,6 +1722,11 @@ namespace Amatsukaze.Models
                         if (Data.SVTAV1Option == value)
                             return;
                         Data.SVTAV1Option = value;
+                        break;
+                    case EncoderType.x262:
+                        if (Data.X262Option == value)
+                            return;
+                        Data.X262Option = value;
                         break;
                     default:
                         return;
@@ -1816,6 +1823,30 @@ namespace Amatsukaze.Models
         #endregion
 
         #region MinOutputDuration変更通知プロパティ
+        public bool EnableMinOutputDuration
+        {
+            get { return Data.MinOutputDuration > 0; }
+            set
+            {
+                var enabled = Data.MinOutputDuration > 0;
+                if (enabled == value)
+                    return;
+                Data.MinOutputDuration = value ? 5 : 0;
+                RaisePropertyChanged();
+                RaisePropertyChanged("MinOutputDuration");
+                RaisePropertyChanged("MinOutputDurationInput");
+            }
+        }
+
+        public int MinOutputDurationInput
+        {
+            get { return Data.MinOutputDuration > 0 ? Data.MinOutputDuration : 5; }
+            set
+            {
+                MinOutputDuration = Math.Max(1, value);
+            }
+        }
+
         public int MinOutputDuration
         {
             get { return Data.MinOutputDuration; }
@@ -1823,8 +1854,73 @@ namespace Amatsukaze.Models
             {
                 if (Data.MinOutputDuration == value)
                     return;
+                var enabled = Data.MinOutputDuration > 0;
                 Data.MinOutputDuration = value;
+                if (enabled != (Data.MinOutputDuration > 0))
+                {
+                    RaisePropertyChanged("EnableMinOutputDuration");
+                }
+                RaisePropertyChanged("MinOutputDurationInput");
                 RaisePropertyChanged();
+            }
+        }
+        #endregion
+
+        #region Mpeg2Partial変更通知プロパティ
+        public bool Mpeg2Partial
+        {
+            get { return Data.Mpeg2Partial; }
+            set
+            {
+                if (value && !Mpeg2PartialVisible)
+                {
+                    value = false;
+                }
+                if (Data.Mpeg2Partial == value)
+                {
+                    if (value)
+                    {
+                        ApplyMpeg2PartialConstraints();
+                    }
+                    return;
+                }
+                Data.Mpeg2Partial = value;
+                if (value)
+                {
+                    ApplyMpeg2PartialConstraints();
+                }
+                RaisePropertyChanged();
+                RaisePropertyChanged("Mpeg2PartialConstraintsEnabled");
+            }
+        }
+
+        public bool Mpeg2PartialVisible
+        {
+            get { return Data.EncoderType == EncoderType.x262 && Data.OutputMask != 1; }
+        }
+
+        public bool Mpeg2PartialConstraintsEnabled
+        {
+            get { return !Data.Mpeg2Partial; }
+        }
+
+        private void ApplyMpeg2PartialConstraints()
+        {
+            EncoderOption = "";
+            FilterOption = (int)global::Amatsukaze.Server.FilterOption.None;
+            EnableAudioEncode = false;
+            NoDelogo = true;
+            TwoPass = false;
+            DisableChapter = false;
+            TsreplaceRemoveTypeD = true;
+        }
+
+        private void UpdateMpeg2PartialAvailability()
+        {
+            RaisePropertyChanged("Mpeg2PartialVisible");
+            if (!Mpeg2PartialVisible)
+            {
+                Mpeg2Partial = false;
             }
         }
         #endregion
@@ -1883,6 +1979,7 @@ namespace Amatsukaze.Models
                 UpdateWarningText();
                 RaisePropertyChanged();
                 RaisePropertyChanged("CMQualityOffsetEnabled");
+                UpdateMpeg2PartialAvailability();
             }
         }
         #endregion
@@ -1956,7 +2053,7 @@ namespace Amatsukaze.Models
                 {
                     return true;
                 }
-                if ((Data.EncoderType == EncoderType.x264 || Data.EncoderType == EncoderType.x265 || Data.EncoderType == EncoderType.SVTAV1)
+                if ((Data.EncoderType == EncoderType.x264 || Data.EncoderType == EncoderType.x262 || Data.EncoderType == EncoderType.x265 || Data.EncoderType == EncoderType.SVTAV1)
                     && Data.OutputMask == 6 /*本編とCMを分離*/)
                 {
                     return true;
@@ -2375,18 +2472,6 @@ namespace Amatsukaze.Models
                 if (Data.SystemAviSynthPlugin == value)
                     return;
                 Data.SystemAviSynthPlugin = value;
-                RaisePropertyChanged();
-            }
-        }
-        #endregion
-
-        #region DisableHashCheck変更通知プロパティ
-        public bool DisableHashCheck {
-            get { return Data.DisableHashCheck; }
-            set {
-                if (Data.DisableHashCheck == value)
-                    return;
-                Data.DisableHashCheck = value;
                 RaisePropertyChanged();
             }
         }
@@ -2822,7 +2907,7 @@ namespace Amatsukaze.Models
         public int[] EncoderParallelList {
             get { return new int[] { 1, 2, 3, 4, 5, 6, 7, 8 }; }
         }
-        private static readonly int[] TsreplaceOutputMasks = new int[] { 1, 8 };
+        private static readonly int[] TsreplaceOutputMasks = new int[] { 1, 2, 8 };
         public DisplayOutputMask[] OutputOptionList_ = new DisplayOutputMask[]
         {
             new DisplayOutputMask()
@@ -3018,6 +3103,11 @@ namespace Amatsukaze.Models
             {
                 sb.Append("SVTAV1は2パスに対応していません\r\n");
             }
+            if (Data.EncoderType == EncoderType.x262
+                && Data.OutputFormat != FormatType.MKV && Data.OutputFormat != FormatType.TSREPLACE)
+            {
+                sb.Append("x262はMKVまたはTS (replace)出力でのみ使用できます\r\n");
+            }
             if (Data.TwoPass && Data.EncoderParallel > 1)
             {
                 sb.Append("2パスエンコード時はエンコード分割並列を使用できません (分割並列数は1として扱われます)\r\n");
@@ -3057,15 +3147,16 @@ namespace Amatsukaze.Models
             SettingWarningText = sb.ToString();
         }
 
-        public void SetEncoderOptions(string X264Option, string X265Option, string QSVEncOption, string NVEncOption)
+        public void SetEncoderOptions(string X264Option, string X265Option, string QSVEncOption, string NVEncOption, string X262Option)
         {
             if (X264Option != Data.X264Option || X265Option != Data.X265Option ||
-                QSVEncOption != Data.QSVEncOption || NVEncOption != Data.NVEncOption)
+                QSVEncOption != Data.QSVEncOption || NVEncOption != Data.NVEncOption || X262Option != Data.X262Option)
             {
                 Data.X264Option = X264Option;
                 Data.X265Option = X265Option;
                 Data.QSVEncOption = QSVEncOption;
                 Data.NVEncOption = NVEncOption;
+                Data.X262Option = X262Option;
                 RaisePropertyChanged("EncoderOption");
             }
         }
@@ -3557,6 +3648,20 @@ namespace Amatsukaze.Models
                 if (Model.X264Path == value)
                     return;
                 Model.X264Path = value;
+                RaisePropertyChanged();
+            }
+        }
+        #endregion
+
+        #region X262Path変更通知プロパティ
+        public string X262Path
+        {
+            get { return Model.X262Path; }
+            set
+            {
+                if (Model.X262Path == value)
+                    return;
+                Model.X262Path = value;
                 RaisePropertyChanged();
             }
         }

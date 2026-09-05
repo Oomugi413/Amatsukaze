@@ -151,6 +151,7 @@
 
                     <TextBox Margin="0,3" Height="85" TextWrapping="Wrap"
                              Text="{Binding Model.SelectedProfile.EncoderOption, Mode=TwoWay}"
+                             IsEnabled="{Binding Model.SelectedProfile.Mpeg2PartialConstraintsEnabled}"
                              VerticalAlignment="Top"
                              VerticalContentAlignment="Top"
                              TextAlignment="Left"
@@ -346,17 +347,22 @@
                             </StackPanel.Style>
                             <CheckBox Content="データ放送を削除する" VerticalAlignment="Center" Margin="5,5" 
                                   IsChecked="{Binding Model.SelectedProfile.TsreplaceRemoveTypeD, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                  IsEnabled="{Binding Model.SelectedProfile.Mpeg2PartialConstraintsEnabled}"
                                   ToolTip="データ放送を削除し、出力tsの軽量化を図ります"/>
                         </StackPanel>
 
                     </DockPanel>
                 </StackPanel>
-                <StackPanel Grid.Row="10" Grid.Column="1" Margin="10,0">
+                <StackPanel Grid.Row="10" Grid.Column="1" Margin="10,0" Orientation="Horizontal">
                     <ComboBox HorizontalAlignment="Left" Margin="0,3" VerticalAlignment="Top" Width="200" Height="22"
                        ItemsSource="{Binding Model.SelectedProfile.OutputOptionList}" 
                        SelectedItem="{Binding Model.SelectedProfile.OutputMask, Mode=TwoWay}"
                        ToolTip="CMカットの精度は100%ではありません"
                     />
+                    <CheckBox Margin="10,3,0,3" VerticalAlignment="Center" Content="カット境界のみ再エンコード"
+                              IsChecked="{Binding Model.SelectedProfile.Mpeg2Partial, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                              Visibility="{Binding Model.SelectedProfile.Mpeg2PartialVisible, Converter={StaticResource BoolVisibilityConverter}}"
+                              ToolTip="再エンコード範囲をカット境界周辺に抑え、それ以外の映像を無劣化でコピーします。チャプター・CM解析とデータ放送の削除は自動的に有効になります。" />
                 </StackPanel>
 
                 <StackPanel Grid.Row="11" Grid.Column="0">
@@ -410,7 +416,8 @@
                 </StackPanel>
 
                 <TextBlock Grid.Row="17" HorizontalAlignment="Left" Text="フィルタ設定" VerticalAlignment="Center"/>
-                <StackPanel Grid.Row="17" Grid.Column="1" Margin="10,4">
+                <StackPanel Grid.Row="17" Grid.Column="1" Margin="10,4"
+                            IsEnabled="{Binding Model.SelectedProfile.Mpeg2PartialConstraintsEnabled}">
                     <ComboBox Margin="0,3" Height="22"
                               ItemsSource="{Binding Model.SelectedProfile.FilterOptions}"
                               SelectedIndex="{Binding Model.SelectedProfile.FilterOption, Mode=TwoWay}">
@@ -465,7 +472,8 @@
                 <TextBlock Grid.Row="18" HorizontalAlignment="Left" Text="ビットレート設定" VerticalAlignment="Top" Margin="0,76.667,0,0"/>
                 <StackPanel Grid.Row="18" Grid.Column="1" Margin="10,4">
                     <CheckBox Margin="0,4" Content="2パスエンコード"
-                          IsChecked="{Binding Model.SelectedProfile.TwoPass, Mode=TwoWay}" VerticalAlignment="Top"/>
+                          IsChecked="{Binding Model.SelectedProfile.TwoPass, Mode=TwoWay}"
+                          IsEnabled="{Binding Model.SelectedProfile.Mpeg2PartialConstraintsEnabled}" VerticalAlignment="Top"/>
                     <DockPanel Margin="0,4">
                         <TextBlock Text="CMビットレート倍率" VerticalAlignment="Center"/>
                         <Border Width="10"/>
@@ -541,7 +549,8 @@
                 <TextBlock Grid.Row="19" HorizontalAlignment="Right" Text="音声エンコード" VerticalAlignment="Top" Margin="0,4"/>
                 <StackPanel Grid.Row="19" Grid.Column="1" Margin="10,0">
                     <CheckBox Content="音声をエンコードする" DockPanel.Dock="Right" VerticalAlignment="Center" Margin="0,4"
-                                  IsChecked="{Binding Model.SelectedProfile.EnableAudioEncode, Mode=TwoWay}"/>
+                                  IsChecked="{Binding Model.SelectedProfile.EnableAudioEncode, Mode=TwoWay}"
+                                  IsEnabled="{Binding Model.SelectedProfile.Mpeg2PartialConstraintsEnabled}"/>
                     <StackPanel>
                         <StackPanel.Style>
                             <Style TargetType="StackPanel">
@@ -756,7 +765,8 @@
                               IsEnabled="{Binding Model.SelectedProfile.MoveInputFile}"
                               ToolTip="これらのファイルも一緒にコピー・移動されるようになります。" />
                     <CheckBox Height="16" Margin="0,3"  Content="チャプター・CM解析を無効にする" 
-                              IsChecked="{Binding Model.SelectedProfile.DisableChapter, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                              IsChecked="{Binding Model.SelectedProfile.DisableChapter, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                              IsEnabled="{Binding Model.SelectedProfile.Mpeg2PartialConstraintsEnabled}" />
                     <CheckBox Height="16" Margin="0,3"  Content="チャプターを別ファイルに出力する" 
                               IsChecked="{Binding Model.SelectedProfile.OutputChapter, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                               IsEnabled="{Binding Model.SelectedProfile.DisableChapter, Converter={StaticResource InverseBooleanConverter}}"
@@ -773,7 +783,8 @@
                               IsEnabled="{Binding Model.SelectedProfile.DisableChapter, Converter={StaticResource InverseBooleanConverter}}"
                               ToolTip="CM解析時にロゴ情報を使用しません。ロゴ消しを行う場合は、CM解析後にロゴ解析を行います。" />
                     <CheckBox Height="16" Margin="0,3"  Content="ロゴ消ししない" 
-                              IsChecked="{Binding Model.SelectedProfile.NoDelogo, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                              IsChecked="{Binding Model.SelectedProfile.NoDelogo, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                              IsEnabled="{Binding Model.SelectedProfile.Mpeg2PartialConstraintsEnabled}" />
                     <CheckBox Height="16" Margin="0,3"  Content="並列ロゴ解析" 
                               IsChecked="{Binding Model.SelectedProfile.ParallelLogoAnalysis, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                               ToolTip="ロゴ解析を並列で行い高速化します。最大スレッド数は[基本設定]タブで設定可能です。"/>
@@ -813,12 +824,17 @@
                                      Text="{Binding Model.SelectedProfile.MaxFadeLength, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
                         </WrapPanel>
                     </CheckBox>
-                    <WrapPanel Orientation="Horizontal" ToolTip="指定秒数未満の短い区間は出力しません。0の場合は既定値の5秒を使用します。">
-                        <TextBlock VerticalAlignment="Center" Text="出力する最短区間:"/>
-                        <TextBox Margin="4,3" Width="72"
-                                 Text="{Binding Model.SelectedProfile.MinOutputDuration, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
-                        <TextBlock VerticalAlignment="Center" Text="秒"/>
-                    </WrapPanel>
+                    <CheckBox Margin="0,3"
+                              IsChecked="{Binding Model.SelectedProfile.EnableMinOutputDuration, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                        ToolTip="指定秒数未満の短い区間は出力しません。OFFの場合は既定値の5秒を使用します。">
+                        <WrapPanel Orientation="Horizontal">
+                            <TextBlock VerticalAlignment="Center" Text="最短区間の設定"/>
+                            <TextBox Margin="4,0" Width="72"
+                                     IsEnabled="{Binding Model.SelectedProfile.EnableMinOutputDuration, Mode=OneWay}"
+                                     Text="{Binding Model.SelectedProfile.MinOutputDurationInput, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                            <TextBlock VerticalAlignment="Center" Text="秒"/>
+                        </WrapPanel>
+                    </CheckBox>
                 </StackPanel>
 
                 <StackPanel Grid.Row="23" Grid.Column="0" Margin="0,20,0,0"
@@ -833,8 +849,6 @@
                     <StackPanel>
                         <CheckBox Height="16" Margin="0,3"  Content="メイン以外のフォーマットは結合しない"
                             IsChecked="{Binding Model.SelectedProfile.SplitSub, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                        <CheckBox Height="16" Margin="0,3"  Content="ネットワーク越しに転送する場合のハッシュチェックを無効にする"
-                              IsChecked="{Binding Model.SelectedProfile.DisableHashCheck, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
                         <TextBox Margin="0,3" Height="40" TextWrapping="Wrap"
                              Text="{Binding Model.SelectedProfile.AdditionalEraseLogo, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                                  ToolTip="CM解析用のメインのロゴとは別に、ロゴ消し用のロゴを追加できます。"

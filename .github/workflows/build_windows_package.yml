@@ -23,9 +23,10 @@ jobs:
       JOINLOGO_URL: https://github.com/yobibi/join_logo_scp/releases/download/v5.1.1/join_logo_scp_51_1.zip
       AVSCUDA_URL: https://github.com/rigaya/AviSynthCUDAFilters/releases/download/0.7.3/AviSynthCUDAFilters_Release_0.7.3.zip
       LSMASH_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20250907-045307/lsmash_20200404.7z
-      X264_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260901-212333/x264_3223_x64.zip
-      X265_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260901-212333/x265_4.3%2B22_x64.zip
-      SVT_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260901-212333/SvtAv1EncApp_4.2.0-107_x64_clang.zip
+      X264_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260905-074217/x264_3223_x64.zip
+      X265_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260905-074217/x265_4.3%2B24_x64.zip
+      SVT_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260905-074217/SvtAv1EncApp_4.2.0-107_x64_clang.zip
+      X262_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20250907-045307/x262_20260901.zip
       NNEDI3_URL: https://github.com/rigaya/NNEDI3/releases/download/0.00/nnedi3_0.00_x64.zip
       BASE_PKG_URL: https://github.com/rigaya/Amatsukaze/releases/download/1.0.9.0/AmatsukazeBasePkg_20260902.7z
     steps:
@@ -80,7 +81,7 @@ jobs:
           )
           call vcpkg\\bootstrap-vcpkg.bat
           set VCPKG_ROOT=%CD%\\vcpkg
-          vcpkg\\vcpkg install zlib:x64-windows-static openssl:x64-windows-static libjpeg-turbo:x64-windows-static
+          vcpkg\\vcpkg install zlib:x64-windows-static libjpeg-turbo:x64-windows-static
           echo VCPKG_ROOT=%CD%\\vcpkg>> %GITHUB_ENV%
 
       - name: Download dependencies
@@ -167,6 +168,8 @@ jobs:
           mkdir package
           curl.exe -fL --retry 3 --retry-delay 10 -o deps\\base_pkg.7z "%BASE_PKG_URL%"
           7z x -y -o"%GITHUB_WORKSPACE%\package" "%DEPS%\base_pkg.7z"
+          rem 旧base packageに含まれる廃止済みツールを除去する
+          if exist package\\exe_files\\BatchHashChecker.exe del /f /q package\\exe_files\\BatchHashChecker.exe
 
       - name: Assemble package
         shell: cmd
@@ -257,6 +260,11 @@ jobs:
         shell: cmd
         run: |
           cd /d %GITHUB_WORKSPACE%
+          rem 廃止済みツールが配布物へ再混入していないことを保証する
+          if exist package\\exe_files\\BatchHashChecker.exe (
+            echo ERROR: package\\exe_files\\BatchHashChecker.exe remains in package.
+            exit /b 1
+          )
           set "PKG_NAME=Amatsukaze_${{ steps.version.outputs.version_name }}.7z"
           7z a -t7z -mx=9 -m0=lzma2 -mmt=on -ms=on -r "%PKG_NAME%" "%GITHUB_WORKSPACE%\package\*"
           echo pkg_name=%PKG_NAME%>> %GITHUB_OUTPUT%

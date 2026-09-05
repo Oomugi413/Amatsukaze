@@ -109,7 +109,7 @@ private:
 
 struct FilterSourceFrame {
     bool halfDelay;
-    int frameIndex; // 内部用(DTS順フレーム番号)
+    int frameIndex; // 内部用(PTS順フレーム番号)。DTS順が必要なら getDtsFrameIndex() で変換すること
     double pts; // 内部用
     double frameDuration; // 内部用
     int64_t originalFramePTS; // AMTSource照合用(ドロップ補正前PTS)
@@ -174,6 +174,11 @@ struct EncodeFileInput {
 
 class StreamReformInfo : public AMTObject {
 public:
+    struct KeepSegment {
+        double start; // 元TS時間軸の絶対PTS
+        double end;   // 元TS時間軸の絶対PTS
+    };
+
     StreamReformInfo(
         AMTContext& ctx,
         int numVideoFile,
@@ -236,6 +241,15 @@ public:
 
     // video frame index -> VideoFrameInfo
     const VideoFrameInfo& getVideoFrameInfo(int frameIndex) const;
+
+    // PTS順フレーム番号 -> DTS順フレーム番号
+    int getDtsFrameIndex(int ptsOrderIndex) const;
+
+    // 中間映像ファイルに属するDTS順フレーム番号の半開区間
+    std::pair<int, int> getVideoFrameRange(int videoFileIndex) const;
+
+    // genWebVTT、tsreplace、カット境界再エンコードで共通に使う保持区間を返す
+    std::vector<KeepSegment> getKeepSegments(const EncodeFileKey& key) const;
 
     // video frame index (DTS順) -> encoder index
     int getEncoderIndex(int frameIndex) const;
@@ -441,6 +455,9 @@ private:
     void genCaptionStream();
 
 public:
+    // tsreplace 用カットリストを生成する。出力フレームがなければ空文字列を返す
+    std::string genTSReplaceCutManifest(const EncodeFileKey& key) const;
+
     // WebVTT生成 (tsreadexのトレースとb24tovttを使用)
     void genWebVTT(const EncodeFileKey& key, const ConfigWrapper& setting,
         std::vector<PsisiarcTask>& psisiarcTasks);

@@ -37,7 +37,8 @@ namespace Amatsukaze.Server
         QSVEnc,
         NVEnc,
         VCEEnc,
-        SVTAV1
+        SVTAV1,
+        x262
     }
 
     public enum AudioEncoderType
@@ -377,6 +378,8 @@ namespace Amatsukaze.Server
         public string VCEEncFilterOption { get; set; }
         [DataMember]
         public string SVTAV1Option { get; set; }
+        [DataMember]
+        public string X262Option { get; set; }
 
         [DataMember]
         public bool ForceSAR { get; set; }
@@ -419,6 +422,8 @@ namespace Amatsukaze.Server
         public int MinOutputDuration { get; set; }
         [DataMember]
         public int OutputMask { get; set; }
+        [DataMember]
+        public bool Mpeg2Partial { get; set; }
         [DataMember]
         public bool AutoBuffer { get; set; }
         [DataMember]
@@ -471,8 +476,6 @@ namespace Amatsukaze.Server
         public bool ParallelLogoAnalysis { get; set; }
         [DataMember]
         public bool SystemAviSynthPlugin { get; set; }
-        [DataMember]
-        public bool DisableHashCheck { get; set; }
         [DataMember]
         public bool EnableNicoJK { get; set; }
         [DataMember]
@@ -582,7 +585,7 @@ namespace Amatsukaze.Server
     // 文字列リソース（列挙体に対応する文字列配列）
     public static class ProfileSettingExtensions
     {
-        public static string[] EncoderList { get; } = new string[] { "x264", "x265", "QSVEnc", "NVEnc", "VCEEnc", "SVT-AV1" };
+        public static string[] EncoderList { get; } = new string[] { "x264", "x265", "QSVEnc", "NVEnc", "VCEEnc", "SVT-AV1", "x262" };
         public static string[] Mpeg2DecoderList { get; } = new string[] { "デフォルト", "QSV", "CUVID" };
         public static string[] H264DecoderList { get; } = new string[] { "デフォルト", "QSV", "CUVID" };
         public static string[] HEVCDecoderList { get; } = new string[] { "デフォルト", "QSV", "CUVID" };
@@ -670,6 +673,7 @@ namespace Amatsukaze.Server
                 case EncoderType.NVEnc: return profile.NVEncOption;
                 case EncoderType.VCEEnc: return profile.VCEEncOption;
                 case EncoderType.SVTAV1: return profile.SVTAV1Option;
+                case EncoderType.x262: return profile.X262Option;
                 default: return null;
             }
         }
@@ -939,6 +943,7 @@ namespace Amatsukaze.Server
             keyValue("出力フォーマット", FormatList[(int)profile.OutputFormat]);
             keyValueBool("出力フォーマット-字幕がある時MKV出力する", profile.UseMKVWhenSubExists);
             keyValue("出力選択", GetOutputMaskName(profile.OutputMask));
+            keyValueBool("カット境界再エンコード", profile.Mpeg2Partial);
             keyValueBool("SCRenameによるリネームを行う", profile.EnableRename);
             keyValue("SCRename書式", profile.RenameFormat ?? "");
             keyValueBool("ジャンルごとにフォルダ分け", profile.EnableGunreFolder);
@@ -1054,7 +1059,6 @@ namespace Amatsukaze.Server
                 ? profile.MinOutputDuration.ToString()
                 : "既定値 (5)");
             keyValueBool("システムにインストールされているAviSynthプラグインを有効にする", profile.SystemAviSynthPlugin);
-            keyValueBool("ネットワーク越しに転送する場合のハッシュチェックを無効にする", profile.DisableHashCheck);
             keyValueBool("ログファイルを出力先に生成しない", profile.DisableLogFile);
             keyValueBool("一時ファイルを削除せずに残す", profile.NoRemoveTmp);
             keyValue("PMT更新によるCM認識", profile.EnablePmtCut
@@ -1117,6 +1121,8 @@ namespace Amatsukaze.Server
         public string VCEEncPath { get; set; }
         [DataMember]
         public string SVTAV1Path { get; set; }
+        [DataMember]
+        public string X262Path { get; set; }
         [DataMember]
         public string MuxerPath { get; set; }
         [DataMember]
@@ -1425,8 +1431,6 @@ namespace Amatsukaze.Server
     {
         [DataMember]
         public string Path; // フルパス
-        [DataMember]
-        public byte[] Hash; // null可
     }
 
     [DataContract]
@@ -1523,8 +1527,6 @@ namespace Amatsukaze.Server
         public string SrcPath { get; set; }
         [DataMember]
         public string DstPath { get; set; }
-        [DataMember]
-        public byte[] Hash { get; set; }
         [DataMember]
         public QueueState State { get; set; }
         [DataMember]
@@ -1626,17 +1628,6 @@ namespace Amatsukaze.Server
         public bool IsOneSeg {
             get {
                 return ImageWidth <= 320 || ImageHeight <= 260;
-            }
-        }
-
-        // プロファイルが決定してる時だけ有効
-        public bool IsSeparateHashRequired
-        {
-            get
-            {
-                return Mode == ProcMode.Batch &&
-                    Profile.DisableHashCheck == false &&
-                    SrcPath.StartsWith("\\\\");
             }
         }
 

@@ -146,6 +146,7 @@ double BitrateSetting::getTargetBitrate(VIDEO_STREAM_FORMAT format, double srcBi
     case ENCODER_NVENC: return _T("NVEnc");
     case ENCODER_VCEENC: return _T("VCEEnc");
     case ENCODER_SVTAV1: return _T("SVT-AV1");
+    case ENCODER_X262: return _T("x262");
     }
     return _T("Unknown");
 }
@@ -170,7 +171,8 @@ double BitrateSetting::getTargetBitrate(VIDEO_STREAM_FORMAT format, double srcBi
     const tstring& timecodepath,
     int vfrTimingFps,
     const ENUM_FORMAT format,
-    const tstring& outpath) {
+    const tstring& outpath,
+    bool sarInContainerOnly) {
     StringBuilderT sb;
 
     sb.append(_T("\"%s\""), binpath);
@@ -179,6 +181,20 @@ double BitrateSetting::getTargetBitrate(VIDEO_STREAM_FORMAT format, double srcBi
     //ss << " --fps " << fmt.frameRateNum << "/" << fmt.frameRateDenom;
     //ss << " --input-res " << fmt.width << "x" << fmt.height;
     //ss << " --sar " << fmt.sarWidth << ":" << fmt.sarHeight;
+
+    // x262(MPEG-2)だけは例外で、SARをsequence headerの
+    // aspect_ratio_information(Table 6-3 = DARコード)として解釈する。
+    // そのためy4mヘッダの実SARをそのまま使わせると表示アスペクトが狂う
+    // (例: 1440x1080 SAR 4:3 → aspect_ratio_information=2 = DAR 4:3。正しくは16:9)。
+    // CLIの--sarはy4mヘッダより優先されるので、ここでDARを明示して上書きする。
+    // sarInContainerOnly時はエンコーダにSARを渡さない方針なので何もしない。
+    if (encoder == ENCODER_X262 && !sarInContainerOnly && !fmt.isSARUnspecified()) {
+        int darWidth = 0, darHeight = 0;
+        fmt.getDAR(darWidth, darHeight);
+        if (darWidth > 0 && darHeight > 0) {
+            sb.append(_T(" --sar %d:%d"), darWidth, darHeight);
+        }
+    }
 
     if (encoder == ENCODER_SVTAV1) {
         if (fmt.colorPrimaries != AVCOL_PRI_UNSPECIFIED) {
@@ -205,6 +221,7 @@ double BitrateSetting::getTargetBitrate(VIDEO_STREAM_FORMAT format, double srcBi
     // インターレース
     switch (encoder) {
     case ENCODER_X264:
+    case ENCODER_X262:
     case ENCODER_QSVENC:
     case ENCODER_NVENC:
     case ENCODER_VCEENC:
@@ -243,6 +260,10 @@ double BitrateSetting::getTargetBitrate(VIDEO_STREAM_FORMAT format, double srcBi
         sb.append(_T(" --stitchable"))
             .append(_T(" --demuxer y4m -"));
         break;
+    case ENCODER_X262:
+        sb.append(_T(" --mpeg2 --stitchable"))
+            .append(_T(" --demuxer y4m -"));
+        break;
     case ENCODER_X265:
         sb.append(_T(" --no-opt-qp-pps --no-opt-ref-list-length-pps"))
             .append(_T(" --y4m --input -"));
@@ -266,6 +287,7 @@ double BitrateSetting::getTargetBitrate(VIDEO_STREAM_FORMAT format, double srcBi
 
     if (timecodepath.size() > 0
         && (encoder == ENCODER_X264
+            || encoder == ENCODER_X262
             || encoder == ENCODER_QSVENC
             || encoder == ENCODER_NVENC
             || encoder == ENCODER_VCEENC)) {
@@ -280,7 +302,8 @@ double BitrateSetting::getTargetBitrate(VIDEO_STREAM_FORMAT format, double srcBi
     const tstring& binpath,
     const tstring& options,
     const VideoFormat& fmt,
-    const tstring& timecodepath,
+    const tstring& inputTimecodePath,
+    const tstring& outputTimecodePath,
     ENUM_ENCODER outputEncoder) {
     StringBuilderT sb;
 
@@ -292,6 +315,12 @@ double BitrateSetting::getTargetBitrate(VIDEO_STREAM_FORMAT format, double srcBi
     // タイムベースを明示指定する (理由はmakeEncoderArgsのコメント参照)
     // エンコーダフィルタは常にHWエンコーダなので無条件に付加する
     sb.append(_T(" --timebase %d/%d"), HWENC_TIMEBASE_NUM, HWENC_TIMEBASE_DEN);
+    if (!inputTimecodePath.empty()) {
+        // AVSフィルタ由来のVFRタイムコードを入力フレームの時刻として与える。
+        // Amatsukazeはy4mをヘッダFPSのCFRとして書き出すため、時刻を伝える手段はこれしかない。
+        // フィルタがフレーム数を変えても、出力タイムコードは入力の時間軸上に得られる。
+        sb.append(_T(" --tcfile-in \"%s\""), inputTimecodePath);
+    }
     if (!options.empty()) {
         sb.append(_T(" %s"), options);
     }
@@ -303,8 +332,8 @@ double BitrateSetting::getTargetBitrate(VIDEO_STREAM_FORMAT format, double srcBi
         sb.append(_T(" --y4m-timestamp"));
     }
     sb.append(_T(" -o -"));
-    if (!timecodepath.empty()) {
-        sb.append(_T(" --timecode \"%s\""), timecodepath);
+    if (!outputTimecodePath.empty()) {
+        sb.append(_T(" --timecode \"%s\""), outputTimecodePath);
     }
     // 進捗表示と結果サマリだけ抑制し、
     // フィルタが実際にどう適用されたか、どのGPUが選択されたかはログに残す
@@ -419,11 +448,13 @@ static bool hasMp4Subtitles(const std::vector<tstring>& subsTitles) {
     const std::pair<int, int>& userSAR,
     const ENUM_FORMAT format,
     const tstring& binpath,
+    const tstring& mkvmergepath,
     const tstring& timelineeditorpath,
     const tstring& mp4boxpath,
     const tstring& srcTSFilePath,
     const tstring& inVideo,
     const bool encoderOutputInContainer,
+    const bool tsreplaceMpegtsInput,
     const VideoFormat& videoFormat,
     const std::vector<tstring>& inAudios,
     const tstring& tmpdir,
@@ -437,8 +468,7 @@ static bool hasMp4Subtitles(const std::vector<tstring>& subsTitles) {
     const std::vector<tstring>& subsTitles,
     const tstring& metapath,
     const bool tsreplaceRemoveTypeD,
-    bool tsreplaceEdgeTrim,
-    int64_t tsreplaceDelay,
+    const tstring& tsreplaceCutList,
     bool muxerAddEncoderCmd,
     bool sarInContainerOnly,
     const tstring& encoderName,
@@ -598,7 +628,20 @@ static bool hasMp4Subtitles(const std::vector<tstring>& subsTitles) {
         sb.clear();
     } else if (format == FORMAT_TSREPLACE) {
         tstring tmppath = inVideo;
-        if (!encoderOutputInContainer) {
+        if (encoder == ENCODER_X262 && !tsreplaceMpegtsInput) {
+            // x262のraw MPEG-2 ESへmkvmergeで時刻情報を付与してからtsreplaceへ渡す。
+            sb.clear();
+            sb.append(_T("\"%s\" -o \"%s\""), mkvmergepath, tmpout1path);
+            if (timecodepath.size()) {
+                sb.append(_T(" --timestamps \"0:%s\""), timecodepath);
+            } else {
+                sb.append(_T(" --default-duration \"0:%d/%dfps\""), videoFormat.frameRateNum, videoFormat.frameRateDenom);
+            }
+            sb.append(_T(" \"%s\""), inVideo);
+            ret.push_back(std::make_pair(sb.str(), true));
+            sb.clear();
+            tmppath = tmpout1path;
+        } else if (!encoderOutputInContainer && !tsreplaceMpegtsInput) {
             const bool needTimecode = (timecodepath.size() > 0);
 
             sb.clear();
@@ -640,10 +683,11 @@ static bool hasMp4Subtitles(const std::vector<tstring>& subsTitles) {
         sb.append(_T("\"%s\""), binpath);
         sb.append(_T(" -i \"%s\""), srcTSFilePath);
         sb.append(_T(" -r \"%s\""), tmppath);
-        sb.append(_T(" --replace-format mp4"));
-        if (tsreplaceEdgeTrim) {
-            sb.append(_T(" --end-at-replace-eof"));
-            sb.append(_T(" --replace-delay %lld"), (long long)tsreplaceDelay);
+        sb.append(_T(" --replace-format %s"), tsreplaceMpegtsInput
+            ? _T("mpegts")
+            : (encoder == ENCODER_X262 ? _T("matroska") : _T("mp4")));
+        if (!tsreplaceCutList.empty()) {
+            sb.append(_T(" --cut-list \"%s\""), tsreplaceCutList.c_str());
         }
         if (tsreplaceRemoveTypeD) {
             sb.append(_T(" --remove-typed"));
@@ -938,6 +982,10 @@ bool ConfigWrapper::isMuxTsTempEnabled() const {
 
 bool ConfigWrapper::getUseMKVWhenSubExist() const {
     return conf.useMKVWhenSubExist;
+}
+
+bool ConfigWrapper::isMpeg2PartialEnabled() const {
+    return conf.mpeg2Partial;
 }
 
 bool ConfigWrapper::isFormatVFRSupported() const {
@@ -1400,6 +1448,11 @@ tstring ConfigWrapper::getTmpB24CutChapterPath(EncodeFileKey key) const {
         tmpDir.path(), key.video, key.format, key.div, GetCMSuffix(key.cm)));
 }
 
+tstring ConfigWrapper::getTmpTSReplaceCutListPath(EncodeFileKey key) const {
+    return regtmp(StringFormat(_T("%s/tsreplace-cut%d-%d-%d%s.txt"),
+        tmpDir.path(), key.video, key.format, key.div, GetCMSuffix(key.cm)));
+}
+
 tstring ConfigWrapper::getTmpVTTFilePath(EncodeFileKey key, int langindex) const {
     return regtmp(StringFormat(_T("%s/vtt%d-%d-%d-%d%s.vtt"),
         tmpDir.path(), key.video, key.format, key.div, langindex, GetCMSuffix(key.cm)));
@@ -1499,6 +1552,7 @@ tstring ConfigWrapper::getOutFileBase(EncodeFileKey key, EncodeFileKey keyMax, E
     sb.append(_T("%s"), GetCMSuffix(key.cm));
     if (format == FORMAT_TSREPLACE) {
         switch (codec) {
+        case VS_MPEG2: sb.append(_T(".mpeg2")); break;
         case VS_H264: sb.append(_T(".h264")); break;
         case VS_H265: sb.append(_T(".hevc")); break;
         case VS_AV1: sb.append(_T(".av1")); break;
@@ -1590,11 +1644,11 @@ tstring ConfigWrapper::getFilterGraphDumpPath(EncodeFileKey key) const {
 }
 
 bool ConfigWrapper::isZoneAvailable() const {
-    return conf.encoder == ENCODER_X264 || conf.encoder == ENCODER_X265 || conf.encoder == ENCODER_NVENC || conf.encoder == ENCODER_QSVENC;
+    return conf.encoder == ENCODER_X264 || conf.encoder == ENCODER_X262 || conf.encoder == ENCODER_X265 || conf.encoder == ENCODER_NVENC || conf.encoder == ENCODER_QSVENC;
 }
 
 bool ConfigWrapper::isZoneWithoutBitrateAvailable() const {
-    return conf.encoder == ENCODER_X264 || conf.encoder == ENCODER_X265;
+    return conf.encoder == ENCODER_X264 || conf.encoder == ENCODER_X262 || conf.encoder == ENCODER_X265;
 }
 
 bool ConfigWrapper::isZoneWithQualityAvailable() const {
@@ -1610,7 +1664,16 @@ bool ConfigWrapper::isZoneTimeBased() const {
 }
 
 bool ConfigWrapper::isEncoderSupportVFR() const {
-    return conf.encoder == ENCODER_X264;
+    return conf.encoder == ENCODER_X264 || conf.encoder == ENCODER_X262;
+}
+
+// 目標ビットレートにVFR補正(vfrBitrateScale)を掛ける必要があるか
+// 本エンコーダがタイムコードを受け取れば、エンコーダ側が実時間でレート制御するため補正は不要。
+// ただしエンコーダフィルタが別プロセスの場合、フィルタがフレーム数を変え得るため
+// 本エンコーダにはタイムコードを渡しておらず、VFR対応エンコーダであっても補正が必要
+// (ゾーンの生成・適用条件はフィルタ出力のフレーム番号を基準とするため、こちらとは分けている)
+bool ConfigWrapper::isVFRBitrateScaleNeeded() const {
+    return isEncoderSupportVFR() == false || isEncoderFilterSeparate();
 }
 
 bool ConfigWrapper::isBitrateCMEnabled() const {
@@ -1641,8 +1704,8 @@ tstring ConfigWrapper::getOptions(
     double targetBitrate = 0;
     if (conf.autoBitrate) {
         targetBitrate = conf.bitrate.getTargetBitrate(srcFormat, srcBitrate);
-        if (isEncoderSupportVFR() == false) {
-            // タイムコード非対応エンコーダにおけるビットレートのVFR調整
+        if (isVFRBitrateScaleNeeded()) {
+            // 本エンコーダにタイムコードを渡さない場合のビットレートのVFR調整
             targetBitrate *= vfrBitrateScale;
         }
         if ((key.cm == CMTYPE_CM && !isZoneAvailable()) || chunkIsCM) {
@@ -1745,7 +1808,7 @@ tstring ConfigWrapper::getOptions(
     // x264/x265は--zonesで品質オフセットは指定できない、またSVT-AV1にはそもそもzonesがない
     // しかし、CM分離時は--crfを直接上書きすることで対応可能
     if ((key.cm == CMTYPE_CM || chunkIsCM)
-        && (conf.encoder == ENCODER_X264 || conf.encoder == ENCODER_X265 || conf.encoder == ENCODER_SVTAV1)) {
+        && (conf.encoder == ENCODER_X264 || conf.encoder == ENCODER_X262 || conf.encoder == ENCODER_X265 || conf.encoder == ENCODER_SVTAV1)) {
         //ctx.infoF("getOptions: ApplyZone CM eoInfo.rcMode %s, cmQualityOffset %f", eoInfo.rcMode, conf.cmQualityOffset);
         if (auto rcMode = getRCMode(conf.encoder, eoInfo.rcMode); rcMode && !rcMode->isBitrateMode && conf.cmQualityOffset != 0.0) {
             const tstring rcModeName = char_to_tstring(rcMode->name);
@@ -1761,6 +1824,7 @@ tstring ConfigWrapper::getOptions(
     if (numFrames > 0) {
         switch (conf.encoder) {
         case ENCODER_X264:
+        case ENCODER_X262:
         case ENCODER_X265:
         case ENCODER_QSVENC:
         case ENCODER_NVENC:
@@ -1810,6 +1874,7 @@ void ConfigWrapper::dump() const {
         cmOutMaskToString(conf.cmoutmask).c_str());
     ctx.infoF(_T("エンコード分割並列: %d"), conf.encoderParallel);
     ctx.infoF(_T("出力する最短区間: %d秒"), conf.minOutputDuration);
+    ctx.infoF(_T("カット境界再エンコード: %s"), conf.mpeg2Partial ? _T("有効") : _T("無効"));
     const bool logoRequiredForChapter = conf.chapter && (!conf.noLogoInCM || !conf.noDelogo);
     ctx.infoF(_T("チャプター解析: %s%s"),
         conf.chapter ? _T("有効") : _T("無効"),

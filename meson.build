@@ -36,12 +36,8 @@ ffmpeg_dep = [
 turbojpeg_dep = dependency('libturbojpeg', required : true)
 
 # プラットフォーム依存ライブラリ
-openssl_dep = dependency('', required : false)
 zlib_dep = dependency('', required : false)
 if host_machine.system() != 'windows'
-  # OpenSSL の静的リンクはディストリビューションによって Libs.private の追加依存
-  # (libjitterentropy.a など) が必要になるため、システムの共有ライブラリを使用する。
-  openssl_dep = dependency('openssl', required : true, static : false)
   zlib_dep = dependency('zlib', required : true, static : true)
 endif
 

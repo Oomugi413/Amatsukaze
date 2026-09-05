@@ -64,12 +64,16 @@ else
                             <option value="@item.Value" selected="@item.Selected">@item.Label</option>
                         }
                     </select>
+                    @if (IsX262InvalidOutputFormat())
+                    {
+                        <span class="text-danger small" style="margin-left: 8px;">x262はMKVまたはTS (replace)出力でのみ使用できます。</span>
+                    }
                 </td>
             </tr>
             <tr>
                 <th>エンコーダ追加<br />オプション</th>
                 <td>
-                    <textarea style="width: 100%; height: 80px;" @oninput="OnEncoderOptionChanged">@GetEncoderOption()</textarea>
+                    <textarea style="width: 100%; height: 80px;" @oninput="OnEncoderOptionChanged" disabled="@GetBoolValue("Mpeg2Partial")">@GetEncoderOption()</textarea>
                 </td>
             </tr>
             <tr>
@@ -235,7 +239,7 @@ else
                 <tr class="profile-check-row">
                     <td colspan="2">
                         <label class="settings-check">
-                            <input type="checkbox" checked="@GetBoolValue("TsreplaceRemoveTypeD")" @onchange="@(e => OnBoolChanged(e, "TsreplaceRemoveTypeD"))" />
+                            <input type="checkbox" checked="@GetBoolValue("TsreplaceRemoveTypeD")" @onchange="@(e => OnBoolChanged(e, "TsreplaceRemoveTypeD"))" disabled="@GetBoolValue("Mpeg2Partial")" />
                             データ放送を削除する
                         </label>
                     </td>
@@ -250,6 +254,13 @@ else
                             <option value="@item.Value" selected="@item.Selected">@item.Label</option>
                         }
                     </select>
+                    @if (IsMpeg2PartialVisible())
+                    {
+                        <label style="margin-left: 8px;" title="再エンコード範囲をカット境界周辺に抑え、それ以外の映像を無劣化でコピーします。チャプター・CM解析とデータ放送の削除は自動的に有効になります。">
+                            <input type="checkbox" checked="@GetBoolValue("Mpeg2Partial")" @onchange="OnMpeg2PartialChanged" />
+                            カット境界のみ再エンコード
+                        </label>
+                    }
                 </td>
             </tr>
         </table>
@@ -321,7 +332,7 @@ else
             <tr>
                 <th>フィルタ</th>
                 <td>
-                    <select @onchange="OnFilterOptionChanged">
+                    <select @onchange="OnFilterOptionChanged" disabled="@GetBoolValue("Mpeg2Partial")">
                         @foreach (var item in GetFilterOptions())
                         {
                             <option value="@item.Value" selected="@item.Selected">@item.Label</option>
@@ -694,7 +705,7 @@ else
             <tr class="profile-check-row">
                 <td colspan="2">
                     <label class="settings-check">
-                        <input type="checkbox" checked="@GetBoolValue("TwoPass")" @onchange="@(e => OnBoolChanged(e, "TwoPass"))" />
+                        <input type="checkbox" checked="@GetBoolValue("TwoPass")" @onchange="@(e => OnBoolChanged(e, "TwoPass"))" disabled="@GetBoolValue("Mpeg2Partial")" />
                         2パスエンコード
                     </label>
                 </td>
@@ -719,7 +730,7 @@ else
             <tr class="profile-check-row">
                 <td colspan="2">
                     <label class="settings-check">
-                        <input type="checkbox" checked="@GetBoolValue("EnableAudioEncode")" @onchange="@(e => OnBoolChanged(e, "EnableAudioEncode"))" />
+                        <input type="checkbox" checked="@GetBoolValue("EnableAudioEncode")" @onchange="@(e => OnBoolChanged(e, "EnableAudioEncode"))" disabled="@GetBoolValue("Mpeg2Partial")" />
                         音声をエンコードする
                     </label>
                 </td>
@@ -876,13 +887,13 @@ else
         <table class="table">
             <tr class="profile-check-row"><td colspan="2"><label class="settings-check"><input type="checkbox" checked="@GetMoveInputFileValue()" @onchange="OnMoveInputFileChanged" />処理の終了後、入力ファイルを別フォルダに移動する</label></td></tr>
             <tr class="profile-check-row"><td colspan="2"><label class="settings-check"><input type="checkbox" checked="@GetBoolValue("MoveEDCBFiles")" @onchange="@(e => OnBoolChanged(e, "MoveEDCBFiles"))" disabled="@(!GetMoveInputFileValue())" />関連ファイル(*.err,*.program.txtなど)もコピー/移動する</label></td></tr>
-            <tr class="profile-check-row"><td colspan="2"><label class="settings-check"><input type="checkbox" checked="@GetBoolValue("DisableChapter")" @onchange="@(e => OnBoolChanged(e, "DisableChapter"))" />チャプター・CM解析を無効にする</label></td></tr>
+            <tr class="profile-check-row"><td colspan="2"><label class="settings-check"><input type="checkbox" checked="@GetBoolValue("DisableChapter")" @onchange="@(e => OnBoolChanged(e, "DisableChapter"))" disabled="@GetBoolValue("Mpeg2Partial")" />チャプター・CM解析を無効にする</label></td></tr>
             <tr class="profile-check-row"><td colspan="2"><label class="settings-check"><input type="checkbox" checked="@GetBoolValue("OutputChapter")" @onchange="@(e => OnBoolChanged(e, "OutputChapter"))" disabled="@(GetBoolValue("DisableChapter"))" />チャプターを別ファイルに出力する</label></td></tr>
             <tr class="profile-check-row"><td colspan="2"><label class="settings-check"><input type="checkbox" checked="@GetBoolValue("IgnoreNoDrcsMap")" @onchange="@(e => OnBoolChanged(e, "IgnoreNoDrcsMap"))" />マッピングにないDRCS外字は無視する</label></td></tr>
             <tr class="profile-check-row"><td colspan="2"><label class="settings-check"><input type="checkbox" checked="@GetBoolValue("LooseLogoDetection")" @onchange="@(e => OnBoolChanged(e, "LooseLogoDetection"))" />ロゴ検出判定しきい値を低くする</label></td></tr>
             <tr class="profile-check-row"><td colspan="2"><label class="settings-check"><input type="checkbox" checked="@GetBoolValue("IgnoreNoLogo")" @onchange="@(e => OnBoolChanged(e, "IgnoreNoLogo"))" />ロゴ検出に失敗しても処理を続行する</label></td></tr>
             <tr class="profile-check-row"><td colspan="2"><label class="settings-check"><input type="checkbox" checked="@GetBoolValue("NoLogoInCM")" @onchange="@(e => OnBoolChanged(e, "NoLogoInCM"))" disabled="@(GetBoolValue("DisableChapter"))" />CM解析でロゴを使用しない</label></td></tr>
-            <tr class="profile-check-row"><td colspan="2"><label class="settings-check"><input type="checkbox" checked="@GetBoolValue("NoDelogo")" @onchange="@(e => OnBoolChanged(e, "NoDelogo"))" />ロゴ消ししない</label></td></tr>
+            <tr class="profile-check-row"><td colspan="2"><label class="settings-check"><input type="checkbox" checked="@GetBoolValue("NoDelogo")" @onchange="@(e => OnBoolChanged(e, "NoDelogo"))" disabled="@GetBoolValue("Mpeg2Partial")" />ロゴ消ししない</label></td></tr>
             <tr class="profile-check-row"><td colspan="2"><label class="settings-check"><input type="checkbox" checked="@GetBoolValue("ParallelLogoAnalysis")" @onchange="@(e => OnBoolChanged(e, "ParallelLogoAnalysis"))" />並列ロゴ解析</label></td></tr>
             <tr class="profile-check-row"><td colspan="2"><label class="settings-check"><input type="checkbox" checked="@GetBoolValue("SystemAviSynthPlugin")" @onchange="@(e => OnBoolChanged(e, "SystemAviSynthPlugin"))" />システムにインストールされているAviSynthプラグインを有効にする</label></td></tr>
             <tr class="profile-check-row"><td colspan="2"><label class="settings-check"><input type="checkbox" checked="@GetBoolValue("DisableLogFile")" @onchange="@(e => OnBoolChanged(e, "DisableLogFile"))" />ログファイルを出力先に生成しない</label></td></tr>
@@ -913,7 +924,14 @@ else
             </tr>
             <tr>
                 <th>出力する最短区間</th>
-                <td><input type="number" min="0" style="width: 80px;" value="@GetIntValue("MinOutputDuration")" @oninput="@(e => OnIntChanged(e, "MinOutputDuration"))" /> 秒（0は既定値の5秒）</td>
+                <td>
+                    <label>
+                        <input type="checkbox" checked="@IsMinOutputDurationEnabled()" @onchange="OnMinOutputDurationEnabledChanged" />
+                        最短区間の設定
+                    </label>
+                    <input type="number" min="1" style="width: 80px; margin-left: 6px;" value="@GetMinOutputDurationInputValue()" @oninput="@(e => OnIntChanged(e, "MinOutputDuration"))" disabled="@(!IsMinOutputDurationEnabled())" />
+                    <span> 秒</span>
+                </td>
             </tr>
         </table>
 
@@ -921,7 +939,6 @@ else
         <h4>詳細設定</h4>
         <table class="table">
             <tr class="profile-check-row"><td colspan="2"><label class="settings-check"><input type="checkbox" checked="@GetBoolValue("SplitSub")" @onchange="@(e => OnBoolChanged(e, "SplitSub"))" />メイン以外のフォーマットは結合しない</label></td></tr>
-            <tr class="profile-check-row"><td colspan="2"><label class="settings-check"><input type="checkbox" checked="@GetBoolValue("DisableHashCheck")" @onchange="@(e => OnBoolChanged(e, "DisableHashCheck"))" />ネットワーク越しに転送する場合のハッシュチェックを無効にする</label></td></tr>
             <tr>
                 <th>追加ロゴ消し用のロゴ</th>
                 <td><textarea style="width: 100%; height: 60px;" @oninput="@(e => OnStringChanged(e, "AdditionalEraseLogo"))">@GetStringValue("AdditionalEraseLogo")</textarea></td>
@@ -999,7 +1016,7 @@ else
     private NameDialogMode _nameDialog = NameDialogMode.None;
     private string _nameDialogTitle = "";
     private string _nameInput = "";
-    private static readonly string[] _encoderEnumNames = new[] { "x264", "x265", "QSVEnc", "NVEnc", "VCEEnc", "SVTAV1" };
+    private static readonly string[] _encoderEnumNames = new[] { "x264", "x265", "QSVEnc", "NVEnc", "VCEEnc", "SVTAV1", "x262" };
     private static readonly string[] _decoderEnumNames = new[] { "Default", "QSV", "CUVID" };
     private static readonly string[] _formatEnumNames = new[] { "MP4", "MKV", "M2TS", "TS", "TSREPLACE" };
     private static readonly string[] _filterEnumNames = new[] { "None", "Setting", "Custom", "QSVEncFilter", "NVEncFilter", "VCEEncFilter" };
@@ -1100,6 +1117,9 @@ else
             return;
         }
         _error = null;
+
+        DisableMpeg2PartialIfUnavailable();
+        ApplyMpeg2PartialConstraints();
 
         var json = UpdateProfileName(_draftJson, _selectedProfileName);
         using var doc = JsonDocument.Parse(json);
@@ -1413,6 +1433,23 @@ else
         SetNodeValue(name, JsonValue.Create(value));
     }
 
+    private bool IsMinOutputDurationEnabled()
+    {
+        return GetIntValue("MinOutputDuration") > 0;
+    }
+
+    private int GetMinOutputDurationInputValue()
+    {
+        var value = GetIntValue("MinOutputDuration");
+        return value > 0 ? value : 5;
+    }
+
+    private void OnMinOutputDurationEnabledChanged(ChangeEventArgs e)
+    {
+        var value = e.Value is bool b && b;
+        SetNodeValue("MinOutputDuration", JsonValue.Create(value ? GetMinOutputDurationInputValue() : 0));
+    }
+
     private void OnMoveInputFileChanged(ChangeEventArgs e)
     {
         var moveInputFile = e.Value is bool b && b;
@@ -1428,6 +1465,7 @@ else
         var idx = ParseIndex(e.Value);
         var enumName = idx >= 0 && idx < _encoderEnumNames.Length ? _encoderEnumNames[idx] : _encoderEnumNames[0];
         SetNodeValue("EncoderType", JsonValue.Create(enumName));
+        DisableMpeg2PartialIfUnavailable();
     }
 
     private void OnEncoderOptionChanged(ChangeEventArgs e)
@@ -1442,6 +1480,7 @@ else
             3 => "NVEncOption",
             4 => "VCEEncOption",
             5 => "SVTAV1Option",
+            6 => "X262Option",
             _ => "X264Option"
         };
         SetNodeValue(name, JsonValue.Create(value));
@@ -1501,6 +1540,44 @@ else
         if (int.TryParse(e.Value?.ToString(), out var value))
         {
             SetNodeValue("OutputMask", JsonValue.Create(value));
+            DisableMpeg2PartialIfUnavailable();
+        }
+    }
+
+    private bool IsMpeg2PartialVisible()
+    {
+        var x262Index = Array.FindIndex(_encoderEnumNames,
+            value => string.Equals(value, "x262", StringComparison.OrdinalIgnoreCase));
+        return GetEncoderIndex() == x262Index && GetIntValue("OutputMask") != 1;
+    }
+
+    private void OnMpeg2PartialChanged(ChangeEventArgs e)
+    {
+        var value = e.Value is bool b && b;
+        SetNodeValue("Mpeg2Partial", JsonValue.Create(value));
+        ApplyMpeg2PartialConstraints();
+    }
+
+    private void ApplyMpeg2PartialConstraints()
+    {
+        if (!GetBoolValue("Mpeg2Partial"))
+        {
+            return;
+        }
+        SetNodeValue("X262Option", JsonValue.Create(""));
+        SetNodeValue("FilterOption", JsonValue.Create("None"));
+        SetNodeValue("EnableAudioEncode", JsonValue.Create(false));
+        SetNodeValue("NoDelogo", JsonValue.Create(true));
+        SetNodeValue("TwoPass", JsonValue.Create(false));
+        SetNodeValue("DisableChapter", JsonValue.Create(false));
+        SetNodeValue("TsreplaceRemoveTypeD", JsonValue.Create(true));
+    }
+
+    private void DisableMpeg2PartialIfUnavailable()
+    {
+        if (!IsMpeg2PartialVisible())
+        {
+            SetNodeValue("Mpeg2Partial", JsonValue.Create(false));
         }
     }
 
@@ -1659,6 +1736,7 @@ else
             3 => "NVEncOption",
             4 => "VCEEncOption",
             5 => "SVTAV1Option",
+            6 => "X262Option",
             _ => "X264Option"
         };
         return GetStringValue(name);
@@ -1719,6 +1797,13 @@ else
     private bool IsTsreplaceFormat()
     {
         return string.Equals(GetEnumString("OutputFormat", _formatEnumNames), "TSREPLACE", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool IsX262InvalidOutputFormat()
+    {
+        return GetEncoderIndex() == 6
+            && !string.Equals(GetEnumString("OutputFormat", _formatEnumNames), "MKV", StringComparison.OrdinalIgnoreCase)
+            && !IsTsreplaceFormat();
     }
 
     private string GetEnumString(string name, string[] enumNames)

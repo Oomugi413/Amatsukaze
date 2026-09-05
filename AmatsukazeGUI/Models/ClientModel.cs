@@ -2055,7 +2055,8 @@ namespace Amatsukaze.Models
 
                 profile.SetEncoderOptions(
                     data.Profile.X264Option, data.Profile.X265Option,
-                    data.Profile.QSVEncOption, data.Profile.NVEncOption);
+                    data.Profile.QSVEncOption, data.Profile.NVEncOption,
+                    data.Profile.X262Option);
                 profile.EncoderTypeInt = (int)data.Profile.EncoderType;
                 profile.ForceSAR = data.Profile.ForceSAR;
                 profile.ForceSARWidth = data.Profile.ForceSARWidth;
@@ -2108,7 +2109,6 @@ namespace Amatsukaze.Models
                 profile.EnableMaxFadeLength = data.Profile.EnableMaxFadeLength;
                 profile.MaxFadeLength = data.Profile.MaxFadeLength;
                 profile.SystemAviSynthPlugin = data.Profile.SystemAviSynthPlugin;
-                profile.DisableHashCheck = data.Profile.DisableHashCheck;
                 profile.Mpeg2DecoderInt = (int)data.Profile.Mpeg2Decoder;
                 profile.H264DecoderInt = (int)data.Profile.H264Deocder;
                 profile.OutputFormatInt = (int)data.Profile.OutputFormat;
@@ -2163,8 +2163,10 @@ namespace Amatsukaze.Models
                 profile.EnableAudioEncode = data.Profile.EnableAudioEncode;
                 profile.AudioEncoderTypeInt = (int)data.Profile.AudioEncoderType;
                 profile.AudioBitrateInKbps = data.Profile.AudioBitrateInKbps;
+                profile.Mpeg2Partial = data.Profile.Mpeg2Partial;
 
                 profile.PreEncodeBatchFile = data.Profile.PreEncodeBatchFile;
+                profile.IsModified = false;
             }
             else
             {
