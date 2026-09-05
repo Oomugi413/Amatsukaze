@@ -162,11 +162,11 @@ sudo apt install -y ./avisynthcudafilters_<version>_amd64_Ubuntuxx.xx.deb
 
   ここではビルド済みアーカイブを展開してインストールする方法を示します。自ビルドする場合は[こちら](./BuildLinux.md)を参考にしてください。
 
-  [こちら](https://github.com/rigaya/Amatsukaze/releases)からAmatsukazeのアーカイブをダウンロードして展開してください。
+  [こちら](https://github.com/Oomugi413/Amatsukaze/releases)からAmatsukazeのアーカイブをダウンロードして展開してください。
   **展開先は実行するユーザーが読み書きできる権限のあるディレクトリとしてください。** (下記では ```$HOME/Amatsukaze```)
 
   ```bash
-  wget https://github.com/rigaya/Amatsukaze/releases/download/<version>/Amatsukaze_<version>_Ubuntuxx.xx.tar.xz
+  wget https://github.com/Oomugi413/Amatsukaze/releases/download/<version>/Amatsukaze_<version>_Ubuntuxx.xx.tar.xz
   tar xf Amatsukaze_<version>_Ubuntuxx.xx.tar.xz -C $HOME/Amatsukaze
   ```
 
