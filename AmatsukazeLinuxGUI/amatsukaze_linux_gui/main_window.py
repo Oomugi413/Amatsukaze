@@ -338,7 +338,7 @@ class MainWindow(Gtk.ApplicationWindow):
         try:
             files = dialog.open_multiple_finish(result)
             paths = [files.get_item(index).get_path() for index in range(files.get_n_items())]
-            self._start_collection([path for path in paths if path])
+            self._start_collection([path for path in paths if path], [])
         except GLib.Error as exc:
             if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
                 return
