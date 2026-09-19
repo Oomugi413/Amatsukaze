@@ -33,7 +33,8 @@ jobs:
       - name: Build native
         run: |
           # 古いキャッシュを掴まないよう、ベースイメージを明示的に取得する
-          docker pull ghcr.io/${{ github.repository_owner }}/amatsukaze-builder:ubuntu2004 || true
+          GHCR_OWNER=$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          docker pull ghcr.io/${GHCR_OWNER}/amatsukaze-builder:ubuntu2004 || true
           docker build \
             --build-arg GHCR_OWNER=${{ github.repository_owner }} \
             --tag build_amatsukaze_native \
@@ -89,11 +90,12 @@ jobs:
       - name: Check wasm-tools workload
         run: |
           # jobs.container は可変タグの古いイメージがrunnerに残る場合があるため、明示的にpullする。
+          GHCR_OWNER=$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           docker pull ghcr.io/${{ github.repository_owner }}/amatsukaze-builder:ubuntu2404
           # wasm-tools が無いとWebUIが最適化なしで発行され、静かにサイズが増える。
           # ベースイメージ側で入れているので、無い場合はイメージが古い。
           if ! docker run --rm \
-            ghcr.io/${{ github.repository_owner }}/amatsukaze-builder:ubuntu2404 \
+            ghcr.io/${GHCR_OWNER}/amatsukaze-builder:ubuntu2404 \
             dotnet workload list | grep -q "wasm-tools"; then
             echo "wasm-toolsワークロードがありません。build_base_image.ymlを再実行してベースイメージを更新してください。" >&2
             exit 1
@@ -101,9 +103,10 @@ jobs:
 
       - name: Build .NET
         run: |
+          GHCR_OWNER=$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           docker run --rm \
             -v "${{ github.workspace }}:/work" \
-            ghcr.io/${{ github.repository_owner }}/amatsukaze-builder:ubuntu2404 \
+            ghcr.io/${GHCR_OWNER}/amatsukaze-builder:ubuntu2404 \
             bash -lc 'git config --global --add safe.directory /work && cd /work && ./scripts/build.sh buildAmatsukaze/Amatsukaze --dotnet-only'
 
       - name: Pack .NET tree
