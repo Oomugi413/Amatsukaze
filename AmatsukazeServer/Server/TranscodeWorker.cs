@@ -223,7 +223,7 @@ namespace Amatsukaze.Server
 
         private static string MakeSCRenameArgs(string screnamepath, string format, string filepath)
         {
-            var ext = (screnamepath.Length > 0) ? Path.GetExtension(screnamepath).ToLower() : "";
+            var ext = (screnamepath.Length > 0) ? Path.GetExtension(screnamepath).ToLowerInvariant() : "";
             var sb = new StringBuilder();
 
             if (ext == ".vbs")
@@ -261,7 +261,7 @@ namespace Amatsukaze.Server
             var serviceName = item.ServiceName;
 
             var ext = ".ts";
-            var scriptExt = Path.GetExtension(screnamepath).ToLower();
+            var scriptExt = Path.GetExtension(screnamepath).ToLowerInvariant();
 
             // 情報がある時はその情報を元にファイル名を作成
             // ないときはファイル名をそのまま使う
@@ -287,6 +287,7 @@ namespace Amatsukaze.Server
                 using (File.Create(srcpath)) { }
 
                 string exename;
+                PythonExecutable python = null;
 
                 if (scriptExt == ".vbs")
                 {
@@ -294,14 +295,8 @@ namespace Amatsukaze.Server
                 }
                 else if (scriptExt == ".py")
                 {
-                    if (Environment.OSVersion.Platform == PlatformID.Win32NT)
-                    {
-                        exename = "py";
-                    }
-                    else
-                    {
-                        exename = "python3";
-                    }
+                    python = PythonExecutableResolver.ResolveOrThrow("SCRename.py");
+                    exename = python.FileName;
                 }
                 else
                 {
@@ -309,6 +304,10 @@ namespace Amatsukaze.Server
                 }
 
                 string args = MakeSCRenameArgs(exename == screnamepath ? "" : screnamepath, format, srcpath);
+                if (python != null)
+                {
+                    args = python.PrependLauncherArguments(args);
+                }
 
                 var psi = new ProcessStartInfo(exename, args)
                 {
@@ -323,7 +322,7 @@ namespace Amatsukaze.Server
                 };
 
                 // Pythonの場合は出力エンコーディングをUTF-8に固定
-                if (scriptExt != ".vbs")
+                if (scriptExt == ".py")
                 {
                     psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
                 }
@@ -778,6 +777,7 @@ namespace Amatsukaze.Server
             }
 
             ProfileSetting profile = item.Profile;
+            string workPath = item.GetEffectiveWorkPath(server.AppData_.setting);
             ServiceSettingElement serviceSetting =
                 (item.Mode != ProcMode.DrcsCheck) ?
                 server.AppData_.services.ServiceMap[item.ServiceId] :
@@ -850,8 +850,8 @@ namespace Amatsukaze.Server
                 try
                 {
                     newName = await SCRename(
-                        server.AppData_.setting.SCRenamePath, 
-                        server.AppData_.setting.WorkPath,
+                        server.AppData_.setting.SCRenamePath,
+                        workPath,
                         profile.RenameFormat, item);
                 }
                 catch (Exception)
@@ -949,7 +949,7 @@ namespace Amatsukaze.Server
                 bool needCopy = !IsEncodableString(srcpath + ";" + dstpath);
                 if (needCopy)
                 {
-                    tmpBase = Util.CreateTmpFile(server.AppData_.setting.WorkPath);
+                    tmpBase = Util.CreateTmpFile(workPath);
                     localsrc = tmpBase + "-in" + Path.GetExtension(srcpath);
                     await CopyFileAsync(srcpath, localsrc);
                     srcpathOrg = srcpath; // もともとのファイル名を記憶
@@ -994,7 +994,7 @@ namespace Amatsukaze.Server
 
                 string args = server.MakeAmatsukazeArgs(
                     item.Mode, profile,
-                    server.AppData_.setting,
+                    server.AppData_.setting, workPath,
                     isMp4,
                     srcpath, srcpathOrg, localdst + ext, json, item.StreamFormat,
                     item.ServiceId, logopaths, ignoreNoLogo, jlscmd, jlsopt, ceopt, trimavs, divfile, resumeDir, server.GetBatDirectoryPath(),

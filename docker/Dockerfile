@@ -65,7 +65,7 @@ ENV ARCH=${ARCH}
 ENV BUILD_MODE=${BUILD_MODE}
 
 # バージョン定義
-ENV AVISYNTHCUDAFILTERS_VER=0.7.1
+ENV AVISYNTHCUDAFILTERS_VER=0.7.4
 ENV AVISYNTH_VER=3.7.5
 ENV YADIFMOD2_VER=0.2.8
 ENV TIVTC_VER=v1.0.29
@@ -116,7 +116,7 @@ RUN add-apt-repository ppa:dotnet/backports \
     && rm -rf /var/lib/apt/lists/*
 
 # AviSynth+ のインストール
-RUN wget https://github.com/rigaya/AviSynthCUDAFilters/releases/download/${AVISYNTHCUDAFILTERS_VER}/avisynth_${AVISYNTH_VER}-1_${ARCH}_Ubuntu${UBUNTU_VERSION}.deb -O avisynth.deb \
+RUN wget https://github.com/rigaya/AviSynthCUDAFilters/releases/download/${AVISYNTHCUDAFILTERS_VER}/avisynth_${AVISYNTH_VER}-1_${ARCH}_linux.deb -O avisynth.deb \
     && apt-get install -y ./avisynth.deb \
     && rm ./avisynth.deb
 
@@ -271,7 +271,6 @@ RUN cd /src/Amatsukaze \
     && git config user.email "docker-build@localhost" \
     && git add -A \
     && git commit -m "Local Docker build source" \
-    && git tag 0.0.0 \
     && ./scripts/build.sh /opt/amatsukaze /tmp/amatsukaze-build \
     && ./scripts/install.sh /opt/amatsukaze \
     && rm -rf /tmp/amatsukaze-build /src/Amatsukaze/.git
@@ -308,13 +307,13 @@ ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics
 ENV VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_egl_icd.json
 
-ENV QSVENCC_VER=8.28
-ENV NVENCC_VER=9.33.1
-ENV VCEENCC_VER=9.15
+ENV QSVENCC_VER=8.30
+ENV NVENCC_VER=9.35
+ENV VCEENCC_VER=9.17
 ENV AMDGPU_INSTALL_VER=25.35.1
 ENV AMDGPU_INSTALL_DEB_VER=7.2.1.70201-1
 ENV TSREPLACE_VER=0.20
-ENV AVISYNTHCUDAFILTERS_VER=0.7.3
+ENV AVISYNTHCUDAFILTERS_VER=0.7.4
 ENV AVISYNTH_VER=3.7.5
 ENV FASTER_WHISPER_VER=r245.4
 
@@ -451,11 +450,11 @@ RUN if [ "$BUILD_MODE" = "debug" ]; then \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 
-# AviSynth+/AvisynthCUDAFilters のインストール（実行段階でも必要）
-RUN wget https://github.com/rigaya/AviSynthCUDAFilters/releases/download/${AVISYNTHCUDAFILTERS_VER}/avisynth_${AVISYNTH_VER}-1_${ARCH}_Ubuntu${UBUNTU_VERSION}.deb -O avisynth.deb \
+# AviSynth+/AvisynthCUDAFiltersのインストール（実行段階でも必要）
+RUN wget https://github.com/rigaya/AviSynthCUDAFilters/releases/download/${AVISYNTHCUDAFILTERS_VER}/avisynth_${AVISYNTH_VER}-1_${ARCH}_linux.deb -O avisynth.deb \
     && apt-get install -y ./avisynth.deb \
     && rm ./avisynth.deb \
-    && wget https://github.com/rigaya/AviSynthCUDAFilters/releases/download/${AVISYNTHCUDAFILTERS_VER}/avisynthcudafilters_${AVISYNTHCUDAFILTERS_VER}-1_${ARCH}_Ubuntu${UBUNTU_VERSION}.deb -O avisynthcudafilters.deb \
+    && wget https://github.com/rigaya/AviSynthCUDAFilters/releases/download/${AVISYNTHCUDAFILTERS_VER}/avisynthcudafilters_${AVISYNTHCUDAFILTERS_VER}-1_${ARCH}_linux.deb -O avisynthcudafilters.deb \
     && apt-get install -y ./avisynthcudafilters.deb \
     && rm ./avisynthcudafilters.deb
 
@@ -483,9 +482,9 @@ RUN git clone --depth 1 -b 0.04 https://github.com/rigaya/SCRenamePy.git tmp_SCR
     && mv tmp_SCRenamePy/SCRename.* exe_files/SCRenamePy/ \
     && rm -rf tmp_SCRenamePy
 
-RUN wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260905-074217/x264_3223_amd64_linux.tar.xz -O x264.tar.xz \
-    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260905-074217/x265_4.3%2B24_amd64_linux.tar.xz -O x265.tar.xz \
-    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260905-074217/SvtAv1EncApp_4.2.0-107_amd64_linux_clang.tar.xz -O svt-av1.tar.xz \
+RUN wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260919-084954/x264_3223_amd64_linux.tar.xz -O x264.tar.xz \
+    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260919-084954/x265_4.3%2B45_amd64_linux.tar.xz -O x265.tar.xz \
+    && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260919-084954/SvtAv1EncApp_4.2.0-146_amd64_linux_clang.tar.xz -O svt-av1.tar.xz \
     && wget https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20250907-045307/x262_20260901.tar.gz -O x262.tar.gz \
     && tar -xf x264.tar.xz -C /app/exe_files \
     && tar -xf x265.tar.xz -C /app/exe_files \
@@ -575,6 +574,11 @@ if getent group video >/dev/null 2>&1; then GROUPS_TO_ADD+=("video"); fi
 if [ -n "$RENDER_GROUP" ]; then GROUPS_TO_ADD+=("$RENDER_GROUP"); elif getent group render >/dev/null 2>&1; then GROUPS_TO_ADD+=("render"); fi
 if [ ${#GROUPS_TO_ADD[@]} -gt 0 ]; then
   usermod -aG "$(IFS=,; echo "${GROUPS_TO_ADD[*]}")" "$(id -nu "${DEFAULT_UID}")"
+fi
+if [ -x /app/exe_files/AmatsukazeDockerConfigFix ]; then
+  gosu "$DEFAULT_UID" /app/exe_files/AmatsukazeDockerConfigFix \
+    /app/config/AmatsukazeServer.xml /app/exe_files || \
+    echo "警告: Docker用実行ファイル設定の補正に失敗しました" >&2
 fi
 exec gosu "$DEFAULT_UID" "$@"
 EOF

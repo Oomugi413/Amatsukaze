@@ -1415,16 +1415,15 @@ namespace Amatsukaze.Server
             }
             if (string.IsNullOrEmpty(setting.NicoConvASSPath))
             {
+                // NicoConvASS は Windows でのみ使用する
                 if (!Util.IsServerLinux())
-                {
-                    // Windows: NicoConvASS.exe を使用
                     setting.NicoConvASSPath = GetExePath(basePath, "NicoConvASS");
-                }
-                else
-                {
-                    // Linux: Python スクリプト nicojk_ass.py を使用
-                    setting.NicoConvASSPath = Path.Combine(basePath, "nicojk_ass.py");
-                }
+            }
+            if (string.IsNullOrEmpty(setting.NicoJKAssPath))
+            {
+                var nicoJKAssPath = Path.Combine(basePath, "nicojk_ass.py");
+                if (File.Exists(nicoJKAssPath))
+                    setting.NicoJKAssPath = nicoJKAssPath;
             }
             if (string.IsNullOrEmpty(setting.SCRenamePath))
             {
@@ -2023,7 +2022,7 @@ namespace Amatsukaze.Server
         internal string MakeAmatsukazeArgs(
             ProcMode mode,
             ProfileSetting profile,
-            Setting setting,
+            Setting setting, string workPath,
             bool isGeneric,
             string src, string srcOrg, string dst, string json,
             VideoStreamFormat streamFormat,
@@ -2110,7 +2109,7 @@ namespace Amatsukaze.Server
                 }
 
                 sb.Append(" -w \"")
-                    .Append(setting.WorkPath)
+                    .Append(workPath)
                     .Append("\" --chapter-exe \"")
                     .Append(setting.ChapterExePath)
                     .Append("\" --jls \"")
@@ -2277,8 +2276,10 @@ namespace Amatsukaze.Server
                         }
                         sb.Append(" --nicojkmask ")
                             .Append(profile.NicoJKFormatMask);
-                        sb.Append(" --nicoass \"")
-                            .Append(setting.NicoConvASSPath)
+                        var useNicoConvAss = !Util.IsServerLinux()
+                            && !string.IsNullOrEmpty(setting.NicoConvASSPath);
+                        sb.Append(useNicoConvAss ? " --nicoass \"" : " --nicojkass \"")
+                            .Append(useNicoConvAss ? setting.NicoConvASSPath : setting.NicoJKAssPath)
                             .Append("\"");
                     }
 
@@ -2712,6 +2713,7 @@ namespace Amatsukaze.Server
             CheckPath("ChapterExe", setting.ChapterExePath);
             CheckPath("JoinLogoScp", setting.JoinLogoScpPath);
             CheckPath("NicoConvAss", setting.NicoConvASSPath);
+            CheckPath("nicojk_ass.py", setting.NicoJKAssPath);
             CheckPath("tsMuxeR", setting.TsMuxeRPath);
             CheckPath("SCRename.vbs", setting.SCRenamePath);
             CheckPath("AutoVfr.exe", setting.AutoVfrPath);
@@ -2746,9 +2748,10 @@ namespace Amatsukaze.Server
                     {
                         throw new ArgumentException("カット境界再エンコードにはx262とTS (replace)出力が必要です。");
                     }
-                    if (profile.OutputMask != 2 || profile.DisableChapter)
+                    if (!ProfileSettingExtensions.Mpeg2PartialOutputMasks.Contains(profile.OutputMask)
+                        || profile.DisableChapter)
                     {
-                        throw new ArgumentException("カット境界再エンコードにはCMをカット（本編のみ）とチャプター・CM解析が必要です。");
+                        throw new ArgumentException("カット境界再エンコードにはCM解析を伴うカット出力が必要です。");
                     }
                     if (profile.FilterOption != FilterOption.None || profile.EnableAudioEncode
                         || !profile.NoDelogo || !string.IsNullOrEmpty(profile.AdditionalEraseLogo)
@@ -2850,11 +2853,20 @@ namespace Amatsukaze.Server
 
                 if (profile.EnableNicoJK)
                 {
-                    if (string.IsNullOrEmpty(setting.NicoConvASSPath))
+                    if (Util.IsServerLinux() && string.IsNullOrEmpty(setting.NicoJKAssPath))
                     {
-                        // Windows: NicoConvASS.exe、Linux: nicojk_ass.py
-                        var toolName = Util.IsServerLinux() ? "nicojk_ass.py" : "NicoConvASS";
-                        throw new ArgumentException(toolName + "パスが設定されていません");
+                        throw new ArgumentException("nicojk_ass.pyパスが設定されていません");
+                    }
+                    if (!Util.IsServerLinux()
+                        && string.IsNullOrEmpty(setting.NicoConvASSPath)
+                        && string.IsNullOrEmpty(setting.NicoJKAssPath))
+                    {
+                        throw new ArgumentException("NicoConvASSまたはnicojk_ass.pyのパスが設定されていません");
+                    }
+                    if (!string.IsNullOrEmpty(setting.NicoJKAssPath)
+                        && (Util.IsServerLinux() || string.IsNullOrEmpty(setting.NicoConvASSPath)))
+                    {
+                        PythonExecutableResolver.ResolveOrThrow("nicojk_ass.py");
                     }
                 }
 
@@ -2865,6 +2877,10 @@ namespace Amatsukaze.Server
                         throw new ArgumentException("SCRenameパスが設定されていません");
                     }
                     var fileName = Path.GetFileName(setting.SCRenamePath);
+                    if (string.Equals(Path.GetExtension(fileName), ".py", StringComparison.OrdinalIgnoreCase))
+                    {
+                        PythonExecutableResolver.ResolveOrThrow("SCRename.py");
+                    }
                     // 間違える人がいるかも知れないので一応チェックしておく
                     if(fileName.Equals("SCRename.bat", StringComparison.OrdinalIgnoreCase) ||
                         fileName.Equals("SCRenameEDCB.bat", StringComparison.OrdinalIgnoreCase))
@@ -4282,10 +4298,18 @@ namespace Amatsukaze.Server
 
         private void PlaySound(string name)
         {
-            var localClientRunning = ClientManager?.HasLocalClient() ?? true;
-            if (localClientRunning == false)
+            try
             {
-                Util.PlayRandomSound(Path.Combine("sound", name));
+                var localClientRunning = ClientManager?.HasLocalClient() ?? true;
+                if (localClientRunning == false)
+                {
+                    Util.PlayRandomSound(Path.Combine("sound", name));
+                }
+            }
+            catch (Exception e)
+            {
+                // 通知音の失敗でエンコード結果を変更せず、状態通知を続行する。
+                Util.AddLog("通知音の処理に失敗: " + name, e);
             }
         }
 

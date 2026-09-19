@@ -18,8 +18,9 @@
 #if defined(_WIN32) || defined(_WIN64)
 #define AMATSUKAZECLI_HELP_NICOASS_LINE _T("  --nicoass <パス>     NicoConvASSへのパス\n")
 #else
-#define AMATSUKAZECLI_HELP_NICOASS_LINE _T("  --nicoass <パス>     nicojk_ass.pyへのパス\n")
+#define AMATSUKAZECLI_HELP_NICOASS_LINE _T("  --nicoass <パス>     nicojk_ass.pyへのパス（互換オプション）\n")
 #endif
+#define AMATSUKAZECLI_HELP_NICOJKASS_LINE _T("  --nicojkass <パス>   nicojk_ass.pyへのパス\n")
 
 static void printCopyright() {
     PRINTF(
@@ -129,6 +130,7 @@ static void printHelp(const tchar* bin) {
         "  --divfile <パス>    出力分割点ファイルへのパス。メインファイルでのみ使用される。\n"
         "  --copy-trimavs      CM解析のみ実行時にTrim・分割点情報を入力ディレクトリにコピーする\n"))
         + AMATSUKAZECLI_HELP_NICOASS_LINE
+        + AMATSUKAZECLI_HELP_NICOJKASS_LINE
         + _T(
         "  -om|--cmoutmask <数値> 出力マスク[1]\n"
         "                      1 : 通常\n"
@@ -246,9 +248,11 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
 #if defined(_WIN32) || defined(_WIN64)
     // Windows: NicoConvASS.exe を使用
     conf.nicoConvAssPath = _T("NicoConvASS") + exeAppendix;
+    conf.nicoJKAssPath = _T("");
 #else
+    conf.nicoConvAssPath = _T("");
     // Linux: Python スクリプト nicojk_ass.py を使用
-    conf.nicoConvAssPath = _T("nicojk_ass.py");
+    conf.nicoJKAssPath = _T("nicojk_ass.py");
 #endif
     conf.muxerPath = _T("muxer") + exeAppendix;
     conf.nicoConvChSidPath = _T("ch_sid.txt");
@@ -549,7 +553,14 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
         } else if (key == _T("--copy-trimavs")) {
             conf.copyTrimAVS = true;
         } else if (key == _T("--nicoass")) {
+#if defined(_WIN32) || defined(_WIN64)
             conf.nicoConvAssPath = pathNormalize(getParam(argc, argv, i++));
+#else
+            // Linux では旧オプションも Python スクリプト指定として扱う
+            conf.nicoJKAssPath = pathNormalize(getParam(argc, argv, i++));
+#endif
+        } else if (key == _T("--nicojkass")) {
+            conf.nicoJKAssPath = pathNormalize(getParam(argc, argv, i++));
         } else if (key == _T("--nicojk18")) {
             conf.nicojk18 = true;
         } else if (key == _T("--webvtt")) {
@@ -644,9 +655,16 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
         if (conf.encoder != ENCODER_X262 || conf.format != FORMAT_TSREPLACE) {
             THROW(ArgumentException, "--mpeg2-partialにはx262とTS (replace)出力が必要です");
         }
-        if (conf.cmoutmask != (1 << CMTYPE_NONCM)
+        const int nonCmMask = 1 << CMTYPE_NONCM;
+        const int cmMask = 1 << CMTYPE_CM;
+        const int edgeTrimMask = 1 << CMTYPE_EDGE_TRIM;
+        const bool supportedOutput = conf.cmoutmask == nonCmMask
+            || conf.cmoutmask == cmMask
+            || conf.cmoutmask == (nonCmMask | cmMask)
+            || conf.cmoutmask == edgeTrimMask;
+        if (!supportedOutput
             || (!conf.chapter && conf.trimavsPath.empty())) {
-            THROW(ArgumentException, "--mpeg2-partialにはCMカット本編のみ出力が必要です");
+            THROW(ArgumentException, "--mpeg2-partialにはCM解析を伴うカット出力が必要です");
         }
         if (!conf.filterScriptPath.empty() || !conf.postFilterScriptPath.empty()
             || !conf.noDelogo || !conf.eraseLogoPath.empty()) {
@@ -735,15 +753,16 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
             conf.encoderFilterPath = search(conf.encoderFilterPath);
         }
         conf.joinLogoScpPath = search(conf.joinLogoScpPath);
-#if defined(_WIN32) || defined(_WIN64)
-        // Windows: SearchExe で NicoConvASS.exe を検索
-        conf.nicoConvAssPath = search(conf.nicoConvAssPath);
-#else
-        // Linux: Python スクリプトは SearchExe を使わず、パスを正規化するのみ
-        conf.nicoConvAssPath = pathNormalize(conf.nicoConvAssPath);
-#endif
-        // ch_sid.txt は nicojk_ass.py / NicoConvASS.exe と同じディレクトリに配置
-        conf.nicoConvChSidPath = pathGetDirectory(conf.nicoConvAssPath) + _T("/ch_sid.txt");
+        if (!conf.nicoConvAssPath.empty()) {
+            conf.nicoConvAssPath = search(conf.nicoConvAssPath);
+        }
+        if (!conf.nicoJKAssPath.empty()) {
+            conf.nicoJKAssPath = pathNormalize(conf.nicoJKAssPath);
+        }
+        // ch_sid.txt は実際に使用する変換ツールと同じディレクトリに配置
+        const auto& nicoJKToolPath = !conf.nicoJKAssPath.empty()
+            ? conf.nicoJKAssPath : conf.nicoConvAssPath;
+        conf.nicoConvChSidPath = pathGetDirectory(nicoJKToolPath) + _T("/ch_sid.txt");
         conf.mp4boxPath = search(conf.mp4boxPath);
         conf.mkvmergePath = search(conf.mkvmergePath);
         conf.muxerPath = search(conf.muxerPath);
@@ -826,54 +845,56 @@ static int amatsukazeTranscodeMain(AMTContext& ctx, const ConfigWrapper& setting
             detectAudioMain(ctx, setting);
 
         else if (mode == _T("test_print_crc"))
-            test::PrintCRCTable(ctx, setting);
+            return test::PrintCRCTable(ctx, setting);
         else if (mode == _T("test_crc"))
-            test::CheckCRC(ctx, setting);
+            return test::CheckCRC(ctx, setting);
         else if (mode == _T("test_read_bits"))
-            test::ReadBits(ctx, setting);
+            return test::ReadBits(ctx, setting);
         else if (mode == _T("test_auto_buffer"))
-            test::CheckAutoBuffer(ctx, setting);
+            return test::CheckAutoBuffer(ctx, setting);
         else if (mode == _T("test_caption_text_length"))
             return test::CaptionTextLength(ctx, setting);
         else if (mode == _T("test_verifympeg2ps"))
-            test::VerifyMpeg2Ps(ctx, setting);
+            return test::VerifyMpeg2Ps(ctx, setting);
         else if (mode == _T("test_readts"))
-            test::ReadTS(ctx, setting);
+            return test::ReadTS(ctx, setting);
         else if (mode == _T("test_aacdec"))
-            test::AacDecode(ctx, setting);
+            return test::AacDecode(ctx, setting);
         else if (mode == _T("test_wavewrite"))
-            test::WaveWriteHeader(ctx, setting);
+            return test::WaveWriteHeader(ctx, setting);
         else if (mode == _T("test_process"))
-            test::ProcessTest(ctx, setting);
+            return test::ProcessTest(ctx, setting);
         else if (mode == _T("test_streamreform"))
-            test::FileStreamInfo(ctx, setting);
+            return test::FileStreamInfo(ctx, setting);
         else if (mode == _T("test_parseargs"))
-            test::ParseArgs(ctx, setting);
+            return test::ParseArgs(ctx, setting);
         else if (mode == _T("test_logoframe"))
-            test::LogoFrameTest(ctx, setting);
+            return test::LogoFrameTest(ctx, setting);
         else if (mode == _T("test_dualmono"))
-            test::SplitDualMonoAAC(ctx, setting);
+            return test::SplitDualMonoAAC(ctx, setting);
         else if (mode == _T("test_aacdecode"))
-            test::AACDecodeTest(ctx, setting);
+            return test::AACDecodeTest(ctx, setting);
         else if (mode == _T("test_ass"))
-            test::CaptionASS(ctx, setting);
+            return test::CaptionASS(ctx, setting);
         else if (mode == _T("test_eo"))
-            test::EncoderOptionParse(ctx, setting);
+            return test::EncoderOptionParse(ctx, setting);
         else if (mode == _T("test_perf"))
-            test::DecodePerformance(ctx, setting);
+            return test::DecodePerformance(ctx, setting);
         else if (mode == _T("test_zone"))
-            test::BitrateZones(ctx, setting);
+            return test::BitrateZones(ctx, setting);
         else if (mode == _T("test_zone2"))
-            test::BitrateZonesBug(ctx, setting);
+            return test::BitrateZonesBug(ctx, setting);
         else if (mode == _T("test_vfr_input"))
             return test::VFRInputDetection(ctx, setting);
         else if (mode == _T("test_printf"))
-            test::PrintfBug(ctx, setting);
+            return test::PrintfBug(ctx, setting);
         else if (mode == _T("test_resource"))
-            test::ResourceTest(ctx, setting);
+            return test::ResourceTest(ctx, setting);
 
-        else
+        else {
             ctx.errorF(_T("--modeの指定が間違っています: %s\n"), mode.c_str());
+            return 1;
+        }
 
         return 0;
     } catch (const NoLogoException&) {

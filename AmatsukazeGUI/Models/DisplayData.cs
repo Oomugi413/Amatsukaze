@@ -1896,7 +1896,11 @@ namespace Amatsukaze.Models
 
         public bool Mpeg2PartialVisible
         {
-            get { return Data.EncoderType == EncoderType.x262 && Data.OutputMask != 1; }
+            get
+            {
+                return Data.EncoderType == EncoderType.x262
+                    && ProfileSettingExtensions.Mpeg2PartialOutputMasks.Contains(Data.OutputMask);
+            }
         }
 
         public bool Mpeg2PartialConstraintsEnabled
@@ -2574,6 +2578,10 @@ namespace Amatsukaze.Models
                 {
                     RaisePropertyChanged("OutputMask");
                 }
+                if (outputMaskChanged)
+                {
+                    UpdateMpeg2PartialAvailability();
+                }
                 RaisePropertyChanged("TsreplaceSelected");
             }
         }
@@ -2907,7 +2915,7 @@ namespace Amatsukaze.Models
         public int[] EncoderParallelList {
             get { return new int[] { 1, 2, 3, 4, 5, 6, 7, 8 }; }
         }
-        private static readonly int[] TsreplaceOutputMasks = new int[] { 1, 2, 8 };
+        private static readonly int[] TsreplaceOutputMasks = ProfileSettingExtensions.TsreplaceOutputMasks;
         public DisplayOutputMask[] OutputOptionList_ = new DisplayOutputMask[]
         {
             new DisplayOutputMask()
@@ -3865,6 +3873,20 @@ namespace Amatsukaze.Models
                 if (Model.NicoConvASSPath == value)
                     return;
                 Model.NicoConvASSPath = value;
+                RaisePropertyChanged();
+            }
+        }
+        #endregion
+
+        #region NicoJKAssPath変更通知プロパティ
+        public string NicoJKAssPath
+        {
+            get { return Model.NicoJKAssPath; }
+            set
+            {
+                if (Model.NicoJKAssPath == value)
+                    return;
+                Model.NicoJKAssPath = value;
                 RaisePropertyChanged();
             }
         }

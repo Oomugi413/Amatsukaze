@@ -21,11 +21,11 @@ jobs:
       FFMPEG_URL: https://github.com/rigaya/ffmpeg_dlls_for_hwenc/releases/download/20241102/ffmpeg_dlls_for_hwenc_20241102.7z
       DEPLIB_URL: https://github.com/rigaya/Amatsukaze/releases/download/1.0.4.6/AmatsukazeDepLibs_20260131.7z
       JOINLOGO_URL: https://github.com/yobibi/join_logo_scp/releases/download/v5.1.1/join_logo_scp_51_1.zip
-      AVSCUDA_URL: https://github.com/rigaya/AviSynthCUDAFilters/releases/download/0.7.3/AviSynthCUDAFilters_Release_0.7.3.zip
+      AVSCUDA_URL: https://github.com/rigaya/AviSynthCUDAFilters/releases/download/0.7.4/AviSynthCUDAFilters_Release_0.7.4.zip
       LSMASH_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20250907-045307/lsmash_20200404.7z
-      X264_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260905-074217/x264_3223_x64.zip
-      X265_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260905-074217/x265_4.3%2B24_x64.zip
-      SVT_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260905-074217/SvtAv1EncApp_4.2.0-107_x64_clang.zip
+      X264_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260919-084954/x264_3223_x64.zip
+      X265_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260919-084954/x265_4.3%2B45_x64.zip
+      SVT_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20260919-084954/SvtAv1EncApp_4.2.0-146_x64_clang.zip
       X262_URL: https://github.com/rigaya/AutoBuildForAviUtlPlugins/releases/download/auto-build-20250907-045307/x262_20260901.zip
       NNEDI3_URL: https://github.com/rigaya/NNEDI3/releases/download/0.00/nnedi3_0.00_x64.zip
       BASE_PKG_URL: https://github.com/rigaya/Amatsukaze/releases/download/1.0.9.0/AmatsukazeBasePkg_20260902.7z
@@ -186,11 +186,27 @@ jobs:
           if exist x64\\Release2\\*.dll copy /y x64\\Release2\\*.dll package\\exe_files
           if exist x64\\Release\\*.dll copy /y x64\\Release\\*.dll package\\exe_files
           if exist x64\\Release\\*.exe copy /y x64\\Release\\*.exe package\\exe_files
+          rem 単体テスト用の実行ファイルは配布物から除外する
+          if exist package\\exe_files\\AmatsukazeNativeTests.exe del /f /q package\\exe_files\\AmatsukazeNativeTests.exe
 
           if exist publish\\win-x64\\*.exe copy /y publish\\win-x64\\*.exe package\\exe_files
           if exist publish\\win-x64\\*.dll copy /y publish\\win-x64\\*.dll package\\exe_files
           if exist publish\\win-x64\\*.dll.config copy /y publish\\win-x64\\*.dll.config package\\exe_files
           if exist publish\\win-x64\\*.xml copy /y publish\\win-x64\\*.xml package\\exe_files
+          if exist publish\\win-x64\\nicojk_ass.py copy /y publish\\win-x64\\nicojk_ass.py package\\exe_files
+
+          rem danmaku2ass.pyは固定コミットから取得する
+          set "DANMAKU2ASS_COMMIT=ced881747670c2eb1c0dbd292c2a567f444b056a"
+          curl.exe -fL --retry 3 --retry-delay 10 -o package\\exe_files\\danmaku2ass.py "https://raw.githubusercontent.com/m13253/danmaku2ass/%DANMAKU2ASS_COMMIT%/danmaku2ass.py"
+          if errorlevel 1 (
+            echo danmaku2ass.pyの取得に失敗しました。
+            exit /b 1
+          )
+          certutil -hashfile package\\exe_files\\danmaku2ass.py SHA256 | findstr /I /C:"899526b7a8f31ab20987bdcebc543f67be9accdcec6120d20f39cfc4efa001cf" >nul
+          if errorlevel 1 (
+            echo danmaku2ass.pyのSHA-256が一致しません。
+            exit /b 1
+          )
 
           if exist package\\exe_files\\wwwroot rmdir /s /q package\\exe_files\\wwwroot
           if exist publish\\win-x64\\wwwroot robocopy publish\\win-x64\\wwwroot package\\exe_files\\wwwroot /E /NFL /NDL /NJH /NJS
@@ -210,6 +226,7 @@ jobs:
           if exist defaults\\bat_win robocopy defaults\\bat_win package\\bat /E /NFL /NDL /NJH /NJS
           if exist defaults\\profile robocopy defaults\\profile package\\profile /E /NFL /NDL /NJH /NJS
           if exist defaults\\drcs\\drcs_map.txt copy /y defaults\\drcs\\drcs_map.txt package\\exe_files
+          if exist defaults\\exe_files\\ch_sid.txt copy /y defaults\\exe_files\\ch_sid.txt package\\exe_files
           if exist defaults\\exe_files\\plugins64\\*.avsi copy /y defaults\\exe_files\\plugins64\\*.avsi package\\exe_files\\plugins64
 
           rem SCRenamePy 0.05タグの全ファイル（.gitを除外）
@@ -271,6 +288,14 @@ jobs:
           rem 廃止済みツールが配布物へ再混入していないことを保証する
           if exist package\\exe_files\\BatchHashChecker.exe (
             echo ERROR: package\\exe_files\\BatchHashChecker.exe remains in package.
+            exit /b 1
+          )
+          if not exist package\\exe_files\\nicojk_ass.py (
+            echo ERROR: package\\exe_files\\nicojk_ass.py がありません。
+            exit /b 1
+          )
+          if not exist package\\exe_files\\danmaku2ass.py (
+            echo ERROR: package\\exe_files\\danmaku2ass.py がありません。
             exit /b 1
           )
           set "PKG_NAME=Amatsukaze_${{ steps.version.outputs.version_name }}.7z"

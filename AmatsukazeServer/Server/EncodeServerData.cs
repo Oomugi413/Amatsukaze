@@ -590,6 +590,8 @@ namespace Amatsukaze.Server
         public static string[] H264DecoderList { get; } = new string[] { "デフォルト", "QSV", "CUVID" };
         public static string[] HEVCDecoderList { get; } = new string[] { "デフォルト", "QSV", "CUVID" };
         public static string[] FormatList { get; } = new string[] { "MP4", "MKV", "M2TS", "TS", "TS (replace)" };
+        public static int[] TsreplaceOutputMasks { get; } = new int[] { 1, 2, 4, 6, 8 };
+        public static int[] Mpeg2PartialOutputMasks { get; } = new int[] { 2, 4, 6, 8 };
         public static string[] SubtitleModeList { get; } = new string[] { "標準", "tsに字幕がない場合Whisperで生成", "常にWhisperで生成" };
         public static string[] WhisperModelList { get; } = new string[] { "自動", "未指定", "small", "medium", "large-v1", "large-v2", "large-v3", "large-v3-turbo" };
         public static string[] AudioEncoderList { get; } = new string[] { "NeroAAC", "qaac", "fdkaac", "opusenc" };
@@ -1144,6 +1146,8 @@ namespace Amatsukaze.Server
         [DataMember]
         public string NicoConvASSPath { get; set; }
         [DataMember]
+        public string NicoJKAssPath { get; set; }
+        [DataMember]
         public string TsMuxeRPath { get; set; }
         [DataMember]
         public string TsReplacePath { get; set; }
@@ -1460,6 +1464,13 @@ namespace Amatsukaze.Server
         [DataMember]
         public string AddQueueBat { get; set; }
 
+        /// <summary>
+        /// タスク固有の一時フォルダ。nullの場合は、タスク実行時点のグローバル設定を使用する。
+        /// 登録時点のグローバル設定をここへコピーすると、設定変更が待機中タスクへ反映されなくなるため禁止。
+        /// </summary>
+        [DataMember]
+        public string WorkPathOverride { get; set; }
+
         /// <summary>キュー追加時に各ターゲットへ付与するタグ（null の場合は空リスト）。</summary>
         [DataMember]
         public List<string> Tags { get; set; }
@@ -1579,6 +1590,13 @@ namespace Amatsukaze.Server
         [DataMember]
         public string ResumeDir { get; set; }
 
+        /// <summary>
+        /// タスク固有の一時フォルダ。nullの場合は、タスク実行時点のグローバル設定を使用する。
+        /// 登録時点のグローバル設定を保存せず、未指定の状態を維持すること。
+        /// </summary>
+        [DataMember]
+        public string WorkPathOverride { get; set; }
+
         [DataMember]
         public AutoLogoResultState AutoLogoResult { get; set; }
         [DataMember]
@@ -1608,7 +1626,16 @@ namespace Amatsukaze.Server
         public bool IsCheck { get { return Mode == ProcMode.DrcsCheck || Mode == ProcMode.CMCheck; } }
         public bool IsTest { get { return Mode == ProcMode.Test; } }
 
-        public string DirName { 
+        /// <summary>
+        /// タスク実行時に使用する一時フォルダを取得する。
+        /// WorkPathOverrideが未指定の場合は、登録時の値ではなく現在のグローバル設定を使用する。
+        /// </summary>
+        public string GetEffectiveWorkPath(Setting setting)
+        {
+            return string.IsNullOrWhiteSpace(WorkPathOverride) ? setting.WorkPath : WorkPathOverride;
+        }
+
+        public string DirName {
             get { 
                 var dir = Path.GetDirectoryName(SrcPath);
                 var delimiter = SrcPath.Contains('\\') ? '\\' : '/';
