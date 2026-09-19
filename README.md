@@ -2,7 +2,7 @@
 
 Automated MPEG2-TS Transcoder
 
-## [ダウンロードはこちら](https://github.com/rigaya/Amatsukaze/releases)
+## [ダウンロードはこちら](https://github.com/Oomugi413/Amatsukaze/releases)
 
 ## これは何？
 
