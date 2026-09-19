@@ -91,7 +91,7 @@ jobs:
         run: |
           # jobs.container は可変タグの古いイメージがrunnerに残る場合があるため、明示的にpullする。
           GHCR_OWNER=$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          docker pull ghcr.io/${{ github.repository_owner }}/amatsukaze-builder:ubuntu2404
+          docker pull ghcr.io/${GHCR_OWNER}/amatsukaze-builder:ubuntu2404
           # wasm-tools が無いとWebUIが最適化なしで発行され、静かにサイズが増える。
           # ベースイメージ側で入れているので、無い場合はイメージが古い。
           if ! docker run --rm \
