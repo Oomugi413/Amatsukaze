@@ -88,18 +88,6 @@ if [ "${BUILD_DOTNET}" = "true" ] && [ "${DEPS_ONLY}" = "false" ]; then
     fi
 fi
 
-# Linux GUIはOSのPython、PyGObject、GTK 4を使用するため、ビルド時には
-# GUI固有の構文検査とGTK非依存テストだけを実行する。
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "python3 コマンドが見つかりません。AmatsukazeLinuxGUIの実行依存を確認してください。"
-    exit 1
-fi
-(
-    cd "${PROJECT_ROOT}" || exit 1
-    python3 -m compileall -q "${PROJECT_ROOT}/AmatsukazeLinuxGUI" || exit 1
-    python3 -m unittest discover -q "${PROJECT_ROOT}/AmatsukazeLinuxGUI/Tests" || exit 1
-) || exit 1
-
 # buildディレクトリがない場合は作成
 if [ ! -d "${BUILD_DIR}" ]; then
     mkdir -p "${BUILD_DIR}"
@@ -116,6 +104,19 @@ if [ "${DEPS_ONLY}" = "true" ]; then
     "${SCRIPT_DIR}/build_dep.sh" "${INSTALL_DIR}"
     exit 0
 fi
+
+# Linux GUIはOSのPython、PyGObject、GTK 4を使用するため、通常のビルド時には
+# GUI固有の構文検査とGTK非依存テストだけを実行する。
+# --deps-only ではソースが読み取り専用でマウントされる場合があるため実行しない。
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 コマンドが見つかりません。AmatsukazeLinuxGUIの実行依存を確認してください。"
+    exit 1
+fi
+(
+    cd "${PROJECT_ROOT}" || exit 1
+    python3 -m compileall -q "${PROJECT_ROOT}/AmatsukazeLinuxGUI" || exit 1
+    python3 -m unittest discover -q "${PROJECT_ROOT}/AmatsukazeLinuxGUI/Tests" || exit 1
+) || exit 1
 
 # CPUアーキテクチャの判定 (7-Zip の取得と .NET の publish の双方で使用する)
 SEVENZIP_VER="26.02"
