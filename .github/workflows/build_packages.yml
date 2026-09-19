@@ -36,7 +36,7 @@ jobs:
           GHCR_OWNER=$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           docker pull ghcr.io/${GHCR_OWNER}/amatsukaze-builder:ubuntu2004 || true
           docker build \
-            --build-arg GHCR_OWNER=${{ github.repository_owner }} \
+            --build-arg GHCR_OWNER="${GHCR_OWNER}" \
             --tag build_amatsukaze_native \
             --file docker/docker_ubuntu2004 ./
           docker run -dit --rm \
