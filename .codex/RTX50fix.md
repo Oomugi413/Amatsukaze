@@ -3,9 +3,9 @@
 - Codex session ID: `019f86fb-e9f2-79a2-bd81-49f5c7d89220`
 - 対象リポジトリ: `/home/oomugi413/git/Amatsukaze`
 - 対象ファイル: `docker/Dockerfile`
-- NVEncCバージョン: `9.25.1`
+- NVEncCバージョン: `9.35`
 - NVEncC取得元: `https://github.com/Oomugi413/NVEnc`
-- CUDAバージョン: `13.3`
+- CUDAバージョン: `12.9`
 
 ## 問題の概要
 
@@ -17,10 +17,10 @@
 
 RTX50fixコミット`f03fb6e`で追加したNVEncC専用ビルドステージと関連処理は、すべて削除した。
 
-現在のDockerfileは、RTX50fix以前と同じdebパッケージのインストール方式を使用し、NVEncCのバージョンと取得元を次のように変更している。
+現在のDockerfileは、Oomugi413版NVEncCのdebパッケージをインストールする方式を使用し、NVEncCのバージョンと取得元を次のように指定している。
 
 ```dockerfile
-ENV NVENCC_VER=9.25.1
+ARG NVENCC_VER=9.35
 
 RUN wget https://github.com/Oomugi413/NVEnc/releases/download/${NVENCC_VER}/nvencc_${NVENCC_VER}_${ARCH}.deb -O nvencc.deb \
     && apt-get install -y ./nvencc.deb \
@@ -29,56 +29,34 @@ RUN wget https://github.com/Oomugi413/NVEnc/releases/download/${NVENCC_VER}/nven
 
 使用するリリースは次のとおり。
 
-- `https://github.com/Oomugi413/NVEnc/releases/tag/9.25.1`
-- パッケージ: `nvencc_9.25.1_amd64.deb`
-- SHA-256: `f941b7e026e95d76ecf1d1058e282a983173bd45dad3a225c470f7b0dda945ba`
+- `https://github.com/Oomugi413/NVEnc/releases/tag/9.35`
+- パッケージ: `nvencc_9.35_amd64.deb`（x86_64の場合）
 
 ## CUDA実行環境
 
-NVEncC 9.25.1はNVENC API 13.0およびCUDA 13.3でビルドされているため、DockerのruntimeとNVRTC/NPPも同じ世代へ統一した。
+Dockerの実行環境はUbuntu 24.04 / CUDA 12.9に統一している。Blackwell対応はOomugi413版NVEncCで行い、実行環境にはCUDA 12.9のNVRTC/NPPを使用する。
 
 ```dockerfile
-FROM nvidia/cuda:13.3.0-base-ubuntu24.04 AS runtime
+FROM nvidia/cuda:12.9.2-runtime-ubuntu24.04
 ```
 
-導入するCUDAパッケージは次のとおり。
+このruntimeイメージには必要なNVRTC/NPPが含まれる。ベースイメージまたはNVEncCを更新するときは、NVRTC/NPPとNVEncCのビルド時CUDAのバージョンの組み合わせに留意し、`nvencc --check-environment`と実エンコードで確認する。
 
-```text
-cuda-nvrtc-13-3
-cuda-nvrtc-dev-13-3
-libnpp-13-3
-```
+確認したCUDA 12.9 runtimeのパッケージは次のとおり。
 
-確認した実際のパッケージバージョンは次のとおり。
-
-- `cuda-nvrtc-13-3`: `13.3.33-1`
-- `cuda-nvrtc-dev-13-3`: `13.3.33-1`
-- `libnpp-13-3`: `13.1.2.81-1`
-
-ホスト環境はNVIDIAドライバー`610.43.02`、CUDA UMD 13.3であり、コンテナのCUDA 13.3と整合している。
+- `cuda-nvrtc-12-9`: `12.9.86-1`
+- `libnpp-12-9`: `12.4.1.87-1`
 
 ## 検証結果
 
-次のコマンドでDockerイメージをビルドした。
+現行Dockerfileでは次の確認を行った。
 
 ```bash
-cd /home/oomugi413/git/Amatsukaze/docker
-docker compose build
+docker buildx build --check -f docker/Dockerfile docker
+docker buildx build --target libplacebo-builder -f docker/Dockerfile docker
 ```
 
-ビルドは終了コード0で成功した。
-
-- 生成イメージ: `amatsukaze`
-- イメージID: `sha256:72531eabe0bcb600941b40fd3aeafb995f33c596488609d681e8f99064a19933`
-- NVEncC: `9.25.1 (r3933)`
-- NVENC API: `13.0`
-- CUDA: `13.3`
-
-Amatsukazeと同じY4M入力経路でH.264エンコードを実行し、120フレームすべてを終了コード0で処理した。
-
-さらにNVRTCを使用する`--vpp-colorspace`を有効にしたテストでも、120フレームすべてを終了コード0で処理した。これにより、NVENCによるエンコードとCUDA 13.3のNVRTCフィルターがコンテナ内で動作することを確認した。
-
-なお、TSをNVEncCへ直接渡して`--frames 300`で打ち切るテストでは、273フレーム処理後にNVDEC終了エラーとなった。これはNVDECを使用する直接入力の打ち切り終了経路で発生したもので、Amatsukazeが使用するY4M入力経路では正常に完走している。
+Dockerfileの静的検査は警告なしで、Vulkan対応libplacebo 7.360.1のビルドステージも成功した。CUDA 12.9 runtimeにNVRTC/NPPが含まれることも確認した。NVEncCやCUDAの更新時は、実使用の想定されるCUDA/Nvidia Linux Open Driverとのバージョン相性を再確認する。
 
 ## 新しいイメージへの切り替え
 

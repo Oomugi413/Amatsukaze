@@ -90,12 +90,13 @@ sudo apt install intel-media-va-driver-non-free intel-opencl-icd libmfx1 libmfx-
 コンテナ外で唯一必要になるAmatsukazeAddTaskを(コンテナ外に)準備します。
 
 ```sh
-  UBUNTU_VERSION=24.04
   # /usr/local/bin/にインストールする例
   mkdir -p /tmp/Amatsukaze \
-    && curl -s https://api.github.com/repos/Oomugi413/Amatsukaze/releases/latest \
-        | grep "browser_download_url.*tar.xz" | grep "Ubuntu${UBUNTU_VERSION}" | cut -d : -f 2,3 | tr -d \" \
-        | wget -i - -O - | tar -xJ -C /tmp/Amatsukaze \
+    && ARCHIVE_URL=$(curl -fsSL https://api.github.com/repos/Oomugi413/Amatsukaze/releases/latest \
+        | sed -n 's/.*"browser_download_url":[[:space:]]*"\([^"]*\.tar\.xz\)".*/\1/p' \
+        | grep 'Amatsukaze_linux_.*_x64\.tar\.xz' | head -1) \
+    && test -n "$ARCHIVE_URL" \
+    && curl -fL --retry 3 "$ARCHIVE_URL" | tar -xJ -C /tmp/Amatsukaze \
     && sudo install /tmp/Amatsukaze/exe_files/AmatsukazeAddTask /usr/local/bin/ \
     && rm -rf /tmp/Amatsukaze
 ```
@@ -103,53 +104,23 @@ sudo apt install intel-media-va-driver-non-free intel-opencl-icd libmfx1 libmfx-
 ## コンテナ作成用のディレクトリ構築
 
 ```sh
-git clone --recursive https://github.com/Oomugi413/Amatsukaze.git
+git clone https://github.com/Oomugi413/Amatsukaze.git
 cd Amatsukaze/docker
-
-# デフォルト設定のコピーと、bind mount用ディレクトリの作成
+# ディレクトリ構成の作成
 ./setup.sh
-
-# 必要に応じてRUN_UID、RUN_GID、volumes、devices、deployを調整
+# Amatsukazeを実行するユーザーIDとグループIDをRUN_UIDとRUN_GIDで指定
+# 必要に応じて volumes のマウント対象等を調整
+# また、環境に応じて devices や deploy を調整
 vi compose.yml
 ```
 
-このDockerfileはGitHub Releases APIから配布パッケージを取得せず、cloneしたローカル作業ツリーをソースとして
-AmatsukazeCLI、共有ライブラリ、サーバー、WebUIをビルドします。コミット前のローカル変更もビルド対象に含まれます。
-
-リポジトリルートがDockerのbuild contextになるため、`compose.yml` のbuild設定は次のまま使用してください。
-
-```yaml
-build:
-  context: ..
-  dockerfile: docker/Dockerfile
-```
-
-初回ビルドではFFmpeg、.NET WebAssembly workload、各種AviSynthプラグインなども構築するため、時間と空き容量が必要です。
-ビルド中はGitHub、Ubuntu、NuGetなどへのインターネット接続も必要です。依存ライブラリはDockerレイヤーに分離されるため、
-通常のソース変更後はAmatsukaze本体を中心に再ビルドされます。
+このDockerfileはUbuntu 24.04およびCUDA 12.9を使用し、Oomugi413版NVEncCとVulkan対応libplaceboを組み込みます。
+Amatsukaze本体は、Oomugi413版の最新リリースまたは`AMATSUKAZE_ARCHIVE`で指定した配布アーカイブから展開します。
 
 ## 起動
 
 ```sh
-# cloneしたローカルソースからイメージをビルド
-docker compose build
-
-# コンテナを作成・起動
 docker compose up -d
-```
-
-ソース変更を反映する場合は、エンコード中のタスクがないことを確認してから再ビルド・再作成します。
-
-```sh
-docker compose build
-docker compose up -d --force-recreate
-```
-
-依存ライブラリのバージョンやビルド手順を変更し、キャッシュを使わず完全に作り直す場合は次を実行します。
-
-```sh
-docker compose build --no-cache
-docker compose up -d --force-recreate
 ```
 
 ## 接続方法
@@ -198,14 +169,14 @@ AmatsukazeAddTask -ip <コンテナを実行中のPCのIPアドレス> -s <プ�
 GDK_BACKEND=wayland /path/to/AmatsukazeLinuxGUI.sh
 ```
 
-同一ホスト上のAmatsukaze Linux GUIから追加する場合は、GUIとServerCLIが同じ絶対パスを参照できるようにしてください。例えばホストの `/mnt` をコンテナーの `/mnt` へそのままbind mountします。
+同一ホスト上のAmatsukaze Linux GUIからタスクを追加する場合は、GUIとコンテナー内のServerCLIが同じ絶対パスを参照できるようにしてください。例えば、`compose.yml`の`volumes`へ次の設定を追加し、ホストの`/mnt`をコンテナーの`/mnt`へそのままbind mountします。
 
 ```yaml
 volumes:
   - /mnt:/mnt
 ```
 
-この構成ではGUIから `/mnt/recording/example.ts` を指定すると、コンテナー内ServerCLIも同じ `/mnt/recording/example.ts` を参照できます。GUIはコンテナーの操作やDockerソケットを必要とせず、RESTポート32769へ接続するだけです。入力・出力ディレクトリの権限は、`RUN_UID` / `RUN_GID` で指定したコンテナー実行ユーザーに合わせてください。
+この構成ではGUIから`/mnt/recording/example.ts`を指定すると、コンテナー内のServerCLIも同じパスを参照できます。GUIはDockerソケットを必要とせず、RESTポート32769へ接続します。入力・出力ディレクトリの権限は、`RUN_UID`と`RUN_GID`で指定したコンテナー実行ユーザーに合わせてください。
 
 ## 設定
 
@@ -240,7 +211,19 @@ docker compose down
 ```sh
 # 更新
 git pull
-docker compose build --pull
+docker compose build --pull --build-arg AMATSUKAZE_CACHE_BUST=$(date +%s)
 # 最新のイメージを元に起動
 docker compose up -d
 ```
+
+### デバッグ
+
+リリース前のローカルアーカイブを使ってDockerイメージをビルドする場合は、アーカイブを`docker`ディレクトリに置き、`AMATSUKAZE_ARCHIVE`でファイル名を指定します。
+
+```sh
+docker build \
+  --build-arg AMATSUKAZE_ARCHIVE=Amatsukaze_linux_trial_x64.tar.xz \
+  -t amatsukaze .
+```
+
+`AMATSUKAZE_ARCHIVE`を指定しない場合は、最新リリースのアーカイブを自動的に取得します。

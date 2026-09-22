@@ -20,11 +20,17 @@ RTX 5070 Ti（compute capability 12.0 / `sm_120`）で Amatsukaze から NVEncC 
 - エンコーダ停止を検出するタイムアウトの有無
 - CUDA JIT キャッシュの設定と永続化状況
 
+## 現在の構成（2026-09-22）
+
+現在の`docker/Dockerfile`はUbuntu 24.04 / CUDA 12.9.2 runtimeを使用し、Oomugi413版NVEncC 9.35を導入する。NVRTC/NPPはruntimeイメージに含まれるCUDA 12.9系を使用する。
+
+Blackwell対応の成否はベースイメージのCUDAバージョンだけでは決まらない。NVEncCを更新するときは、配布バイナリのビルド時CUDA、cubin/PTXの対象アーキテクチャ、および実行時NVRTC/NPPのバージョンの組み合わせに留意すること。
+
 ## 結論
 
 Amatsukaze でも、Blackwell GPU 上で NVEncC の PTX JIT による起動停止が発生するリスクがある。
 
-現在の Dockerfile が導入する NVEncC 9.13 の公式 Debian バイナリは CUDA 11.2 でビルドされ、ネイティブ cubin の上限が `sm_86` である。RTX 5070 Ti の `sm_120` に対応する cubin を持たないため、実行時に `compute_86` PTX から `sm_120` 用 cubin を JIT コンパイルする必要がある。
+調査時のDockerfileが導入していたNVEncC 9.13の公式DebianバイナリはCUDA 11.2でビルドされ、ネイティブcubinの上限が`sm_86`であった。RTX 5070 Tiの`sm_120`に対応するcubinを持たないため、実行時に`compute_86` PTXから`sm_120`用cubinをJITコンパイルする必要があった。
 
 NVEncC が JIT 中に stdin を消費しない場合、Amatsukaze の Y4M パイプ書き込みがブロックし、上流のフレームバッファも満杯になる。その結果、エンコードジョブ全体が長時間停止して見える。
 
@@ -32,9 +38,9 @@ Amatsukaze にはエンコーダの無進捗を短時間で異常終了させる
 
 ## NVEncC バイナリの調査結果
 
-### 現行 Dockerfile
+### 調査時の Dockerfile
 
-`docker/Dockerfile` は実行段階のベースイメージとして CUDA 12.8.1 を使用している。
+調査時の`docker/Dockerfile`は実行段階のベースイメージとしてCUDA 12.8.1を使用していた。
 
 ```dockerfile
 FROM nvidia/cuda:12.8.1-base-ubuntu24.04 AS runtime
@@ -78,19 +84,6 @@ RTX 5070 Ti は `sm_120` であるため、このバイナリには直接実行�
 また、Dockerfile で CUDA 12.5 の NVRTC / NPP ランタイムを導入しても、NVEncC 本体に埋め込まれた `.nv_fatbin` の内容は変化しない。
 
 したがって、実行環境の CUDA ランタイム世代だけでは本問題を回避できない。NVEncC 自体を CUDA 12.8 以上でビルドし、バイナリへ `sm_120` cubin を含める必要がある。
-
-### その他の Dockerfile
-
-`docker/Dockerfile_2` は NVEncC 9.20 を CUDA 11.8 環境でソースビルドする。
-
-```dockerfile
-ENV NVENCC_VER=9.20
-ENV NVENC_SOURCE_REF=9.20
-```
-
-CUDA 11.8 は `sm_120` cubinを生成できないため、この構成にも同じ根本リスクがある。
-
-`docker/Dockerfile_1` と `docker/Dockerfile_original` も NVEncC 9.20 の公式 Debian パッケージを取得する構成であり、使用時には実際のバイナリのビルド時 CUDA バージョンと cubin 上限を確認する必要がある。
 
 ### 手動 Linux インストール
 
@@ -220,8 +213,8 @@ await Task.WhenAll(
 
 | 使用構成 | 判定 | 理由 |
 |---|---|---|
-| 現行 Dockerfile の NVEncC 9.13 | 該当 | CUDA 11.2、ネイティブ上限 `sm_86` |
-| Dockerfile_2 の NVEncC 9.20 | 該当 | CUDA 11.8 ビルド、`sm_120` を生成不可 |
+| 調査時のDockerfileのNVEncC 9.13 | 該当 | CUDA 11.2、ネイティブ上限`sm_86` |
+| 現行DockerfileのOomugi413版NVEncC 9.35 | 更新時に確認 | ビルド時CUDA、cubin/PTX構成、実行時NVRTC/NPPの組み合わせを確認する |
 | 最新公式 Debian NVEncC 9.25 | 該当 | CUDA 11.2、ネイティブ上限 `sm_86` |
 | 手動導入した NVEncC | 条件付き | 使用バイナリのビルド CUDA と cubin 構成による |
 | Windows版 NVEncC | 条件付き | 使用バイナリのビルド CUDA と cubin 構成による |

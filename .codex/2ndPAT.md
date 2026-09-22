@@ -11,6 +11,8 @@
 - Composeのbuild contextをリポジトリルートに変更し、`.dockerignore`と`docker/readme.md`を追加・更新した。依存ビルドはDockerレイヤーへ分離してキャッシュする。
 - runtime依存導入前に`install.sh`を実行していたため、`QPClip`を提供する`KFM.so`など6本のCUDAプラグインリンクが欠落していた。runtime側で再実行し、全必須プラグインの存在確認をビルド条件に追加した。
 
+> 現在の`docker/Dockerfile`はrigaya版の配布アーカイブ利用を中心とする構成へ戻しており、リポジトリルートをbuild contextにしてローカルソースをビルドする方式は採用していない。この節は当時の変更記録として残す。
+
 ## 確認結果
 
 - 対象TSで、最初のPATではサービス343がなく、別位置のPATで検出後にTS解析が継続することをログで確認した。

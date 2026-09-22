@@ -53,9 +53,6 @@ build/
 /docker/*
 !/docker/base/
 !/docker/Dockerfile
-!/docker/Dockerfile_1
-!/docker/Dockerfile_2
-!/docker/Dockerfile_original
 !/docker/Dockerfile_ubuntu2404
 !/docker/compose.sample.yml
 !/docker/compose.yml

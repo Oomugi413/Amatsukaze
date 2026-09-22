@@ -76,16 +76,17 @@ failed to initialize file reader(s).
 
 ### 対処
 
-`docker/Dockerfile` と `docker/compose.yml` を `docker/compose.yml` 使用前提で修正した。
+`docker/Dockerfile`とDocker Composeの実行設定を修正した。現在の構成は次のとおり。
 
 主な修正:
 
-- runtime に `libvulkan1`, `vulkan-tools`, `libplacebo-dev` を追加。
-- `cuda-nvrtc-12-5`, `cuda-nvrtc-dev-12-5`, `libnpp-12-5` を追加。
+- Ubuntu 24.04 / CUDA 12.9.2 runtimeを使用。
+- runtimeイメージに含まれるCUDA 12.9系NVRTC/NPPを使用。更新時はNVEncCとのバージョンの組み合わせに留意する。
+- Vulkan対応libplacebo 7.360.1を専用ステージでビルドしてruntimeへ配置。
+- runtimeに`libvulkan1`、`vulkan-tools`などの実行時依存を追加。
 - `NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics` を設定。
 - `VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_egl_icd.json` を設定。
 - `libEGL_nvidia.so.0` 参照の Vulkan ICD JSON を作成。
-- `libnvrtc.so` / `libnvrtc-builtins.so` の symlink fallback を追加。
 
 検証:
 
