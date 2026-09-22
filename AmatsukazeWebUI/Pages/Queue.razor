@@ -399,8 +399,18 @@ else
 
 @if (_showAddDialog)
 {
-    <div class="modal-overlay" @onclick="CloseAddDialog">
-        <div class="modal-body" @onclick:stopPropagation="true">
+    <div class="modal-overlay"
+         @onclick="OnAddDialogOverlayClick"
+         @onpointerdown="OnAddDialogOverlayPointerDown"
+         @onpointercancel="OnAddDialogPointerCancel">
+        <div class="modal-body"
+             @onclick:stopPropagation="true"
+             @onpointerdown="OnAddDialogBodyPointerDown"
+             @onpointerdown:stopPropagation="true"
+             @onpointerup="OnAddDialogBodyPointerUp"
+             @onpointerup:stopPropagation="true"
+             @onpointercancel="OnAddDialogPointerCancel"
+             @onpointercancel:stopPropagation="true">
             <h4>キュー追加</h4>
             @if (!string.IsNullOrEmpty(_addError))
             {
@@ -496,7 +506,7 @@ else
     private bool _contextMenuVisible;
     private double _contextMenuX;
     private double _contextMenuY;
-    private const double ContextMenuHeight = 260;
+    private const double ContextMenuHeight = 400;
     private const double ContextMenuMargin = 8;
     private int _dropIndex = -1;
     private bool _isDragging;
@@ -515,6 +525,7 @@ else
     private readonly List<FinishActionOptionView> _finishActionOptions = new();
     private string _finishAction = "";
     private bool _showAddDialog;
+    private bool _addDialogPointerDownInside;
     private string? _addError;
     private bool _adding;
     private string _addSrcPath = "";
@@ -1122,6 +1133,51 @@ else
     {
         _showAddDialog = false;
         _addError = null;
+        _addDialogPointerDownInside = false;
+    }
+
+    private void OnAddDialogOverlayPointerDown(PointerEventArgs e)
+    {
+        if (e.IsPrimary)
+        {
+            _addDialogPointerDownInside = false;
+        }
+    }
+
+    private void OnAddDialogBodyPointerDown(PointerEventArgs e)
+    {
+        if (e.IsPrimary)
+        {
+            _addDialogPointerDownInside = true;
+        }
+    }
+
+    private void OnAddDialogBodyPointerUp(PointerEventArgs e)
+    {
+        if (e.IsPrimary)
+        {
+            _addDialogPointerDownInside = false;
+        }
+    }
+
+    private void OnAddDialogPointerCancel(PointerEventArgs e)
+    {
+        if (e.IsPrimary)
+        {
+            _addDialogPointerDownInside = false;
+        }
+    }
+
+    private void OnAddDialogOverlayClick()
+    {
+        // Chromeでは、ダイアログ内から外へドラッグした後のclickが背景を対象にすることがある。
+        // ダイアログ内から始まった操作では、誤ってダイアログを閉じない。
+        if (_addDialogPointerDownInside)
+        {
+            _addDialogPointerDownInside = false;
+            return;
+        }
+        CloseAddDialog();
     }
 
     private async Task EnsureAddDialogDataAsync()
