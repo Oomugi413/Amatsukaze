@@ -38,12 +38,15 @@ jobs:
           fi
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: Set lowercase GHCR owner
+        run: echo "GHCR_OWNER=$(printf '%s' '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
       - name: Pull build image
-        run: docker pull "ghcr.io/${{ github.repository_owner }}/amatsukaze-builder:ubuntu2004"
+        run: docker pull "ghcr.io/${GHCR_OWNER}/amatsukaze-builder:ubuntu2004"
 
       - name: Check BasePkg build tools
         run: |
-          docker run --rm "ghcr.io/${{ github.repository_owner }}/amatsukaze-builder:ubuntu2004" \
+          docker run --rm "ghcr.io/${GHCR_OWNER}/amatsukaze-builder:ubuntu2004" \
             bash -ec 'command -v patchelf; command -v rake; command -v xsltproc' || {
               echo 'BaseImage が古いため、build_base_image.yml で ubuntu2004 を更新してください。' >&2
               exit 1
@@ -58,7 +61,7 @@ jobs:
           docker run --rm \
             -v "${{ github.workspace }}:/work" \
             -w /work \
-            "ghcr.io/${{ github.repository_owner }}/amatsukaze-builder:ubuntu2004" \
+            "ghcr.io/${GHCR_OWNER}/amatsukaze-builder:ubuntu2004" \
             bash ./scripts/build_dep_tools.sh \
               --work-dir /work/build_tmp/dep_tools \
               --output-dir /work/artifacts/basepkg \

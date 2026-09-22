@@ -53,6 +53,7 @@ jobs:
           BASEPKG_VERSION: ${{ inputs.basepkg_version }}
         run: |
           set -euo pipefail
+          GHCR_OWNER=$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           mapfile -t source_archives < <(find parts/source -type f -name 'Amatsukaze_linux_*_x64.tar.xz')
           (( ${#source_archives[@]} == 1 )) || { echo '通常パッケージのアーカイブが1件ではありません' >&2; exit 1; }
           basepkg_archive="parts/basepkg/Amatsukaze_Linux_BasePkg_${BASEPKG_VERSION}_x64.tar.xz"
@@ -62,11 +63,11 @@ jobs:
           tar -xf "$basepkg_archive" -C pkg
           grep -Fq "\"version\":\"${BASEPKG_VERSION}\"" pkg/basepkg-manifest.json
           grep -Fq '"complete":true' pkg/basepkg-manifest.json
-          docker pull "ghcr.io/${{ github.repository_owner }}/amatsukaze-builder:ubuntu2004"
+          docker pull "ghcr.io/${GHCR_OWNER}/amatsukaze-builder:ubuntu2004"
           docker run --rm \
             -v "${{ github.workspace }}:/work" \
             -w /work \
-            "ghcr.io/${{ github.repository_owner }}/amatsukaze-builder:ubuntu2004" \
+            "ghcr.io/${GHCR_OWNER}/amatsukaze-builder:ubuntu2004" \
             bash ./scripts/build_dep_tools.sh \
               --assets-only \
               --package-dir /work/pkg \

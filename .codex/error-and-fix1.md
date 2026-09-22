@@ -106,7 +106,7 @@ nvrtc      : yes
 
 ### 症状
 
-`/home/oomugi413/git/Amatsukaze/.codex/error4.txt` で確認した失敗。
+[error4.txt](logs/error4.txt)で確認した失敗。
 
 ```text
 colorspace: --vpp-colorspace requires "libnvrtc.so", not available on your system.
@@ -143,7 +143,7 @@ NVEncC の `--vpp-colorspace` は NVRTC を要求する。Docker 側でも NVRTC
 
 ### 症状
 
-`/home/oomugi413/git/Amatsukaze/.codex/error3.txt` および `error5.txt` で確認。
+[error3.txt](logs/error3.txt)で確認。
 
 ```text
 AMT [error] Avisynthフィルタでエラーが発生: not supported conversion.

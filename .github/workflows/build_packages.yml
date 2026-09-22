@@ -165,6 +165,7 @@ jobs:
         id: create_pkg
         run: |
           set -euo pipefail
+          GHCR_OWNER=$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           # 2つの成果物は内容が重ならないので、同じツリーに重ねるだけでよい
           mkdir -p pkg
           tar -xf parts/native.tar -C pkg
@@ -172,11 +173,11 @@ jobs:
           basepkg_archive="parts/basepkg/Amatsukaze_Linux_BasePkg_20260920_2_x64.tar.xz"
           test -s "$basepkg_archive"
           tar -xf "$basepkg_archive" -C pkg
-          docker pull "ghcr.io/${{ github.repository_owner }}/amatsukaze-builder:ubuntu2004"
+          docker pull "ghcr.io/${GHCR_OWNER}/amatsukaze-builder:ubuntu2004"
           docker run --rm \
             -v "${{ github.workspace }}:/work" \
             -w /work \
-            "ghcr.io/${{ github.repository_owner }}/amatsukaze-builder:ubuntu2004" \
+            "ghcr.io/${GHCR_OWNER}/amatsukaze-builder:ubuntu2004" \
             bash ./scripts/build_dep_tools.sh \
               --assets-only \
               --package-dir /work/pkg \
