@@ -92,7 +92,7 @@ sudo apt install intel-media-va-driver-non-free intel-opencl-icd libmfx1 libmfx-
 ```sh
   # /usr/local/bin/にインストールする例
   mkdir -p /tmp/Amatsukaze \
-    && ARCHIVE_URL=$(curl -fsSL https://api.github.com/repos/rigaya/Amatsukaze/releases/latest \
+    && ARCHIVE_URL=$(curl -fsSL https://api.github.com/repos/Oomugi413/Amatsukaze/releases/latest \
         | sed -n 's/.*"browser_download_url":[[:space:]]*"\([^"]*\.tar\.xz\)".*/\1/p' \
         | grep 'Amatsukaze_linux_.*_x64\.tar\.xz' | head -1) \
     && test -n "$ARCHIVE_URL" \
@@ -104,7 +104,7 @@ sudo apt install intel-media-va-driver-non-free intel-opencl-icd libmfx1 libmfx-
 ## コンテナ作成用のディレクトリ構築
 
 ```sh
-git clone https://github.com/rigaya/Amatsukaze.git
+git clone https://github.com/Oomugi413/Amatsukaze.git
 cd Amatsukaze/docker
 # ディレクトリ構成の作成
 ./setup.sh
@@ -113,6 +113,9 @@ cd Amatsukaze/docker
 # また、環境に応じて devices や deploy を調整
 vi compose.yml
 ```
+
+このDockerfileはUbuntu 24.04およびCUDA 12.9を使用し、Oomugi413版NVEncCとVulkan対応libplaceboを組み込みます。
+Amatsukaze本体は、Oomugi413版の最新リリースまたは`AMATSUKAZE_ARCHIVE`で指定した配布アーカイブから展開します。
 
 ## 起動
 
@@ -157,6 +160,23 @@ Windowsから ```AmatsukazeClient.bat``` を実行して接続します。
 #  (コンテナ外) ./output -> (コンテナ内) /app/output
 AmatsukazeAddTask -ip <コンテナを実行中のPCのIPアドレス> -s <プロファイル名> -o /app/output -f /app/input/<入力tsファイル名>
 ```
+
+### Linuxからの接続 (AmatsukazeLinuxGUI)
+
+インストール先にLinux GUIが含まれる場合は、ServerCLIを起動した状態で次のように起動できます。
+
+```sh
+GDK_BACKEND=wayland /path/to/AmatsukazeLinuxGUI.sh
+```
+
+同一ホスト上のAmatsukaze Linux GUIからタスクを追加する場合は、GUIとコンテナー内のServerCLIが同じ絶対パスを参照できるようにしてください。例えば、`compose.yml`の`volumes`へ次の設定を追加し、ホストの`/mnt`をコンテナーの`/mnt`へそのままbind mountします。
+
+```yaml
+volumes:
+  - /mnt:/mnt
+```
+
+この構成ではGUIから`/mnt/recording/example.ts`を指定すると、コンテナー内のServerCLIも同じパスを参照できます。GUIはDockerソケットを必要とせず、RESTポート32769へ接続します。入力・出力ディレクトリの権限は、`RUN_UID`と`RUN_GID`で指定したコンテナー実行ユーザーに合わせてください。
 
 ## 設定
 
