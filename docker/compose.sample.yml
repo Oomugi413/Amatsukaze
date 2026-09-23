@@ -3,8 +3,7 @@ services:
         image: amatsukaze
         container_name: amatsukaze
         build:
-          # Dockerfileと任意の配布アーカイブを含むdockerディレクトリを渡す
-          context: .
+          context: ./
           dockerfile: Dockerfile
           args:
             ENABLE_FASTER_WHISPER: "0"  # Faster-Whisper-XXLを含める場合は "1" に変更
