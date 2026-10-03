@@ -735,6 +735,20 @@ else
                     </label>
                 </td>
             </tr>
+            @if (!GetBoolValue("EnableAudioEncode") && !IsTsreplaceFormat())
+            {
+                <tr title="音声をエンコードする / tsreplace出力では無効です">
+                    <th>音声フォーマット変更</th>
+                    <td>
+                        <select @onchange="@(e => OnIntChanged(e, "AudioFormatChangeMode"))" title="@_options?.AudioFormatChangeModeToolTip">
+                            @foreach (var item in GetAudioFormatChangeModeOptions())
+                            {
+                                <option value="@item.Value" selected="@item.Selected">@item.Label</option>
+                            }
+                        </select>
+                    </td>
+                </tr>
+            }
             @if (GetBoolValue("EnableAudioEncode"))
             {
                 <tr>
@@ -793,14 +807,6 @@ else
                             <label class="settings-check">
                                 <input type="checkbox" checked="@GetBoolValue("NicoJKLog")" @onchange="@(e => OnBoolChanged(e, "NicoJKLog"))" />
                                 NicoJKログから優先的にコメントを取得する
-                            </label>
-                        </td>
-                    </tr>
-                    <tr class="profile-check-row">
-                        <td colspan="2">
-                            <label class="settings-check">
-                                <input type="checkbox" checked="@GetBoolValue("NicoJK18")" @onchange="@(e => OnBoolChanged(e, "NicoJK18"))" />
-                                NicoJK18サーバからコメントを取得する（推奨）
                             </label>
                         </td>
                     </tr>
@@ -2292,6 +2298,32 @@ else
         return string.Equals(current, name, StringComparison.OrdinalIgnoreCase);
     }
 
+    private int GetAudioFormatChangeMode()
+    {
+        var value = GetIntValue("AudioFormatChangeMode");
+        return value is >= 0 and <= 2 ? value : 0;
+    }
+
+    // 保存値はモード値のまま、サーバが指定する表示順で並べる。
+    private IEnumerable<(string Value, string Label, bool Selected)> GetAudioFormatChangeModeOptions()
+    {
+        var list = _options?.AudioFormatChangeModeList;
+        if (list == null)
+        {
+            yield break;
+        }
+        var selected = GetAudioFormatChangeMode();
+        var order = _options?.AudioFormatChangeModeDisplayOrder ?? Enumerable.Range(0, list.Count).ToList();
+        foreach (var mode in order)
+        {
+            if (mode < 0 || mode >= list.Count)
+            {
+                continue;
+            }
+            yield return (mode.ToString(), list[mode], mode == selected);
+        }
+    }
+
     private int GetAudioEncoderIndex()
     {
         var node = GetNode("AudioEncoderType");
@@ -2415,6 +2447,8 @@ else
             case "ForceSARWidth":
             case "ForceSARHeight":
                 return Math.Max(1, value);
+            case "AudioFormatChangeMode":
+                return value is >= 0 and <= 2 ? value : 0;
             case "AudioBitrateInKbps":
                 return Math.Max(1, value);
             case "PmtCutHeadRate":

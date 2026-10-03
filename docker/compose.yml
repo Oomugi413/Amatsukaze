@@ -7,7 +7,7 @@ services:
           dockerfile: Dockerfile
           args:
             ENABLE_FASTER_WHISPER: "0"  # Faster-Whisper-XXLを含める場合は "1" に変更
-            ENABLE_VCEENCC: "0"  # VCEEncCを含める場合は "1" に変更
+            ENABLE_VCEENC_AMF: "0"  # VCEEncCでAMFも使う場合は "1" に変更 (既定はVA-APIのみ)
         restart: always
         ports:
           - "32768:32768"

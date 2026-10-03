@@ -16,6 +16,62 @@ float CalcCorrelation5x5_AVX2(const float* k, const float* Y, int x, int y, int 
     return CalcCorrelation5x5_AVX_AVX2<true>(k, Y, x, y, w, pavg);
 }
 
+// 各laneを別のfade候補とし、画素側のFMA順序を既存のAVX2経路に合わせる。
+void blendLogoBackgroundFadesAVX2(float* dst, const float* src, const float* background,
+    int count, const float* fades, int activeFades) {
+    alignas(32) float fadeValues[8] = {};
+    alignas(32) float invFadeValues[8] = {};
+    for (int fi = 0; fi < activeFades; fi++) {
+        fadeValues[fi] = fades[fi];
+        invFadeValues[fi] = 1.0f - fades[fi];
+    }
+    const __m256 vfade = _mm256_load_ps(fadeValues);
+    const __m256 vinvfade = _mm256_load_ps(invFadeValues);
+    for (int i = 0; i < count; i++) {
+        const __m256 vsrc = _mm256_broadcast_ss(src + i);
+        const __m256 vbg = _mm256_broadcast_ss(background + i);
+        const __m256 value = _mm256_fmadd_ps(vfade, vbg, _mm256_mul_ps(vinvfade, vsrc));
+        _mm256_storeu_ps(dst + i * 8, value);
+    }
+}
+
+// 元の空間方向AVX2処理と同じ縮約木を、fadeごとのlane内で再現する。
+void CalcCorrelation5x5Fades_AVX2(const float* k, const float* work,
+    int x, int y, int w, float* avgs, float* sums) {
+    __m256 row[5][5];
+    for (int ky = 0; ky < 5; ky++) {
+        for (int kx = 0; kx < 5; kx++) {
+            row[ky][kx] = _mm256_loadu_ps(work + ((y + ky - 2) * w + x + kx - 2) * 8);
+        }
+    }
+    __m256 ysum[5];
+    for (int c = 0; c < 5; c++) {
+        ysum[c] = _mm256_add_ps(_mm256_add_ps(_mm256_add_ps(row[0][c], row[1][c]),
+            _mm256_add_ps(row[2][c], row[3][c])), row[4][c]);
+    }
+    const __m256 avg = _mm256_mul_ps(_mm256_add_ps(_mm256_add_ps(
+        _mm256_add_ps(ysum[0], ysum[2]), ysum[4]), _mm256_add_ps(ysum[1], ysum[3])),
+        _mm256_set1_ps(1.0f / 25.0f));
+    __m256 corr[5];
+    for (int c = 0; c < 5; c++) {
+        const __m256 d0 = _mm256_sub_ps(row[0][c], avg);
+        const __m256 d1 = _mm256_sub_ps(row[1][c], avg);
+        const __m256 d2 = _mm256_sub_ps(row[2][c], avg);
+        const __m256 d3 = _mm256_sub_ps(row[3][c], avg);
+        const __m256 d4 = _mm256_sub_ps(row[4][c], avg);
+        const __m256 lower = _mm256_fmadd_ps(_mm256_set1_ps(k[c]), d0,
+            _mm256_mul_ps(_mm256_set1_ps(k[5 + c]), d1));
+        const __m256 upper = _mm256_fmadd_ps(_mm256_set1_ps(k[10 + c]), d2,
+            _mm256_mul_ps(_mm256_set1_ps(k[15 + c]), d3));
+        corr[c] = _mm256_fmadd_ps(_mm256_set1_ps(k[20 + c]), d4,
+            _mm256_add_ps(lower, upper));
+    }
+    const __m256 sum = _mm256_add_ps(_mm256_add_ps(
+        _mm256_add_ps(corr[0], corr[2]), corr[4]), _mm256_add_ps(corr[1], corr[3]));
+    _mm256_storeu_ps(avgs, avg);
+    _mm256_storeu_ps(sums, sum);
+}
+
 void removeLogoLineAVX2(float *dst, const float *src, const int srcStride, const float *logoAY, const float *logoBY, const int logowidth, const float maxv, const float fade) {
     const float invfade = 1.0f - fade;
     const __m256 vmaxv = _mm256_broadcast_ss(&maxv);
@@ -38,6 +94,43 @@ void removeLogoLineAVX2(float *dst, const float *src, const int srcStride, const
         const __m128 bg = _mm_fmadd_ss(a, srcv, _mm_mul_ss(b, _mm256_castps256_ps128(vmaxv)));
         const __m128 dstv = _mm_fmadd_ss(_mm256_castps256_ps128(vfade), bg, _mm_mul_ss(_mm256_castps256_ps128(v1_fade), srcv));
         _mm_store_ss(dst + x, dstv);
+    }
+}
+
+void prepareLogoBackgroundLineAVX2(float *dst, const float *src, const float *logoAY,
+    const float *logoBY, int width, float maxv) {
+    const __m256 vmaxv = _mm256_broadcast_ss(&maxv);
+    int x = 0;
+    for (; x < (width & ~7); x += 8) {
+        const __m256 srcv = _mm256_loadu_ps(src + x);
+        const __m256 a = _mm256_loadu_ps(logoAY + x);
+        const __m256 b = _mm256_loadu_ps(logoBY + x);
+        _mm256_storeu_ps(dst + x, _mm256_fmadd_ps(a, srcv, _mm256_mul_ps(b, vmaxv)));
+    }
+    for (; x < width; x++) {
+        const __m128 srcv = _mm_load_ss(src + x);
+        const __m128 a = _mm_load_ss(logoAY + x);
+        const __m128 b = _mm_load_ss(logoBY + x);
+        _mm_store_ss(dst + x, _mm_fmadd_ss(a, srcv, _mm_mul_ss(b, _mm256_castps256_ps128(vmaxv))));
+    }
+}
+
+void blendLogoBackgroundLineAVX2(float *dst, const float *src, const float *background,
+    int width, float fade) {
+    const float invfade = 1.0f - fade;
+    const __m256 vfade = _mm256_broadcast_ss(&fade);
+    const __m256 v1_fade = _mm256_broadcast_ss(&invfade);
+    int x = 0;
+    for (; x < (width & ~7); x += 8) {
+        const __m256 srcv = _mm256_loadu_ps(src + x);
+        const __m256 bg = _mm256_loadu_ps(background + x);
+        _mm256_storeu_ps(dst + x, _mm256_fmadd_ps(vfade, bg, _mm256_mul_ps(v1_fade, srcv)));
+    }
+    for (; x < width; x++) {
+        const __m128 srcv = _mm_load_ss(src + x);
+        const __m128 bg = _mm_load_ss(background + x);
+        _mm_store_ss(dst + x, _mm_fmadd_ss(_mm256_castps256_ps128(vfade), bg,
+            _mm_mul_ss(_mm256_castps256_ps128(v1_fade), srcv)));
     }
 }
 
@@ -169,6 +262,51 @@ bool TryEstimateBgEvalSideContiguousU8_AVX2(const uint8_t* ptr, int len, int thr
      _mm256_storeu_si256(reinterpret_cast<__m256i*>(sums + 16), sums16To31);
      _mm256_storeu_si256(reinterpret_cast<__m256i*>(minvOut), minv);
      _mm256_storeu_si256(reinterpret_cast<__m256i*>(maxvOut), maxv);
+}
+
+// 各画素の4近傍の補正edgeを、元と同じ順序で8画素ずつ求める。
+void CalcCorrectedEdges32U8_AVX2(const uint8_t* src, int stride, float invMaxv, float* edges) {
+    const __m256 scale = _mm256_set1_ps(invMaxv);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 epsilon = _mm256_set1_ps(1e-4f);
+    const int offsets[4] = {-1, 1, -stride, stride};
+    for (int lane = 0; lane < 32; lane += 8) {
+        const __m256 center = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(
+            _mm_loadl_epi64((const __m128i*)(src + lane)))), scale);
+        const __m256 centerValue = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(
+            _mm_loadl_epi64((const __m128i*)(src + lane))));
+        __m256 maximum = _mm256_setzero_ps();
+        for (int side = 0; side < 4; side++) {
+            const __m256 neighbor = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(
+                _mm_loadl_epi64((const __m128i*)(src + lane + offsets[side])))), scale);
+            const __m256 raw = _mm256_sub_ps(center, neighbor);
+            const __m256 denominator = _mm256_add_ps(_mm256_sub_ps(one, neighbor), epsilon);
+            const __m256 neighborValue = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(
+                _mm_loadl_epi64((const __m128i*)(src + lane + offsets[side]))));
+            // 同値画素にFMAの丸め差から正のedgeが生じることを防ぐ。
+            const __m256 positive = _mm256_cmp_ps(centerValue, neighborValue, _CMP_GT_OQ);
+            const __m256 corrected = _mm256_and_ps(positive, _mm256_div_ps(raw, denominator));
+            maximum = _mm256_max_ps(maximum, corrected);
+        }
+        _mm256_storeu_ps(edges + lane, maximum);
+    }
+}
+
+// 上下境界では横辺の行をclampし、縦辺は実際の短い区間で集計する。
+void CalcBgSideStatsVerticalBoundary32U8_AVX2(const uint8_t* src, int stride, int height,
+    int x, int y, int radius, uint16_t* sums, uint8_t* mins, uint8_t* maxs) {
+    const int first = std::max(0, y - radius);
+    const int last = std::min(height - 1, y + radius);
+    const int rows[2] = { first, last };
+    for (int side = 0; side < 2; side++) {
+        CalcBgSideStatsBlock32U8_AVX2Impl(src + rows[side] * stride + x - radius,
+            1, 2 * radius + 1, sums + side * 32, mins + side * 32, maxs + side * 32);
+    }
+    for (int side = 2; side < 4; side++) {
+        const int column = x + (side == 2 ? -radius : radius);
+        CalcBgSideStatsBlock32U8_AVX2Impl(src + first * stride + column,
+            stride, last - first + 1, sums + side * 32, mins + side * 32, maxs + side * 32);
+    }
 }
 
 void CalcBgSideStatsBlock32U8_AVX2(const uint8_t* src, int stride, int x, int y, int radius,

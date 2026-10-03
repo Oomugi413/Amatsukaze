@@ -56,6 +56,16 @@ void removeLogoLineAVX2(float* dst, const float* src, int srcStride, const float
     removeLogoLine(dst, src, srcStride, logoAY, logoBY, logoWidth, maxValue, fade);
 }
 
+void prepareLogoBackgroundLineAVX2(float *dst, const float *src, const float *logoAY,
+    const float *logoBY, int width, float maxv) {
+    for (int x = 0; x < width; x++) dst[x] = logoAY[x] * src[x] + logoBY[x] * maxv;
+}
+
+void blendLogoBackgroundLineAVX2(float *dst, const float *src, const float *background,
+    int width, float fade) {
+    for (int x = 0; x < width; x++) dst[x] = fade * background[x] + (1.0f - fade) * src[x];
+}
+
 static uint8_t BilateralFilterPixel(const uint8_t* src, int pitch, int width, int height,
     int x, int y, const float* spatial, const float* rangeWeight) {
     const int center = src[y * pitch + x];
@@ -107,6 +117,47 @@ bool TryEstimateBgEvalSideContiguousU8_AVX2(const uint8_t* ptr, int length, int 
     }
     average = (float)sum / length;
     return (int)maxValue - (int)minValue <= threshold;
+}
+
+// 非x86向けの補正edge計算。各画素内の順序を維持する。
+void CalcCorrectedEdges32U8_AVX2(const uint8_t* src, int stride, float invMaxv, float* edges) {
+    const int offsets[4] = {-1, 1, -stride, stride};
+    for (int lane = 0; lane < 32; lane++) {
+        const float center = (float)src[lane] * invMaxv;
+        float maximum = 0.0f;
+        for (int side = 0; side < 4; side++) {
+            const float neighbor = (float)src[lane + offsets[side]] * invMaxv;
+            const float raw = center - neighbor;
+            if (raw > 0.0f) maximum = std::max(maximum, raw / (1.0f - neighbor + 1e-4f));
+        }
+        edges[lane] = maximum;
+    }
+}
+
+// AVX2を使用しない環境でも同じ短い区間を集計する。
+void CalcBgSideStatsVerticalBoundary32U8_AVX2(const uint8_t* src, int stride, int height,
+    int x, int y, int radius, uint16_t* sums, uint8_t* mins, uint8_t* maxs) {
+    const int first = std::max(0, y - radius);
+    const int last = std::min(height - 1, y + radius);
+    for (int side = 0; side < 4; side++) {
+        for (int lane = 0; lane < 32; lane++) {
+            unsigned sum = 0;
+            uint8_t minv = 255, maxv = 0;
+            const int len = side < 2 ? 2 * radius + 1 : last - first + 1;
+            for (int i = 0; i < len; i++) {
+                const int sx = side < 2 ? x + lane - radius + i : x + lane + (side == 2 ? -radius : radius);
+                const int sy = side < 2 ? (side == 0 ? first : last) : first + i;
+                const uint8_t value = src[sy * stride + sx];
+                sum += value;
+                minv = std::min(minv, value);
+                maxv = std::max(maxv, value);
+            }
+            const int index = side * 32 + lane;
+            sums[index] = (uint16_t)sum;
+            mins[index] = minv;
+            maxs[index] = maxv;
+        }
+    }
 }
 
 void CalcBgSideStatsBlock32U8_AVX2(const uint8_t* src, int stride, int x, int y, int radius,

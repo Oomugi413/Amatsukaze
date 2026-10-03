@@ -818,6 +818,9 @@ namespace Amatsukaze.Server.Rest
                     SubtitleModeList = ProfileSettingExtensions.SubtitleModeList.ToList(),
                     WhisperModelList = ProfileSettingExtensions.WhisperModelList.ToList(),
                     AudioEncoderList = audioEncoderList,
+                    AudioFormatChangeModeList = ProfileSettingExtensions.AudioFormatChangeModeList.ToList(),
+                    AudioFormatChangeModeToolTip = ProfileSettingExtensions.AudioFormatChangeModeToolTip,
+                    AudioFormatChangeModeDisplayOrder = ProfileSettingExtensions.AudioFormatChangeModeDisplayOrder.ToList(),
                     IsServerLinux = isLinux
                 };
                 return Results.Json(options);

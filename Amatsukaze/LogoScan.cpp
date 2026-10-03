@@ -7,6 +7,7 @@
 */
 
 #include "LogoScan.h"
+#include "LogoDecodeSession.h"
 #include "AMTSource.h"
 #include "FileUtils.h"
 #include "StringUtils.h"
@@ -385,11 +386,14 @@ void logo::LogoDataParam::CreateLogoMask(float maskratio) {
     kernels = std::unique_ptr<float[]>(new float[maskpixels * KLEN + 8]);
     // 各ピクセルx各単色背景での相関値スケール
     scales = std::unique_ptr<ScaleLimit[]>(new ScaleLimit[maskpixels * CLEN]);
+    maskCoordinates.clear();
+    maskCoordinates.reserve(maskpixels);
     int count = 0;
     float avgCorr = 0.0f;
     for (int y = 2; y < h - 2; y++) {
         for (int x = 2; x < w - 2; x++) {
             if (mask[x + y * w]) {
+                maskCoordinates.emplace_back(x, y);
                 float* k = &kernels[count * KLEN];
                 ScaleLimit* s = &scales[count * CLEN];
                 makeKernel(k, memWork.get(), x, y, w);
@@ -448,6 +452,59 @@ float logo::LogoDataParam::EvaluateLogo(const float *src, float maxv, float fade
     return CorrelationScore(work, maxv) / blackScore;
 }
 
+void logo::LogoDataParam::PrepareLogoBackground(const float* src, float maxv, float* background, int stride) {
+    if (stride == -1) stride = w;
+    const float* logoAY = GetA(PLANAR_Y);
+    const float* logoBY = GetB(PLANAR_Y);
+    for (int y = 0; y < h; y++) {
+        prepareLogoBackgroundLineAVX2(background + y * w, src + y * stride,
+            logoAY + y * w, logoBY + y * w, w, maxv);
+    }
+}
+
+float logo::LogoDataParam::EvaluateLogoWithBackground(const float* src, const float* background,
+    float maxv, float fade, float* work, int stride) {
+    if (stride == -1) stride = w;
+    for (int y = 0; y < h; y++) {
+        blendLogoBackgroundLineAVX2(work + y * w, src + y * stride, background + y * w, w, fade);
+    }
+    return CorrelationScore(work, maxv) / blackScore;
+}
+
+void logo::LogoDataParam::EvaluateLogoFadesAVX2(const float* src, const float* background,
+    float maxv, const float* fades, int fadeCount, float* work, float* scores) {
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+    constexpr int kFadeLanes = 8;
+    const float* kernelData = GetKernels();
+    for (int firstFade = 0; firstFade < fadeCount; firstFade += kFadeLanes) {
+        const int activeFades = std::min(kFadeLanes, fadeCount - firstFade);
+        blendLogoBackgroundFadesAVX2(work, src, background, w * h, fades + firstFade, activeFades);
+        float results[kFadeLanes] = {};
+        for (size_t count = 0; count < maskCoordinates.size(); count++) {
+            const int x = maskCoordinates[count].first;
+            const int y = maskCoordinates[count].second;
+            const float* k = kernelData + count * KLEN;
+            float avgs[kFadeLanes], sums[kFadeLanes];
+            CalcCorrelation5x5Fades_AVX2(k, work, x, y, w, avgs, sums);
+            for (int fi = 0; fi < activeFades; fi++) {
+                const int idx = std::max(0, std::min((int)CLEN, (int)(avgs[fi] * CLEN / maxv)));
+                const ScaleLimit s = scales[count * CLEN + idx];
+                const float normalized = std::max(-1.0f, std::min(1.0f, sums[fi] * s.scale));
+                const float score = normalized * s.scale2;
+                results[fi] += score;
+            }
+        }
+        for (int fi = 0; fi < activeFades; fi++) {
+            scores[firstFade + fi] = results[fi] / blackScore;
+        }
+    }
+#else
+    for (int fi = 0; fi < fadeCount; fi++) {
+        scores[fi] = EvaluateLogo(src, maxv, fades[fi], work);
+    }
+#endif
+}
+
 std::unique_ptr<logo::LogoDataParam> logo::LogoDataParam::MakeFieldLogo(bool bottom) {
     auto logo = std::unique_ptr<logo::LogoDataParam>(
         new logo::LogoDataParam(LogoData(w, h / 2, logUVx, logUVy), imgw, imgh / 2, imgx, imgy / 2));
@@ -477,32 +534,25 @@ std::unique_ptr<logo::LogoDataParam> logo::LogoDataParam::MakeFieldLogo(bool bot
 
 // 画素ごとにロゴとの相関を計算
 float logo::LogoDataParam::CorrelationScore(const float *work, float maxv) {
-    const uint8_t* mask = GetMask();
     const float* kernels = GetKernels();
 
-    // ロゴとの相関を評価
-    int count = 0;
+    // マスクの有効座標を元の行優先順に走査する。
     float result = 0;
-    for (int y = 2; y < h - 2; y++) {
-        for (int x = 2; x < w - 2; x++) {
-            if (mask[x + y * w]) {
-                const float* k = &kernels[count * KLEN];
+    for (size_t count = 0; count < maskCoordinates.size(); count++) {
+        const int x = maskCoordinates[count].first;
+        const int y = maskCoordinates[count].second;
+        const float* k = &kernels[count * KLEN];
 
-                float avg;
-                float sum = pCalcCorrelation5x5(k, work, x, y, w, &avg);
-                // avg単色の場合の相関値が1になるように正規化
-                const int idx = std::max(0, std::min((int)CLEN, (int)(avg * CLEN / maxv)));
-                ScaleLimit s = scales[count * CLEN + idx];
-                // 1を超える部分は捨てる（ロゴによる相関ではない部分なので）
-                float normalized = std::max(-1.0f, std::min(1.0f, sum * s.scale));
-                // 相関が下限値以下の場合は一部元に戻す
-                float score = normalized * s.scale2;
-
-                result += score;
-
-                count++;
-            }
-        }
+        float avg;
+        float sum = pCalcCorrelation5x5(k, work, x, y, w, &avg);
+        // avg単色の場合の相関値が1になるように正規化
+        const int idx = std::max(0, std::min((int)CLEN, (int)(avg * CLEN / maxv)));
+        ScaleLimit s = scales[count * CLEN + idx];
+        // 1を超える部分は捨てる（ロゴによる相関ではない部分なので）
+        float normalized = std::max(-1.0f, std::min(1.0f, sum * s.scale));
+        // 相関が下限値以下の場合は一部元に戻す
+        float score = normalized * s.scale2;
+        result += score;
     }
 
     return result;
@@ -1045,7 +1095,14 @@ void logo::SimpleVideoReader::readAll(const tstring& src, int serviceid, const F
                 }
 
                 currentPos = qf.pos;
-                const bool keepReading = onFrameCb ? onFrameCb(qf.frame) : true;
+                bool keepReading;
+                try {
+                    keepReading = onFrameCb ? onFrameCb(qf.frame) : true;
+                } catch (...) {
+                    // 処理中のフレームも、例外でキューから外れたまま残さない。
+                    av_frame_free(&qf.frame);
+                    throw;
+                }
                 if (qf.frame != nullptr) {
                     av_frame_free(&qf.frame);
                 }
@@ -1256,7 +1313,17 @@ void logo::LogoScanDataCompressed::compress(const void *ptr, size_t datasize) {
     memcpy(compressed_data.data(), tmp.data(), compressed_size);
 }
 
+void logo::LogoScanDataCompressed::storeRaw(const void *ptr, size_t datasize) {
+    original_size = (unsigned long)datasize;
+    raw_data.resize(datasize);
+    memcpy(raw_data.data(), ptr, datasize);
+}
+
 void logo::LogoScanDataCompressed::decompress(void *ptr) {
+    if (!raw_data.empty()) {
+        memcpy(ptr, raw_data.data(), original_size);
+        return;
+    }
     unsigned long buf_size = original_size;
     uncompress((BYTE *)ptr, &buf_size, (BYTE *)compressed_data.data(), (unsigned long)compressed_data.size());
 }
@@ -1268,13 +1335,26 @@ logo::LogoAnalyzer::InitialLogoCreator::InitialLogoCreator(LogoAnalyzer* pThis) 
     bitDepth(8),
     readCount(0),
     filesize(0),
+    retainRaw(false),
     memScanData(),
     scanData() {}
 
 void logo::LogoAnalyzer::InitialLogoCreator::readAll(const tstring& src, int serviceid) {
     { File file(src, _T("rb")); filesize = file.size(); }
 
-    SimpleVideoReader::readAll(src, serviceid);
+    const size_t cachedFrames = activeLogoDecodeSession != nullptr ? activeLogoDecodeSession->cachedFrames() : 0;
+    const bool reused = activeLogoDecodeSession != nullptr && activeLogoDecodeSession->generate(
+        src, serviceid, pThis->scanx, pThis->scany, pThis->scanw, pThis->scanh,
+        [&](AVStream* stream, AVFrame* frame) { onFirstFrame(stream, frame); },
+        [&](AVFrame* frame, int originX, int originY, int64_t position) {
+            inputOriginX = originX;
+            inputOriginY = originY;
+            currentPos = position;
+            return onFrame(frame);
+        });
+    inputOriginX = inputOriginY = 0;
+    if (!reused) SimpleVideoReader::readAll(src, serviceid);
+    else pThis->ctx.infoF(_T("[GenLogo] decoded frame reuse: %zu"), cachedFrames);
 
     pThis->logodata = logoscan->GetLogo(false);
     if (pThis->logodata == nullptr) {
@@ -1285,6 +1365,35 @@ void logo::LogoAnalyzer::InitialLogoCreator::readAll(const tstring& src, int ser
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get((AVPixelFormat)(frame->format));
 
     bitDepth = desc->comp[0].depth;
+
+    // 非圧縮ROIが小さく、追加分を除いてもメモリに余裕がある場合だけ保持する。
+    const uint64_t rawBytes = uint64_t(scanDataSize) * (bitDepth > 8 ? 2 : 1) * pThis->numMaxFrames;
+    uint64_t availableBytes = 0;
+#if defined(_WIN32) || defined(_WIN64)
+    MEMORYSTATUSEX memoryStatus = { 0 };
+    memoryStatus.dwLength = sizeof(memoryStatus);
+    if (GlobalMemoryStatusEx(&memoryStatus)) {
+        availableBytes = memoryStatus.ullAvailPhys;
+    }
+#else
+    struct sysinfo memoryStatus;
+    if (sysinfo(&memoryStatus) == 0) {
+        availableBytes = uint64_t(memoryStatus.freeram) * memoryStatus.mem_unit;
+    }
+    FILE* memoryInfo = fopen("/proc/meminfo", "r");
+    if (memoryInfo != nullptr) {
+        char line[256];
+        while (fgets(line, sizeof(line), memoryInfo) != nullptr) {
+            uint64_t kb = 0;
+            if (sscanf(line, "MemAvailable: %" PRIu64 " kB", &kb) == 1) {
+                availableBytes = kb * 1024;
+                break;
+            }
+        }
+        fclose(memoryInfo);
+    }
+#endif
+    retainRaw = rawBytes <= (128ULL << 20) && availableBytes > rawBytes + (2ULL << 30);
 
     pThis->logUVx = desc->log2_chroma_w;
     pThis->logUVy = desc->log2_chroma_h;
@@ -1321,6 +1430,47 @@ void logo::LogoAnalyzer::InitialLogoCreator::readAll(const tstring& src, int ser
 void logo::LogoAnalyzer::MakeInitialLogo() {
     creator = std::make_unique<InitialLogoCreator>(this);
     creator->readAll(srcpath, serviceid);
+}
+
+int logo::GetLogoRemakeEvaluationThreadCount() {
+    return ResolveAutoDetectThreadCount(0);
+}
+
+void logo::RunLogoRemakeFrameEvaluation(const int numFrames, const int threadCount,
+    const std::function<void(int, int, int)>& evaluateRange,
+    const std::function<void(int)>& reportProgress) {
+    constexpr int kProgressInterval = 100;
+    if (threadCount <= 1) {
+        for (int i = 0; i < numFrames; i++) {
+            evaluateRange(0, i, i + 1);
+            if ((i % kProgressInterval) == 0) {
+                reportProgress(i);
+            }
+        }
+        return;
+    }
+    if (numFrames <= 0) {
+        return;
+    }
+    LogoScanWorkerPool pool(threadCount);
+    // 最初の通知位置も従来と合わせ、以降は100フレーム単位で完了を待つ。
+    evaluateRange(0, 0, 1);
+    reportProgress(0);
+    for (int start = 1; start < numFrames; start += kProgressInterval) {
+        const int end = std::min(numFrames, start + kProgressInterval);
+        const int activeWorkers = std::min(threadCount, end - start);
+        pool.run(activeWorkers, [&](const int firstWorker, const int lastWorker) {
+            for (int worker = firstWorker; worker < lastWorker; worker++) {
+                const int frameStart = start + (end - start) * worker / activeWorkers;
+                const int frameEnd = start + (end - start) * (worker + 1) / activeWorkers;
+                evaluateRange(worker, frameStart, frameEnd);
+            }
+        }, 1);
+        // 全ワーカー停止後に通知するため、キャンセルや例外時もバッファを安全に破棄できる。
+        if (((end - 1) % kProgressInterval) == 0) {
+            reportProgress(end - 1);
+        }
+    }
 }
 
 logo::LogoAnalyzer::LogoAnalyzer(AMTContext& ctx, const tchar* srcpath, int serviceid, const tchar* workfile, const tchar* dstpath,
@@ -2705,8 +2855,15 @@ namespace {
         alignas(32) uint16_t sideSums[4][lanes];
         alignas(32) uint8_t sideMins[4][lanes];
         alignas(32) uint8_t sideMaxs[4][lanes];
-        CalcBgSideStatsBlock32U8_AVX2(y.data(), w, x, y0, radius,
-            &sideSums[0][0], &sideMins[0][0], &sideMaxs[0][0]);
+        const bool verticalBoundary = y0 - radius < 0 || y0 + radius >= h;
+        if (verticalBoundary) {
+            CalcBgSideStatsVerticalBoundary32U8_AVX2(y.data(), w, h, x, y0, radius,
+                &sideSums[0][0], &sideMins[0][0], &sideMaxs[0][0]);
+        } else {
+            CalcBgSideStatsBlock32U8_AVX2(y.data(), w, x, y0, radius,
+                &sideSums[0][0], &sideMins[0][0], &sideMaxs[0][0]);
+        }
+        const int verticalLen = std::min(h - 1, y0 + radius) - std::max(0, y0 - radius) + 1;
 
         const int sideLen = radius * 2 + 1;
         static constexpr int retryOrder[4][3] = {
@@ -2720,7 +2877,7 @@ namespace {
             float sideAvg[4];
             uint8_t sideValid[4];
             for (int side = 0; side < 4; side++) {
-                sideAvg[side] = (float)sideSums[side][lane] / sideLen;
+                sideAvg[side] = (float)sideSums[side][lane] / (side < 2 ? sideLen : verticalLen);
                 sideValid[side] = ((int)sideMaxs[side][lane] - (int)sideMins[side][lane] <= threshold) ? 1 : 0;
             }
 
@@ -3206,8 +3363,12 @@ namespace {
             std::vector<std::vector<uint8_t>> batchFrameWork8;
             std::vector<std::vector<uint8_t>> batchFrameTranspose8;
             std::vector<std::vector<uint8_t>> batchRaw8;
+            // 初回走査で受け取ったが、まだ統計へ反映していないフレーム数。
+            int pendingInitialFrames = 0;
+            bool allFramesBatched = true;
+            bool reuseUnweighted = false;
             std::vector<AutoDetectStats> stats;
-            // bin優先配置のヒストグラム蓄積バッファ: [bin][画素]
+            // タイル単位のヒストグラム蓄積バッファ: [タイル][bin][画素]
             std::vector<BinAccum> binAccumBuf;
             std::vector<float> lastObservedFg;
             std::vector<uint8_t> lastObservedValid;
@@ -3217,6 +3378,9 @@ namespace {
             std::vector<SpatialEdgeAccum> edgeAccumBuf;
 
             void reset(const int scanw, const int scanh, const int bitDepth) {
+                pendingInitialFrames = 0;
+                allFramesBatched = true;
+                reuseUnweighted = false;
                 if (bitDepth <= 8) {
                     // 背景辺のAVX2処理が行末付近でも64 byteを直接ロードできるよう、
                     // 作業画像と転置画像の末尾へ余白を持たせる。
@@ -3255,6 +3419,15 @@ namespace {
         int roiCacheFrameBytes = 0;
         int roiCacheStoredFrames = 0;
         std::vector<std::vector<uint8_t>> roiCacheRamSlabs;
+        // 背景値は生のfloatで保持し、未計算はNaN、不適合は-1で区別する。
+        std::vector<std::vector<float>> backgroundCacheSlabs;
+        bool backgroundCacheAttempted = false;
+        int backgroundCacheWidth = 0, backgroundCacheHeight = 0;
+        int backgroundCacheX = 0, backgroundCacheY = 0;
+        int backgroundCacheRadius = 0, backgroundCacheThreshold = 0;
+        // 生ROIとは別に、8bitの同一条件で求めたフィルタ結果だけを保持する。
+        std::vector<std::vector<uint8_t>> filteredRoiCacheSlabs;
+        std::vector<uint8_t> filteredRoiCacheValid;
         std::vector<uint8_t> roiReplayFrame;
         std::vector<uint8_t> detectFrame8;
         std::vector<uint16_t> detectFrame16;
@@ -3963,7 +4136,7 @@ namespace {
                 segmentConsensusCaptureActive = kEnableSegmentConsensus;
                 runFramePassWithProgress(srcpath, 1, 0.0f, 0.5f, 0.0f, 0.15f,
                     [&](AVStream *videoStream, AVFrame* frame) { processFirstFrame(videoStream, frame, &pass1Stats, nullptr); },
-                    [&](AVFrame* frame) { return processFrame(frame, &pass1Stats, nullptr); });
+                    [&](AVFrame* frame) { return processFrame(frame, &pass1Stats, nullptr); }, &pass1Stats);
                 temporalHistCaptureActive = false;
                 segmentConsensusCaptureActive = false;
                 roiCacheCaptureActive = false;
@@ -4150,6 +4323,13 @@ namespace {
             roiCacheStoredFrames = 0;
             roiCacheRamSlabs.clear();
             roiCacheRamSlabs.shrink_to_fit();
+            backgroundCacheSlabs.clear();
+            backgroundCacheSlabs.shrink_to_fit();
+            backgroundCacheAttempted = false;
+            filteredRoiCacheSlabs.clear();
+            filteredRoiCacheSlabs.shrink_to_fit();
+            filteredRoiCacheValid.clear();
+            filteredRoiCacheValid.shrink_to_fit();
             roiReplayFrame.clear();
             roiReplayFrame.shrink_to_fit();
             detectFrame8.clear();
@@ -4181,6 +4361,7 @@ namespace {
                         roiCacheRamSlabs.emplace_back((size_t)roiCacheFrameBytes * (size_t)framesInSlab);
                     }
                     roiCacheBackend = RoiCacheBackend::Ram;
+                    initializeFilteredRoiCache(estimatedBytes, slabCount);
                     logCtx.infoF(_T("[LogoScan] ROI cache: RAM slabs=%d (%") _T(PRIu64) _T(" bytes, avail=%") _T(PRIu64) _T(")"), slabCount, estimatedBytes, availBytes);
                     return;
                 }
@@ -4199,6 +4380,53 @@ namespace {
                 clearRoiCache();
                 logCtx.warn(_T("[LogoScan] ROI cache init failed; fallback to full decode reruns"));
             }
+        }
+
+        void initializeFilteredRoiCache(const uint64_t estimatedBytes, const int slabCount) {
+            constexpr uint64_t kMemoryReserveBytes = 2ull * 1024ull * 1024ull * 1024ull;
+            const uint64_t availableBytes = getAvailableSystemMemoryBytes();
+            // 空き量を取得できない場合と、高bit深度の再走査では従来経路を使う。
+            if (bitDepth != 8) {
+                return;
+            }
+            if (availableBytes < estimatedBytes + kMemoryReserveBytes) {
+                logCtx.infoF(_T("[LogoScan] フィルタ済みROIキャッシュを省略: 空き=%") _T(PRIu64) _T(" bytes, 必要=%") _T(PRIu64) _T(" bytes"), availableBytes, estimatedBytes + kMemoryReserveBytes);
+                return;
+            }
+            try {
+                filteredRoiCacheSlabs.reserve(slabCount);
+                for (int slab = 0; slab < slabCount; slab++) {
+                    const int count = std::min(kRoiCacheFramesPerSlab, searchFrames - slab * kRoiCacheFramesPerSlab);
+                    filteredRoiCacheSlabs.emplace_back((size_t)roiCacheFrameBytes * count);
+                }
+                filteredRoiCacheValid.assign(searchFrames, 0);
+                logCtx.infoF(_T("[LogoScan] フィルタ済みROIキャッシュ: %") _T(PRIu64) _T(" bytes (空き=%") _T(PRIu64) _T(")"), estimatedBytes, availableBytes);
+            } catch (const std::bad_alloc&) {
+                filteredRoiCacheSlabs.clear();
+                filteredRoiCacheValid.clear();
+                logCtx.info(_T("[LogoScan] フィルタ済みROIキャッシュを確保できないため従来経路を使用"));
+            }
+        }
+
+        bool loadFilteredRoiFrame(const int frameIndex, std::vector<uint8_t>& out) const {
+            if (frameIndex < 0 || frameIndex >= (int)filteredRoiCacheValid.size()
+                || filteredRoiCacheValid[frameIndex] == 0) {
+                return false;
+            }
+            out.resize(roiCacheFrameBytes);
+            const auto& slab = filteredRoiCacheSlabs[frameIndex / kRoiCacheFramesPerSlab];
+            std::memcpy(out.data(), slab.data() + (size_t)(frameIndex % kRoiCacheFramesPerSlab) * roiCacheFrameBytes, roiCacheFrameBytes);
+            return true;
+        }
+
+        void storeFilteredRoiFrame(const int frameIndex, const std::vector<uint8_t>& work) {
+            if (frameIndex < 0 || frameIndex >= (int)filteredRoiCacheValid.size()
+                || work.size() < (size_t)roiCacheFrameBytes) {
+                return;
+            }
+            auto& slab = filteredRoiCacheSlabs[frameIndex / kRoiCacheFramesPerSlab];
+            std::memcpy(slab.data() + (size_t)(frameIndex % kRoiCacheFramesPerSlab) * roiCacheFrameBytes, work.data(), roiCacheFrameBytes);
+            filteredRoiCacheValid[frameIndex] = 1;
         }
 
         template<typename pixel_t>
@@ -4386,7 +4614,10 @@ namespace {
         }
 
         RGY_FORCEINLINE size_t binAccumIndex(const int off, const int bin) const {
-            return (size_t)bin * (scanw * scanh) + off;
+            constexpr int tilePixels = 128;
+            const int first = off & ~(tilePixels - 1);
+            const int count = std::min(tilePixels, scanw * scanh - first);
+            return (size_t)first * kHistBins + (size_t)bin * count + (off - first);
         }
 
         void accumulateTemporalHistSample(const int off, const float rawValue, const float invMaxv) {
@@ -4923,12 +5154,25 @@ namespace {
         }
 
         template<typename FirstFrameCb, typename FrameCb>
-        void runFramePassWithProgress(const tstring& srcpath, const int stage, const float stageBase, const float stageSpan, const float overallBase, const float overallSpan, FirstFrameCb&& onFirstFrame, FrameCb&& onFrame) {
+        void runFramePassWithProgress(const tstring& srcpath, const int stage, const float stageBase, const float stageSpan, const float overallBase, const float overallSpan, FirstFrameCb&& onFirstFrame, FrameCb&& onFrame, StatsPassBuffers* pendingStats = nullptr) {
             setProgressPlan(stage, stageBase, stageSpan, overallBase, overallSpan);
             if (!reportProgressInCurrentPlan(0.0f, 0, searchFrames)) {
                 THROW(RuntimeException, "Cancel requested");
             }
-            readAll(srcpath, serviceid, std::forward<FirstFrameCb>(onFirstFrame), std::forward<FrameCb>(onFrame));
+            auto* session = logo::activeLogoDecodeSession;
+            if (session != nullptr && session->matches(srcpath, serviceid) && !session->hasStarted()
+                && roiCacheCaptureActive && frameWindowStart == 0 && pendingStats != nullptr) {
+                session->detect(onFirstFrame, onFrame, [&](AVFrame* frame) {
+                    session->configure(frame, scanx, scany, scanw, scanh, detectScaleNum, detectScaleDen,
+                        searchFrames, getAvailableSystemMemoryBytes());
+                });
+            } else {
+                readAll(srcpath, serviceid, std::forward<FirstFrameCb>(onFirstFrame), std::forward<FrameCb>(onFrame));
+            }
+            // 入力終端がバッチ境界と一致しない場合も、最後の端数を集計する。
+            if (pendingStats != nullptr) {
+                flushInitialStatsBatch(*pendingStats);
+            }
             if (!reportProgressInCurrentPlan(1.0f, readFrames, searchFrames)) {
                 THROW(RuntimeException, "Cancel requested");
             }
@@ -6423,6 +6667,11 @@ namespace {
             }
             auto& frameWork = getFrameWorkBuffer<pixel_t>(*statsPass);
             preprocessFrame<pixel_t>(srcY, pitchY, frameWork, maxv, rawScale, thresholdRaw);
+            if constexpr (std::is_same<pixel_t, uint8_t>::value) {
+                if (roiCacheCaptureActive) {
+                    storeFilteredRoiFrame(readFrames, frameWork);
+                }
+            }
             return collectFrameSamples<pixel_t>(frameWork, invMaxv, rawScale, thresholdRaw, *statsPass, traceFgRaw);
         }
 
@@ -6598,17 +6847,25 @@ namespace {
         }
 
         void preprocessStoredFrame(const uint8_t* srcY, const int pitchY, std::vector<uint8_t>& frameWork, const float thresholdRaw) {
+            if (loadFilteredRoiFrame(readFrames, frameWork)) {
+                return;
+            }
             constexpr int kBilateralRadius = 2;
             const float sigmaRange = std::max(6.0f, thresholdRaw * 0.6f);
             BilateralFilter<uint8_t, kBilateralRadius>(frameWork, srcY, pitchY, scanw, scanh, 1.4f, sigmaRange, (uint8_t)255, &threadPool, threadN);
+            storeFilteredRoiFrame(readFrames, frameWork);
         }
 
         void preprocessStoredFrameSingleThread(const uint8_t* srcY, const int pitchY,
-            std::vector<uint8_t>& frameWork, const float thresholdRaw) {
+            std::vector<uint8_t>& frameWork, const float thresholdRaw, const int frameIndex) {
+            if (loadFilteredRoiFrame(frameIndex, frameWork)) {
+                return;
+            }
             constexpr int kBilateralRadius = 2;
             const float sigmaRange = std::max(6.0f, thresholdRaw * 0.6f);
             BilateralFilter<uint8_t, kBilateralRadius>(frameWork, srcY, pitchY, scanw, scanh,
                 1.4f, sigmaRange, (uint8_t)255, nullptr, 1);
+            storeFilteredRoiFrame(frameIndex, frameWork);
         }
 
         template<typename pixel_t>
@@ -6648,54 +6905,150 @@ namespace {
             }
         }
 
+        void initializeBackgroundCache() {
+            if (backgroundCacheAttempted) return;
+            backgroundCacheAttempted = true;
+            const int width = std::max(0, scanw - 2 * kScanEdgeMargin);
+            const int height = std::max(0, scanh - 2 * kScanEdgeMargin);
+            if (bitDepth != 8 || width == 0 || height == 0 || searchFrames <= 0
+                || !tracePoints.empty() || filteredRoiCacheSlabs.empty()) return;
+            const uint64_t bytes = uint64_t(width) * height * searchFrames * sizeof(float);
+            // 共有デコーダは検出ROIが別サイズの場合もあるため、上限2GiBを留保する。
+            const uint64_t decodeReserve = logo::activeLogoDecodeSession != nullptr
+                ? (2ULL << 30) : 0;
+            const uint64_t available = getAvailableSystemMemoryBytes();
+            if (bytes > (2ULL << 30) || available < bytes + decodeReserve + (2ULL << 30)) {
+                logCtx.info(_T("[LogoScan] 背景推定キャッシュを省略: メモリ上限または空き量不足"));
+                return;
+            }
+            try {
+                const int slabs = (searchFrames + kRoiCacheFramesPerSlab - 1) / kRoiCacheFramesPerSlab;
+                backgroundCacheSlabs.reserve(slabs);
+                for (int slab = 0; slab < slabs; slab++) {
+                    const int count = std::min(kRoiCacheFramesPerSlab, searchFrames - slab * kRoiCacheFramesPerSlab);
+                    backgroundCacheSlabs.emplace_back((size_t)width * height * count,
+                        std::numeric_limits<float>::quiet_NaN());
+                }
+                backgroundCacheWidth = scanw;
+                backgroundCacheHeight = scanh;
+                backgroundCacheX = scanx;
+                backgroundCacheY = scany;
+                backgroundCacheRadius = radius;
+                backgroundCacheThreshold = threshold;
+                logCtx.infoF(_T("[LogoScan] 背景推定キャッシュ: %") _T(PRIu64) _T(" bytes"), bytes);
+            } catch (const std::bad_alloc&) {
+                backgroundCacheSlabs.clear();
+                logCtx.info(_T("[LogoScan] 背景推定キャッシュの確保失敗により従来計算へ戻す"));
+            }
+        }
+
+        float* backgroundCacheFrame(const int frame, const int thresholdRaw) {
+            if (backgroundCacheSlabs.empty() || bitDepth != 8 || scanw != backgroundCacheWidth
+                || scanh != backgroundCacheHeight || radius != backgroundCacheRadius
+                || scanx != backgroundCacheX || scany != backgroundCacheY
+                || thresholdRaw != backgroundCacheThreshold || frame < 0 || frame >= searchFrames
+                || frame >= (int)filteredRoiCacheValid.size() || !filteredRoiCacheValid[frame]) return nullptr;
+            const size_t pixels = (size_t)(scanw - 2 * kScanEdgeMargin) * (scanh - 2 * kScanEdgeMargin);
+            return backgroundCacheSlabs[frame / kRoiCacheFramesPerSlab].data()
+                + (size_t)(frame % kRoiCacheFramesPerSlab) * pixels;
+        }
+
+        size_t backgroundCacheIndex(const int x, const int y) const {
+            return (size_t)(y - kScanEdgeMargin) * (scanw - 2 * kScanEdgeMargin) + x - kScanEdgeMargin;
+        }
+
+        uint32_t estimateBackgroundBlock(const std::vector<uint8_t>& frameWork, const int x, const int y,
+            const int thresholdRaw, const std::vector<uint8_t>* transpose, float* cache, float* bg) {
+            const size_t offset = cache ? backgroundCacheIndex(x, y) : 0;
+            bool complete = cache != nullptr;
+            if (cache) {
+                for (int lane = 0; lane < 32; lane++) {
+                    if (std::isnan(cache[offset + lane])) { complete = false; break; }
+                }
+            }
+            if (complete) {
+                uint32_t mask = 0;
+                for (int lane = 0; lane < 32; lane++) {
+                    const float value = cache[offset + lane];
+                    bg[lane] = value >= 0.0f ? value : 0.0f;
+                    if (value >= 0.0f) mask |= 1u << lane;
+                }
+                return mask;
+            }
+            const uint32_t mask = TryEstimateBgBlock32U8(frameWork, scanw, scanh,
+                x, y, radius, thresholdRaw, bg, transpose);
+            if (cache) {
+                for (int lane = 0; lane < 32; lane++) cache[offset + lane] = (mask & (1u << lane)) ? bg[lane] : -1.0f;
+            }
+            return mask;
+        }
+
         template<typename pixel_t>
         RGY_FORCEINLINE int collectFrameSampleRange(const std::vector<pixel_t>& frameWork, const float invMaxv,
             const int thresholdRaw, const float transitionThreshold, StatsPassBuffers& statsPass,
             const std::vector<pixel_t>* transposed, const int segmentConsensusIndex,
-            const int yBegin, const int yEnd, const int xBegin, const int xEnd, const bool useBgBlock32) {
+            const int yBegin, const int yEnd, const int xBegin, const int xEnd, const bool useBgBlock32, const int frameIndex = -1) {
             auto& stats = statsPass.stats;
             auto& binAccumBuf = statsPass.binAccumBuf;
             auto& lastObservedFg = statsPass.lastObservedFg;
             auto& lastObservedValid = statsPass.lastObservedValid;
+            const bool reuseUnweighted = statsPass.reuseUnweighted;
+            float* cache = backgroundCacheFrame(frameIndex >= 0 ? frameIndex : readFrames, thresholdRaw);
             int localFrameCount = 0;
             for (int y = yBegin; y < yEnd; y++) {
-                auto collectOne = [&](const int x, const bool bgOk, const float bg) {
+                auto collectOne = [&](const int x, const bool bgOk, const float bg, const float preparedEdge = -1.0f) {
                     const int off = x + y * scanw;
                     if (off >= 0 && off < (int)tracePointIndexByOffset.size() && tracePointIndexByOffset[off] >= 0) {
                         return 0;
                     }
                     const float fgRaw = (float)frameWork[off];
-                    accumulateTemporalHistSample(off, fgRaw, invMaxv);
                     AutoDetectStats& s = stats[off];
-                    s.observed++;
-                    if (lastObservedValid[off]) {
-                        if (std::abs(lastObservedFg[off] - fgRaw) > transitionThreshold) {
-                            s.fgTransition++;
+                    if (!reuseUnweighted) {
+                        accumulateTemporalHistSample(off, fgRaw, invMaxv);
+                        s.observed++;
+                        if (lastObservedValid[off]) {
+                            if (std::abs(lastObservedFg[off] - fgRaw) > transitionThreshold) {
+                                s.fgTransition++;
+                            }
+                        }
+                        lastObservedFg[off] = fgRaw;
+                        lastObservedValid[off] = 1;
+
+                        if (preparedEdge < 0.0f) {
+                            AccumulateCorrectedEdge(frameWork, off, x, y, invMaxv, statsPass);
+                        } else if (preparedEdge > 0.0f) {
+                            auto& edge = statsPass.edgeAccumBuf[off];
+                            edge.sumEdge += preparedEdge;
+                            edge.sumEdge2 += preparedEdge * preparedEdge;
+                            edge.edgeCount++;
                         }
                     }
-                    lastObservedFg[off] = fgRaw;
-                    lastObservedValid[off] = 1;
-
-                    AccumulateCorrectedEdge(frameWork, off, x, y, invMaxv, statsPass);
 
                     // 背景推定不可(周辺辺が不一致など)な点は無効サンプルとして棄却。
                     if (!bgOk) {
                         return 0;
                     }
-                    s.totalCandidates++;
+                    if (!reuseUnweighted) s.totalCandidates++;
                     const double f = (double)frameWork[off] * invMaxv;
                     const double b = (double)bg * invMaxv;
 
                     if (IsExtremeContrastSample(f, b)) {
-                        s.rejectedExtreme++;
+                        if (!reuseUnweighted) s.rejectedExtreme++;
                         return 0;
                     }
 
-                    s.rawSampleCount++;
+                    if (!reuseUnweighted) s.rawSampleCount++;
                     const int binIdx = std::min(kHistBins - 1, (int)(fgRaw * invMaxv * kHistBins));
                     auto& bin = binAccumBuf[binAccumIndex(off, binIdx)];
-                    accumulateSegmentConsensusSample(off, segmentConsensusIndex, f, b);
-                    AddBinAccumSample(bin, f, b, calcSampleResidualWeight(off, f, b));
+                    if (reuseUnweighted) {
+                        const double w = std::max(0.0, calcSampleResidualWeight(off, f, b));
+                        bin.sum_weight += w;
+                        bin.sum_weighted_fg += w * f;
+                        bin.sum_weighted_bg += w * b;
+                    } else {
+                        accumulateSegmentConsensusSample(off, segmentConsensusIndex, f, b);
+                        AddBinAccumSample(bin, f, b, calcSampleResidualWeight(off, f, b));
+                    }
                     return 1;
                 };
 
@@ -6704,23 +7057,33 @@ namespace {
                     if constexpr (std::is_same_v<pixel_t, uint8_t>) {
                         const bool blockInRange = useBgBlock32
                             && x + 32 <= xEnd
-                            && x - radius >= 0 && x + 31 + radius < scanw
-                            && y - radius >= 0 && y + radius < scanh;
+                            && x - radius >= 0 && x + 31 + radius < scanw;
                         if (blockInRange) {
                             float bg[32];
-                            const uint32_t bgValidMask = TryEstimateBgBlock32U8(frameWork, scanw, scanh,
-                                x, y, radius, thresholdRaw, bg, transposed);
+                            float preparedEdges[32];
+                            if (!reuseUnweighted) {
+                                CalcCorrectedEdges32U8_AVX2(frameWork.data() + x + y * scanw, scanw, invMaxv, preparedEdges);
+                            }
+                            const uint32_t bgValidMask = estimateBackgroundBlock(frameWork, x, y, thresholdRaw, transposed, cache, bg);
                             for (int lane = 0; lane < 32; lane++) {
                                 localFrameCount += collectOne(x + lane,
-                                    (bgValidMask & (1u << lane)) != 0, bg[lane]);
+                                    (bgValidMask & (1u << lane)) != 0, bg[lane], reuseUnweighted ? 0.0f : preparedEdges[lane]);
                             }
                             x += 32;
                             continue;
                         }
                     }
                     float bg = 0.0f;
-                    const bool bgOk = TryEstimateBg(frameWork, scanw, scanh, x, y,
-                        radius, thresholdRaw, bg, nullptr, transposed);
+                    bool bgOk = false;
+                    const size_t offset = cache ? backgroundCacheIndex(x, y) : 0;
+                    if (cache && !std::isnan(cache[offset])) {
+                        bgOk = cache[offset] >= 0.0f;
+                        if (bgOk) bg = cache[offset];
+                    } else {
+                        bgOk = TryEstimateBg(frameWork, scanw, scanh, x, y,
+                            radius, thresholdRaw, bg, nullptr, transposed);
+                        if (cache) cache[offset] = bgOk ? bg : -1.0f;
+                    }
                     localFrameCount += collectOne(x, bgOk, bg);
                     x++;
                 }
@@ -6744,6 +7107,7 @@ namespace {
 
         template<typename pixel_t>
         int collectFrameSamples(const std::vector<pixel_t>& frameWork, const float invMaxv, const float rawScale, const int thresholdRaw, StatsPassBuffers& statsPass, const std::vector<float>& traceFgRaw) {
+            statsPass.allFramesBatched = false;
             auto& stats = statsPass.stats;
             auto& binAccumBuf = statsPass.binAccumBuf;
             auto& lastObservedFg = statsPass.lastObservedFg;
@@ -6918,6 +7282,7 @@ namespace {
 
         void processStoredStatsBatch(const int firstFrame, const int batchCount,
             StatsPassBuffers& statsPass, Pass2Buffers* pass2) {
+            initializeBackgroundCache();
             struct BatchFrameInfo {
                 const uint8_t* src = nullptr;
                 int segmentConsensusIndex = 0;
@@ -6978,7 +7343,7 @@ namespace {
                 for (int ai = begin; ai < end; ai++) {
                     const int bi = activeFrames[ai];
                     preprocessStoredFrameSingleThread(frames[bi].src, scanw,
-                        statsPass.batchFrameWork8[bi], thresholdRaw);
+                        statsPass.batchFrameWork8[bi], thresholdRaw, firstFrame + bi);
                     if (useTranspose) {
                         buildFrameTranspose8(statsPass.batchFrameWork8[bi], statsPass.batchFrameTranspose8[bi]);
                     }
@@ -6993,6 +7358,20 @@ namespace {
                 ? 1 : std::min(collectXSplits, innerWidth);
             const int yTasks = (innerHeight + collectYBlock - 1) / collectYBlock;
             const int totalTasks = yTasks * xSplits;
+            std::vector<int> xBoundaries(xSplits + 1);
+            for (int tile = 0; tile <= xSplits; tile++) {
+                xBoundaries[tile] = kScanEdgeMargin + (innerWidth * tile) / xSplits;
+            }
+            if (useBgBlock32) {
+                // 内側の開始位置とタイル境界を同じ32画素の区切りへ合わせる。
+                const int anchor = std::max(kScanEdgeMargin, radius);
+                for (int tile = 1; tile < xSplits; tile++) {
+                    const int aligned = anchor + ((xBoundaries[tile] - anchor) / 32) * 32;
+                    if (aligned > xBoundaries[tile - 1] && aligned < xBoundaries[tile + 1]) {
+                        xBoundaries[tile] = aligned;
+                    }
+                }
+            }
             std::vector<int> taskFrameCounts((size_t)totalTasks * batchCount, 0);
 
             // 各空間タイルを一つのワーカーが所有し、同じ画素をフレーム順に更新する。
@@ -7005,8 +7384,8 @@ namespace {
                     if (localY0 >= localY1) {
                         continue;
                     }
-                    const int localX0 = (innerWidth * tileX) / xSplits;
-                    const int localX1 = (innerWidth * (tileX + 1)) / xSplits;
+                    const int localX0 = xBoundaries[tileX] - kScanEdgeMargin;
+                    const int localX1 = xBoundaries[tileX + 1] - kScanEdgeMargin;
                     if (localX0 >= localX1) {
                         continue;
                     }
@@ -7019,7 +7398,7 @@ namespace {
                             statsPass.batchFrameWork8[bi], kInvMaxv, thresholdRaw, transitionThreshold,
                             statsPass, transposed, frames[bi].segmentConsensusIndex,
                             localY0 + kScanEdgeMargin, localY1 + kScanEdgeMargin,
-                            localX0 + kScanEdgeMargin, localX1 + kScanEdgeMargin, useBgBlock32);
+                            localX0 + kScanEdgeMargin, localX1 + kScanEdgeMargin, useBgBlock32, firstFrame + bi);
                     }
                 }
             }, 1);
@@ -7042,12 +7421,29 @@ namespace {
             }
         }
 
+        bool useInitialStatsBatch(const StatsPassBuffers* statsPass, const Pass2Buffers* pass2) const {
+            // 高bit入力は元の精度を保ち、追跡ログとディスクキャッシュは従来経路へ戻す。
+            return threadN >= 8 && bitDepth == 8 && roiCacheCaptureActive
+                && roiCacheBackend == RoiCacheBackend::Ram && statsPass != nullptr && pass2 == nullptr
+                && tracePoints.empty() && ParseEnvIntDefault("AMT_LOGO_FRAME_BATCH", 16, 1) > 1;
+        }
+
+        void flushInitialStatsBatch(StatsPassBuffers& statsPass) {
+            if (statsPass.pendingInitialFrames <= 0) {
+                return;
+            }
+            const int count = statsPass.pendingInitialFrames;
+            processStoredStatsBatch(readFrames, count, statsPass, nullptr);
+            statsPass.pendingInitialFrames = 0;
+        }
+
         bool processFrame(AVFrame* frame, StatsPassBuffers* statsPass, Pass2Buffers* pass2) {
             if (sourceFrameIndex < frameWindowStart) {
                 sourceFrameIndex++;
                 return true;
             }
-            if (readFrames >= searchFrames) {
+            const int pendingFrames = statsPass != nullptr ? statsPass->pendingInitialFrames : 0;
+            if (readFrames + pendingFrames >= searchFrames) {
                 return false;
             }
 
@@ -7057,12 +7453,31 @@ namespace {
                 const auto* srcY = reinterpret_cast<const uint8_t*>(frame->data[0]);
                 const int pitchY = frame->linesize[0] / sizeof(uint8_t);
                 buildDetectFrame<uint8_t>(srcY, pitchY, detectFrame8);
+                if (useInitialStatsBatch(statsPass, pass2)) {
+                    // 生ROIを保存してからバッチを処理し、デコードとの同期をまとめる。
+                    appendDetectFrameToRoiCache(detectFrame8.data(), scanw);
+                    statsPass->pendingInitialFrames++;
+                    sourceFrameIndex++;
+                    const int frameBatch = std::min(32, ParseEnvIntDefault("AMT_LOGO_FRAME_BATCH", 16, 1));
+                    if (statsPass->pendingInitialFrames >= frameBatch
+                        || readFrames + statsPass->pendingInitialFrames >= searchFrames) {
+                        flushInitialStatsBatch(*statsPass);
+                    }
+                    return true;
+                }
+                // 万一、途中でバッチ条件が変わった場合も入力順を維持する。
+                if (statsPass != nullptr) {
+                    flushInitialStatsBatch(*statsPass);
+                }
                 frameCount = addFrame<uint8_t>(detectFrame8.data(), scanw, statsPass, pass2);
                 appendDetectFrameToRoiCache(detectFrame8.data(), scanw);
             } else {
                 const auto* srcY = reinterpret_cast<const uint16_t*>(frame->data[0]);
                 const int pitchY = frame->linesize[0] / sizeof(uint16_t);
                 buildDetectFrame<uint16_t>(srcY, pitchY, detectFrame16);
+                if (statsPass != nullptr) {
+                    flushInitialStatsBatch(*statsPass);
+                }
                 frameCount = addFrame<uint16_t>(detectFrame16.data(), scanw, statsPass, pass2);
                 appendDetectFrameToRoiCache(detectFrame16.data(), scanw);
             }
@@ -8014,7 +8429,28 @@ namespace {
             // q43 のように「bin代表点だけ見るとまだ二股だが、sample 単位では本流が見える」
             // ケースを拾うため、ここは再走査してでも sample 単位で処理する。
             sampleResidualReweightActive = true;
-            resetAccumulationState(&statsPass, pass2);
+            // 同じキャッシュと選別マスクを再走査する場合だけ、重みに依存しない統計を保持する。
+            const bool reuseUnweighted = bitDepth == 8 && hasStoredRoiCache()
+                && statsPass.allFramesBatched && threadN >= 8 && tracePoints.empty()
+                && ParseEnvIntDefault("AMT_LOGO_FRAME_BATCH", 16, 1) > 1;
+            if (reuseUnweighted) {
+                readFrames = 0;
+                sourceFrameIndex = 0;
+                statsPass.frameValidCounts.clear();
+                for (auto& bin : statsPass.binAccumBuf) {
+                    bin.sum_weight = bin.sum_weighted_fg = bin.sum_weighted_bg = 0.0;
+                }
+                if (pass2 != nullptr) {
+                    pass2->acceptedFrames = pass2->skippedFrames = 0;
+                }
+                statsPass.reuseUnweighted = true;
+            } else {
+                resetAccumulationState(&statsPass, pass2);
+            }
+            struct RestoreReuseFlag {
+                StatsPassBuffers& buffers;
+                ~RestoreReuseFlag() { buffers.reuseUnweighted = false; }
+            } restoreReuseFlag{ statsPass };
             if (hasStoredRoiCache()) {
                 runStoredRoiStatsPassWithProgress(progressPlan.stage, progressPlan.stageBase, progressPlan.stageSpan,
                     progressPlan.overallBase, progressPlan.overallSpan, statsPass, pass2);
@@ -11341,6 +11777,23 @@ namespace {
             THROW(RuntimeException, "Cancel requested");
         }
     }
+}
+
+// 検出と生成を同じ呼び出しスレッドで行うCLI用の任意API。
+extern "C" AMATSUKAZE_API void* LogoDecodeSession_Create(AMTContext* ctx, const tchar* srcpath, int serviceid) {
+    if (ctx == nullptr || srcpath == nullptr || logo::activeLogoDecodeSession != nullptr) return nullptr;
+    try {
+        logo::activeLogoDecodeSession = new logo::LogoDecodeSession(*ctx, srcpath, serviceid);
+        return logo::activeLogoDecodeSession;
+    } catch (const std::bad_alloc&) {
+        return nullptr;
+    }
+}
+
+extern "C" AMATSUKAZE_API void LogoDecodeSession_Delete(void* session) {
+    auto* decoder = static_cast<logo::LogoDecodeSession*>(session);
+    if (logo::activeLogoDecodeSession == decoder) logo::activeLogoDecodeSession = nullptr;
+    delete decoder;
 }
 
 // C API for P/Invoke

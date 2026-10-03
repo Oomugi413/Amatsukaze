@@ -12,6 +12,7 @@
 #include <thread>
 #include "AdtsParser.h"
 #include "PacketCache.h"
+#include "AudioTrackBuilder.h"
 #include "rgy_pipe.h"
 #include "rgy_mutex.h"
 #include "Subtitle.h"
@@ -554,7 +555,8 @@ static bool tryLoadResume(
         if (!setting.isSubtitlesEnabled()) {
             reformInfo->clearCaptionItems();
         }
-        reformInfo->prepare(setting.isSplitSub(), setting.isEncodeAudio(), setting.getFormat() == FORMAT_TSREPLACE);
+        reformInfo->prepare(setting.isSplitSub(), setting.isEncodeAudio(), setting.getFormat() == FORMAT_TSREPLACE,
+            setting.getAudioFormatChangeMode(), setting.getAudioFilePath());
         ctx.info(_T("[一時ファイル再利用] ストリーム情報を読み込みました"));
         if (!validateResumeFiles(setting, *reformInfo, info, reason)) {
             ctx.warnF(_T("[一時ファイル再利用] %s。通常処理へ戻ります"), reason.c_str());
@@ -691,7 +693,15 @@ static tstring createWhisperWaveInput(AMTContext& ctx,
         return tstring();
     }
 
-    const auto& frameIndexList = fileIn.audioFrames[entry.audioSourceIndex];
+    std::vector<int> plannedFrames;
+    if (fileIn.isAudioTrackPlanned) {
+        const auto& track = fileIn.audioTrackPlan.at(entry.localIndex);
+        for (const auto& ref : track.frames) {
+            plannedFrames.push_back(ref.operation != AudioTrackOperation::SILENCE ? ref.frameIndex : -1);
+        }
+    }
+    const auto& frameIndexList = !fileIn.isAudioTrackPlanned
+        ? fileIn.audioFrames[entry.audioSourceIndex] : plannedFrames;
     if (frameIndexList.empty()) {
         ctx.warnF(_T("Whisper入力wav作成: 音声%d-%d-%dにフレームが存在しません"), key.video, key.format, entry.audioSourceIndex);
         return tstring();
@@ -724,7 +734,9 @@ static tstring createWhisperWaveInput(AMTContext& ctx,
 
     const auto fmt = reformInfo.getFormat(key);
     int sampleRate = 48000;
-    if (entry.audioSourceIndex < (int)fmt.audioFormat.size() && fmt.audioFormat[entry.audioSourceIndex].sampleRate > 0) {
+    if (fileIn.isAudioTrackPlanned) {
+        sampleRate = fileIn.audioTrackPlan.at(entry.localIndex).sampleRate;
+    } else if (entry.audioSourceIndex < (int)fmt.audioFormat.size() && fmt.audioFormat[entry.audioSourceIndex].sampleRate > 0) {
         sampleRate = fmt.audioFormat[entry.audioSourceIndex].sampleRate;
     }
 
@@ -741,7 +753,10 @@ static tstring createWhisperWaveInput(AMTContext& ctx,
     std::vector<uint8_t> srcBuffer;
     std::vector<uint8_t> dstBuffer;
 
-    for (const auto& frame : waveFrames) {
+    for (size_t waveIndex = 0; waveIndex < waveFrames.size(); ++waveIndex) {
+        const auto& frame = waveFrames[waveIndex];
+        const int sourceDualMonoChannel = fileIn.isAudioTrackPlanned
+            ? fileIn.audioTrackPlan.at(entry.localIndex).frames[waveIndex].dualMonoChannel : entry.dualMonoChannel;
         int frameSamples = (frame.waveLength > 0)
             ? (int)(frame.waveLength / (bytesPerSample * srcChannels))
             : samplesPerFrame;
@@ -763,16 +778,28 @@ static tstring createWhisperWaveInput(AMTContext& ctx,
         }
 
         if (destChannels == srcChannels) {
+            if (fileIn.isAudioTrackPlanned && sourceDualMonoChannel >= 0) {
+                // mergeの目標が2chでも、元デュアルモノ区間は指定言語だけを両側へ渡す。
+                auto* samples = reinterpret_cast<int16_t*>(srcBuffer.data());
+                for (int sample = 0; sample < frameSamples; ++sample) {
+                    const int16_t value = samples[sample * srcChannels + sourceDualMonoChannel];
+                    samples[sample * srcChannels] = samples[sample * srcChannels + 1] = value;
+                }
+            }
             if (fwrite(srcBuffer.data(), srcBytes, 1, fp.get()) != 1) {
                 THROWF(IOException, "Whisper入力wav作成: 書き込みに失敗 (%s)", wavPath.c_str());
             }
         } else {
             dstBuffer.resize((size_t)frameSamples * bytesPerSample);
-            const int channelIndex = (entry.dualMonoChannel >= 0 && entry.dualMonoChannel < srcChannels) ? entry.dualMonoChannel : 0;
+            const int channelIndex = (sourceDualMonoChannel >= 0 && sourceDualMonoChannel < srcChannels) ? sourceDualMonoChannel : 0;
             const int16_t* srcSamples = reinterpret_cast<const int16_t*>(srcBuffer.data());
             int16_t* dstSamples = reinterpret_cast<int16_t*>(dstBuffer.data());
             for (int s = 0; s < frameSamples; s++) {
-                dstSamples[s] = srcSamples[s * srcChannels + channelIndex];
+                if (fileIn.isAudioTrackPlanned && sourceDualMonoChannel < 0) {
+                    dstSamples[s] = static_cast<int16_t>((static_cast<int>(srcSamples[s * srcChannels]) + srcSamples[s * srcChannels + 1]) / 2);
+                } else {
+                    dstSamples[s] = srcSamples[s * srcChannels + channelIndex];
+                }
             }
             if (fwrite(dstBuffer.data(), dstBuffer.size(), 1, fp.get()) != 1) {
                 THROWF(IOException, "Whisper入力wav作成: 書き込みに失敗 (%s)", wavPath.c_str());
@@ -1603,7 +1630,8 @@ void DoBadThing() {
     }
 
     if (!isReusingTmp) {
-        reformInfo.prepare(setting.isSplitSub(), setting.isEncodeAudio(), setting.getFormat() == FORMAT_TSREPLACE);
+        reformInfo.prepare(setting.isSplitSub(), setting.isEncodeAudio(), setting.getFormat() == FORMAT_TSREPLACE,
+            setting.getAudioFormatChangeMode(), setting.getAudioFilePath());
     }
     if (setting.isMpeg2PartialEnabled()) {
         if (reformInfo.getVideoStreamFormat() != VS_MPEG2) {
@@ -1740,6 +1768,8 @@ void DoBadThing() {
             copyCutInfoForCMOnly(ctx, setting, reformInfo, cmanalyze, numVideoFiles);
         }
         if (setting.isOutputChapterEnabled()) {
+            // CM解析のみでも、チャプター出力に使う出力キーと保持フレーム列を確定する。
+            reformInfo.genAudio(setting.getCMTypes());
             ctx.info(_T("[チャプター生成]"));
             for (const auto& key : reformInfo.getOutFileKeys()) {
                 const auto& fileIn = reformInfo.getEncodeFile(key);
@@ -1748,7 +1778,7 @@ void DoBadThing() {
                     chapterMakers[key.video]->exec(key);
                     const auto path = setting.getTmpChapterPath(key);
                     if (File::exists(path)) {
-                        const auto dstchapter = setting.getOutChapterPath(fileIn.key, fileIn.keyMax, setting.getFormat(), eoInfo.format);
+                        const auto dstchapter = setting.getOutChapterPath(fileIn.outKey, fileIn.keyMax, setting.getFormat(), eoInfo.format);
                         File::copy(path, dstchapter);
                     }
                 }
@@ -1815,6 +1845,18 @@ void DoBadThing() {
             const auto key = keys[i];
             const auto& fileIn = reformInfo.getEncodeFile(key);
             const auto fmt = reformInfo.getFormat(key);
+            if (fileIn.isAudioTrackPlanned) {
+                for (int adst = 0; adst < (int)fileIn.audioTrackPlan.size(); ++adst) {
+                    const auto& track = fileIn.audioTrackPlan[adst];
+                    const auto filepath = setting.getIntAudioFilePath(key, adst, setting.getAudioEncoder());
+                    BuildAudioTrack(ctx, audioCache, track, filepath, reformInfo.getAudioFrameList());
+                    // Whisperも出力プランの無音区間とデュアルモノ展開を反映する。
+                    const int dualMonoChannel = track.layout == AUDIO_MONO ? track.logicalTrack : -1;
+                    whisperAudioEntries.push_back({ i, key, adst, filepath, track.sourceTrack, dualMonoChannel });
+                    ctx.infoF(_T("音声%d-%d (%s) 出力 -> %s"), fileIn.outKey.format, adst, track.name.c_str(), filepath.c_str());
+                }
+                continue;
+            }
             for (int asrc = 0, adst = 0; asrc < (int)fileIn.audioFrames.size(); asrc++) {
                 const std::vector<int>& frameList = fileIn.audioFrames[asrc];
                 if (frameList.size() > 0) {

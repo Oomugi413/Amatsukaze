@@ -7,6 +7,7 @@ using System.Linq;
 using System.Runtime.Serialization;
 using System.Text;
 using System.Globalization;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Amatsukaze.Lib;
 
@@ -39,6 +40,15 @@ namespace Amatsukaze.Server
         VCEEnc,
         SVTAV1,
         x262
+    }
+
+    // 欠損したDataMemberは0になるため、サーバではmergeを0にする。
+    // C++側はsplit=0だが、CLIには文字列で渡すので番号の違いは問題ない。
+    public enum AudioFormatChangeMode
+    {
+        Merge = 0,
+        Split = 1,
+        Separate = 2
     }
 
     public enum AudioEncoderType
@@ -481,8 +491,6 @@ namespace Amatsukaze.Server
         [DataMember]
         public bool IgnoreNicoJKError { get; set; }
         [DataMember]
-        public bool NicoJK18 { get; set; }
-        [DataMember]
         public bool NicoJKLog { get; set; }
         [DataMember]
         public bool[] NicoJKFormats { get; set; }
@@ -553,6 +561,8 @@ namespace Amatsukaze.Server
         [DataMember]
         public bool EnableAudioEncode { get; set; }
         [DataMember]
+        public int AudioFormatChangeMode { get; set; }
+        [DataMember]
         public AudioEncoderType AudioEncoderType { get; set; }
         [DataMember]
         public string NeroAacOption { get; set; }
@@ -587,6 +597,73 @@ namespace Amatsukaze.Server
     // 文字列リソース（列挙体に対応する文字列配列）
     public static class ProfileSettingExtensions
     {
+        public static string[] AudioFormatChangeModeList { get; } = new string[]
+        {
+            "トラック統合", "ファイル分割", "トラック分離"
+        };
+
+        // UIでの表示順（モード値の並び）。保存値はモード値のまま。
+        public static int[] AudioFormatChangeModeDisplayOrder { get; } = new int[]
+        {
+            (int)AudioFormatChangeMode.Merge, (int)AudioFormatChangeMode.Separate, (int)AudioFormatChangeMode.Split
+        };
+
+        // AudioFormatChangeModeListと同じくモード値の順に並べる。
+        private static readonly string[] AudioFormatChangeModeDescriptionList = new string[]
+        {
+            "元の音声トラックごとに1本のトラックへまとめて出力します。\n途中でチャンネル数が変わる区間は、主となる構成へ変換して再エンコードします。",
+            "音声フォーマットが変わる位置でファイルを分割して出力します。",
+            "チャンネル数などの構成ごとに別トラックとして出力します。\n再エンコードはせず、音声がない区間は無音で埋めます。"
+        };
+
+        // 選択中の項目によらず、全モードの説明を表示順でまとめたツールチップ。
+        public static string AudioFormatChangeModeToolTip { get; } = string.Join("\n\n",
+            AudioFormatChangeModeDisplayOrder.Select(mode => "- " + AudioFormatChangeModeList[mode] + "\n  "
+                + AudioFormatChangeModeDescriptionList[mode].Replace("\n", "\n  ")));
+
+        public static int NormalizeAudioFormatChangeMode(int mode)
+        {
+            return mode == (int)AudioFormatChangeMode.Split || mode == (int)AudioFormatChangeMode.Separate
+                ? mode : (int)AudioFormatChangeMode.Merge;
+        }
+
+        public static string GetAudioFormatChangeModeArgument(this ProfileSetting profile)
+        {
+            switch (NormalizeAudioFormatChangeMode(profile?.AudioFormatChangeMode ?? (int)AudioFormatChangeMode.Merge))
+            {
+                case (int)AudioFormatChangeMode.Split: return "split";
+                case (int)AudioFormatChangeMode.Separate: return "separate";
+                default: return "merge";
+            }
+        }
+
+        public static string GetAudioFormatChangeModeDisplayName(this ProfileSetting profile)
+        {
+            return AudioFormatChangeModeList[NormalizeAudioFormatChangeMode(profile?.AudioFormatChangeMode ?? (int)AudioFormatChangeMode.Merge)];
+        }
+
+        private static readonly Regex DeinterlaceOptionPattern = new Regex(
+            @"(?<!\S)--vpp-(?<name>kfm|afs|nnedi|yadif|bwdif|decomb|ivtc|deinterlace)(?=\s|=|$)",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        public static bool HasDeinterlaceOption(string option)
+        {
+            if (string.IsNullOrWhiteSpace(option))
+            {
+                return false;
+            }
+            foreach (Match match in DeinterlaceOptionPattern.Matches(option))
+            {
+                if (!match.Groups["name"].Value.Equals("deinterlace", StringComparison.OrdinalIgnoreCase)
+                    || !Regex.IsMatch(option.Substring(match.Index + match.Length),
+                        @"^\s*(?:=\s*)?none(?=\s|$)", RegexOptions.IgnoreCase))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         public static string[] EncoderList { get; } = new string[] { "x264", "x265", "QSVEnc", "NVEnc", "VCEEnc", "SVT-AV1", "x262" };
         public static string[] Mpeg2DecoderList { get; } = new string[] { "デフォルト", "QSV", "CUVID" };
         public static string[] H264DecoderList { get; } = new string[] { "デフォルト", "QSV", "CUVID" };
@@ -1029,7 +1106,6 @@ namespace Amatsukaze.Server
             keyValueBool("ニコニコ実況コメントを有効にする", profile.EnableNicoJK);
             keyValueBool("ニコニコ実況コメントのエラーを無視する", profile.IgnoreNicoJKError);
             keyValueBool("NicoJKログから優先的にコメントを取得する", profile.NicoJKLog);
-            keyValueBool("NicoJK18サーバからコメントを取得する", profile.NicoJK18);
             keyValue("コメント出力フォーマット", profile.NicoJKFormatMask.ToString());
             keyValueBool("入力ファイルの移動を無効にする", profile.DisableMoveInputFile);
             keyValueBool("関連ファイル(*.err,*.program.txt)も処理", profile.MoveEDCBFiles);
@@ -1076,6 +1152,7 @@ namespace Amatsukaze.Server
             keyValueBool("エンコードアフィニティを無視する", profile.IgnoreEncodeAffinity);
             keyValue("エンコードバッファフレーム数", profile.NumEncodeBufferFrames.ToString());
             keyValue("追加ロゴ消去", profile.AdditionalEraseLogo ?? "なし");
+            keyValue("音声フォーマット変更", profile.GetAudioFormatChangeModeDisplayName());
             keyValueBool("音声エンコードを有効にする", profile.EnableAudioEncode);
             if (profile.EnableAudioEncode)
             {

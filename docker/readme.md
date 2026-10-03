@@ -114,8 +114,8 @@ cd Amatsukaze/docker
 vi compose.yml
 ```
 
-このDockerfileはUbuntu 24.04およびCUDA 12.9を使用し、Oomugi413版NVEncCとVulkan対応libplaceboを組み込みます。
-Amatsukaze本体は、Oomugi413版の最新リリースまたは`AMATSUKAZE_ARCHIVE`で指定した配布アーカイブから展開します。
+このDockerfileは通常のUbuntu 24.04イメージを使用し、NVRTC 12.9、Oomugi413版NVEncC、Vulkan対応libplacebo、およびfdkaacを組み込みます。Oomugi413版NVEncCのNPPは静的リンクされているため、NPPの共有ライブラリは別途導入しません。
+Amatsukaze本体は、Oomugi413版の最新リリースから展開します。
 
 ## 起動
 
@@ -218,12 +218,10 @@ docker compose up -d
 
 ### デバッグ
 
-リリース前のローカルアーカイブを使ってDockerイメージをビルドする場合は、アーカイブを`docker`ディレクトリに置き、`AMATSUKAZE_ARCHIVE`でファイル名を指定します。
+リリース前のローカルアーカイブを使ってDockerイメージをビルドする場合は、アーカイブを`docker`ディレクトリに置き、`Dockerfile`のAmatsukaze本体展開処理にあるデバッグ用の`COPY`と`RUN`のコメントを外します。`COPY`のアーカイブ名は実際のファイル名に合わせてください。
 
 ```sh
-docker build \
-  --build-arg AMATSUKAZE_ARCHIVE=Amatsukaze_linux_trial_x64.tar.xz \
-  -t amatsukaze .
+docker build -t amatsukaze .
 ```
 
-`AMATSUKAZE_ARCHIVE`を指定しない場合は、最新リリースのアーカイブを自動的に取得します。
+通常のDockerfileではローカルファイルをコピーせず、最新リリースのアーカイブを自動的に取得します。

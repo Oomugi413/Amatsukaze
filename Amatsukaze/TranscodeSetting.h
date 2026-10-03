@@ -11,6 +11,7 @@
 
 #include <string>
 
+#include "AudioFormatChange.h"
 #include "StreamUtils.h"
 #include "CoreUtils.hpp"
 #include "InterProcessComm.h"
@@ -159,7 +160,8 @@ std::vector<std::pair<tstring, bool>> makeMuxerArgs(
     bool muxerAddEncoderCmd,
     bool sarInContainerOnly,
     const tstring& encoderName,
-    const tstring& encoderOptions);
+    const tstring& encoderOptions,
+    const std::vector<tstring>& audioTrackNames = std::vector<tstring>());
 
 tstring makeTimelineEditorArgs(
     const tstring& binpath,
@@ -237,6 +239,7 @@ struct Config {
     bool sarInContainerOnly;
     std::pair<int, int> userSAR;
     ENUM_AUDIO_ENCODER audioEncoder;
+    AUDIO_FORMAT_CHANGE_MODE audioFormatChangeMode = AFC_SPLIT;
     tstring audioEncoderPath;
     tstring audioEncoderOptions;
     tstring muxerPath;
@@ -270,7 +273,6 @@ struct Config {
     bool outputChapter;
     bool subtitles;
     int nicojkmask;
-    bool nicojk18;
     bool useNicoJKLog;
     BitrateSetting bitrate;
     double bitrateCM;
@@ -385,6 +387,8 @@ public:
 
     bool isEncodeAudio() const;
 
+    AUDIO_FORMAT_CHANGE_MODE getAudioFormatChangeMode() const;
+
     tstring getAudioEncoderPath() const;
 
     tstring getAudioEncoderOptions() const;
@@ -440,7 +444,6 @@ public:
 
     bool isNicoJKEnabled() const;
 
-    bool isNicoJK18Enabled() const;
 
     bool isUseNicoJKLog() const;
 
@@ -619,7 +622,6 @@ public:
 
     tstring getTmpChapterPath(EncodeFileKey key) const;
 
-    tstring getTmpNicoJKXMLPath() const;
 
     tstring getTmpNicoJKASSPath(NicoJKType type) const;
 

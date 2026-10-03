@@ -551,6 +551,28 @@
                     <CheckBox Content="音声をエンコードする" DockPanel.Dock="Right" VerticalAlignment="Center" Margin="0,4"
                                   IsChecked="{Binding Model.SelectedProfile.EnableAudioEncode, Mode=TwoWay}"
                                   IsEnabled="{Binding Model.SelectedProfile.Mpeg2PartialConstraintsEnabled}"/>
+                    <StackPanel Orientation="Horizontal" Margin="0,3"
+                                ToolTip="音声をエンコードする / tsreplace出力では無効です">
+                        <StackPanel.Style>
+                            <Style TargetType="StackPanel">
+                                <Setter Property="Visibility" Value="Visible"/>
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding Model.SelectedProfile.EnableAudioEncode}" Value="True">
+                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding Model.SelectedProfile.TsreplaceSelected}" Value="True">
+                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </StackPanel.Style>
+                        <TextBlock Text="音声フォーマット変更" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <ComboBox HorizontalAlignment="Left" Width="220" Height="22"
+                                  ItemsSource="{Binding Model.SelectedProfile.AudioFormatChangeModeList}"
+                                  DisplayMemberPath="Name" SelectedValuePath="Value"
+                                  SelectedValue="{Binding Model.SelectedProfile.AudioFormatChangeMode, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                  ToolTip="{Binding Model.SelectedProfile.AudioFormatChangeModeToolTip}"/>
+                    </StackPanel>
                     <StackPanel>
                         <StackPanel.Style>
                             <Style TargetType="StackPanel">
@@ -626,24 +648,6 @@
                         <CheckBox.ToolTip>
                             <TextBlock>NicoJKログからのコメント取得は完全にNicoConvAss依存です。
                             <LineBreak/>NicoConvAss.iniのNicoJK_pathを設定しておいてください。
-                            </TextBlock>
-                        </CheckBox.ToolTip>
-                    </CheckBox>
-                    <CheckBox Grid.Row="1" Content="NicoJK18サーバからコメントを取得する（推奨）" Margin="0,3"
-                                  IsChecked="{Binding Model.SelectedProfile.NicoJK18, Mode=TwoWay}"
-                                  IsEnabled="{Binding IsChecked, ElementName=nicoJKCheck}">
-                        <CheckBox.Style>
-                            <Style TargetType="CheckBox">
-                                <Style.Triggers>
-                                    <DataTrigger Binding="{Binding Model.Setting.IsServerLinux}" Value="True">
-                                        <Setter Property="Visibility" Value="Collapsed"/>
-                                    </DataTrigger>
-                                </Style.Triggers>
-                            </Style>
-                        </CheckBox.Style>
-                        <CheckBox.ToolTip>
-                            <TextBlock>セットアップ不要で取得できるサーバです。
-                            <LineBreak/>これを使わない場合、JKCommentGetterのセットアップが必要になります（結構大変）。
                             </TextBlock>
                         </CheckBox.ToolTip>
                     </CheckBox>

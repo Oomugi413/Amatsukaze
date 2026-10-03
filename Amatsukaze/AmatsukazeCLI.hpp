@@ -74,6 +74,7 @@ static void printHelp(const tchar* bin) {
         "                      指定しなければ音声はエンコードしない\n"
         "  -ae|--audio-encoder <パス> 音声エンコーダ[]"
         "  -aeo|--audio-encoder-option <オプション> 音声エンコーダへ渡すオプション[]\n"
+        "  --audio-format-change split|merge|separate 音声フォーマット変更時の出力方法[split]\n"
         "  -fmt|--format <フォーマット> 出力フォーマット[mp4]\n"
         "                      対応フォーマット: mp4,mkv,m2ts,ts,tsreplace\n"
         "  --use-mkv-when-sub-exists 字幕がある場合にはmkv出力を強制する\n"
@@ -138,7 +139,6 @@ static void printHelp(const tchar* bin) {
         "                      4 : CMのみ出力\n"
         "                      8 : 前後のCMのみカット\n"
         "                      ORも可 例) 6: 本編とCMを分離\n"
-        "  --nicojk18          ニコニコ実況コメントをnicojk18サーバから取得\n"
         "  --nicojklog         ニコニコ実況コメントをNicoJKログフォルダから取得\n"
         "                      (NicoConvASSを -nicojk 1 で呼び出します)\n"
         "  --nicojkmask <数値> ニコニコ実況コメントマスク[1]\n"
@@ -368,6 +368,17 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
             if (conf.audioEncoder == (ENUM_AUDIO_ENCODER)-1) {
                 printTStderr(StringFormat(_T("--audio-encoder-typeの指定が間違っています: %s\n"), arg.c_str()));
             }
+        } else if (key == _T("--audio-format-change")) {
+            const tstring arg = getParam(argc, argv, i++);
+            if (arg == _T("split")) {
+                conf.audioFormatChangeMode = AFC_SPLIT;
+            } else if (arg == _T("merge")) {
+                conf.audioFormatChangeMode = AFC_MERGE;
+            } else if (arg == _T("separate")) {
+                conf.audioFormatChangeMode = AFC_SEPARATE;
+            } else {
+                THROW(ArgumentException, "--audio-format-changeにはsplit、merge、separateを指定してください");
+            }
         } else if (key == _T("-ae") || key == _T("--audio-encoder")) {
             conf.audioEncoderPath = pathNormalize(getParam(argc, argv, i++));
         } else if (key == _T("-aeo") || key == _T("--audio-encoder-option")) {
@@ -561,8 +572,6 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
 #endif
         } else if (key == _T("--nicojkass")) {
             conf.nicoJKAssPath = pathNormalize(getParam(argc, argv, i++));
-        } else if (key == _T("--nicojk18")) {
-            conf.nicojk18 = true;
         } else if (key == _T("--webvtt")) {
             conf.webvtt = true;
         } else if (key == _T("--sub-mode")) {

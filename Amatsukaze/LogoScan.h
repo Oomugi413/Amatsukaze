@@ -40,9 +40,15 @@ bool IsAVX512BWAvailable();
 float CalcCorrelation5x5_AVX(const float* k, const float* Y, int x, int y, int w, float* pavg);
 float CalcCorrelation5x5_AVX2(const float* k, const float* Y, int x, int y, int w, float* pavg);
 void removeLogoLineAVX2(float *dst, const float *src, const int srcStride, const float *logoAY, const float *logoBY, const int logowidth, const float maxv, const float fade);
+void prepareLogoBackgroundLineAVX2(float *dst, const float *src, const float *logoAY, const float *logoBY, int width, float maxv);
+void blendLogoBackgroundLineAVX2(float *dst, const float *src, const float *background, int width, float fade);
+void blendLogoBackgroundFadesAVX2(float* dst, const float* src, const float* background, int count, const float* fades, int activeFades);
+void CalcCorrelation5x5Fades_AVX2(const float* k, const float* work, int x, int y, int w, float* avgs, float* sums);
 void BilateralFilter5x5U8RangeLUT_AVX2(uint8_t* dst, const uint8_t* srcBase, int srcPitch, int w, int h, const float* spatial, const float* rangeWeight, uint8_t maxv, int y0, int y1);
 void BilateralFilter5x5U8RangeLUT_AVX512(uint8_t* dst, const uint8_t* srcBase, int srcPitch, int w, int h, const float* spatial, const float* rangeWeight, uint8_t maxv, int y0, int y1);
 bool TryEstimateBgEvalSideContiguousU8_AVX2(const uint8_t* ptr, int len, int threshold, float& avg, uint8_t& minvOut, uint8_t& maxvOut);
+void CalcCorrectedEdges32U8_AVX2(const uint8_t* src, int stride, float invMaxv, float* edges);
+void CalcBgSideStatsVerticalBoundary32U8_AVX2(const uint8_t* src, int stride, int height, int x, int y, int radius, uint16_t* sums, uint8_t* mins, uint8_t* maxs);
 void CalcBgSideStatsBlock32U8_AVX2(const uint8_t* src, int stride, int x, int y, int radius,
     uint16_t* sideSums, uint8_t* sideMins, uint8_t* sideMaxs);
 
@@ -90,6 +96,7 @@ class LogoDataParam : public LogoData {
     };
     int imgw, imgh, imgx, imgy; // この4つはすべて2の倍数
     std::unique_ptr<uint8_t[]> mask;
+    std::vector<std::pair<int, int>> maskCoordinates;
     std::unique_ptr<float[]> kernels;
     struct ScaleLimit {
         float scale;   // 正規化用スケール（想定される相関が1になるようにするため）
@@ -123,6 +130,10 @@ public:
     void CreateLogoMask(float maskratio);
 
     float EvaluateLogo(const float *src, float maxv, float fade, float* work, int stride = -1);
+    void PrepareLogoBackground(const float* src, float maxv, float* background, int stride = -1);
+    float EvaluateLogoWithBackground(const float* src, const float* background, float maxv, float fade, float* work, int stride = -1);
+    void EvaluateLogoFadesAVX2(const float* src, const float* background, float maxv,
+        const float* fades, int fadeCount, float* work, float* scores);
 
     std::unique_ptr<LogoDataParam> MakeFieldLogo(bool bottom);
 
@@ -397,17 +408,24 @@ typedef bool(*LOGO_ANALYZE_CB)(float progress, int nread, int total, int ngather
 //   大きめの処理区間にまとめて通知する。
 typedef bool(*LOGO_AUTODETECT_CB)(int stage, float stageProgress, float progress, int nread, int total);
 
+// 再生成のフレーム評価だけを並列実行する。進捗通知は呼び出し元スレッドで行う。
+int GetLogoRemakeEvaluationThreadCount();
+void RunLogoRemakeFrameEvaluation(int numFrames, int threadCount,
+    const std::function<void(int, int, int)>& evaluateRange,
+    const std::function<void(int)>& reportProgress);
+
 class LogoScanDataCompressed {
 public:
     LogoScanDataCompressed();
     ~LogoScanDataCompressed();
 
     void compress(const void *ptr, size_t datasize);
+    void storeRaw(const void *ptr, size_t datasize);
     void decompress(void *ptr);
     int originalSize() const { return original_size; }
 protected:
     std::vector<char> compressed_data;
-    
+    std::vector<uint8_t> raw_data;
     unsigned long original_size;
 };
 
@@ -419,6 +437,8 @@ class LogoAnalyzer : AMTObject {
         int bitDepth;
         int readCount;
         int64_t filesize;
+        bool retainRaw;
+        int inputOriginX = 0, inputOriginY = 0;
         std::vector<uint8_t> memScanData;
         std::unique_ptr<LogoScan> logoscan;
         std::vector<std::unique_ptr<LogoScanDataCompressed>> scanData;
@@ -439,8 +459,8 @@ class LogoAnalyzer : AMTObject {
             // スキャン部分だけ
             const int pitchY = frame->linesize[0] / sizeof(pixel_t);
             const int pitchUV = frame->linesize[1] / sizeof(pixel_t);
-            const int offY = pThis->scanx + pThis->scany * pitchY;
-            const int offUV = (pThis->scanx >> pThis->logUVx) + (pThis->scany >> pThis->logUVy) * pitchUV;
+            const int offY = (pThis->scanx - inputOriginX) + (pThis->scany - inputOriginY) * pitchY;
+            const int offUV = ((pThis->scanx - inputOriginX) >> pThis->logUVx) + ((pThis->scany - inputOriginY) >> pThis->logUVy) * pitchUV;
             const pixel_t* scanY = (const pixel_t *)frame->data[0] + offY;
             const pixel_t* scanU = (const pixel_t *)frame->data[1] + offUV;
             const pixel_t* scanV = (const pixel_t *)frame->data[2] + offUV;
@@ -454,7 +474,16 @@ class LogoAnalyzer : AMTObject {
                 CopyYV12((pixel_t *)memScanData.data(), scanY, scanU, scanV, pitchY, pitchUV, pThis->scanw, pThis->scanh);
                 //ここでメモリにためる
                 auto scanDataCompressed = std::make_unique<LogoScanDataCompressed>();
-                scanDataCompressed->compress(memScanData.data(), scanDataSize * sizeof(pixel_t));
+                if (retainRaw) {
+                    try {
+                        scanDataCompressed->storeRaw(memScanData.data(), scanDataSize * sizeof(pixel_t));
+                    } catch (const std::bad_alloc&) {
+                        retainRaw = false;
+                    }
+                }
+                if (!retainRaw) {
+                    scanDataCompressed->compress(memScanData.data(), scanDataSize * sizeof(pixel_t));
+                }
                 scanData.push_back(std::move(scanDataCompressed));
             }
         }
@@ -528,41 +557,73 @@ class LogoAnalyzer : AMTObject {
         const size_t YSize = scanw * scanh;
         std::vector<pixel_t> memScanData;
 
-        auto memDeint = std::unique_ptr<float[]>(new float[YSize + 8]);
-        auto memWork = std::unique_ptr<float[]>(new float[YSize + 8]);
-
-        const int numFade = 20;
+        static constexpr int numFade = 20;
         auto minFades = std::unique_ptr<int[]>(new int[numFrames]);
         {
-
-            // 全フレームループ
-            for (int i = 0; i < numFrames; i++) {
-                memScanData.resize(creator->getFrameSize(i));
-                creator->getFrame(i, memScanData.data());
-                const float maxv = (float)((1 << creator->bitdepth()) - 1);
-                // フレームをインタレ解除
-                DeintY(memDeint.get(), memScanData.data(), scanw, scanw, scanh);
-                // fade値ループ
-                float minResult = std::numeric_limits<float>::max();
-                int minFadeIndex = 0;
-                for (int fi = 0; fi < numFade; fi++) {
-                    float fade = 0.1f * fi;
-                    // ロゴを評価
-                    float result = std::abs(deintLogo.EvaluateLogo(memDeint.get(), maxv, fade, memWork.get()));
-                    if (result < minResult) {
-                        minResult = result;
-                        minFadeIndex = fi;
-                    }
-                }
-                minFades[i] = minFadeIndex;
-
-                if ((i % 100) == 0) {
-                    float progress = (float)i / numFrames * 25 + progressbase;
-                    if (cb(progress, i, numFrames, numFrames) == false) {
-                        THROW(RuntimeException, "Cancel requested");
-                    }
-                }
+            struct EvaluationBuffer {
+                std::vector<pixel_t> scan;
+                std::unique_ptr<float[]> deint;
+                std::unique_ptr<float[]> work;
+                std::unique_ptr<float[]> background;
+                std::unique_ptr<float[]> fadeWork;
+            };
+            const bool usePreparedBackground = IsAVX2Available();
+            const bool useFadeSIMD = usePreparedBackground;
+            float fades[numFade];
+            for (int fi = 0; fi < numFade; fi++) fades[fi] = 0.1f * fi;
+            const int threadCount = std::min(GetLogoRemakeEvaluationThreadCount(), std::max(1, numFrames));
+            std::vector<EvaluationBuffer> buffers(threadCount);
+            for (auto& buffer : buffers) {
+                buffer.deint.reset(new float[YSize + 8]);
+                buffer.work.reset(new float[YSize + 8]);
+                if (usePreparedBackground) buffer.background.reset(new float[YSize + 8]);
+                if (useFadeSIMD) buffer.fadeWork.reset(new float[YSize * 8]);
             }
+            // 各タスクは専用バッファを所有し、同じフレーム内のfade順と演算を維持する。
+            const auto evaluateRange = [&](const int worker, const int start, const int end) {
+                auto& buffer = buffers[worker];
+                for (int i = start; i < end; i++) {
+                    buffer.scan.resize(creator->getFrameSize(i));
+                    creator->getFrame(i, buffer.scan.data());
+                    const float maxv = (float)((1 << creator->bitdepth()) - 1);
+                    DeintY(buffer.deint.get(), buffer.scan.data(), scanw, scanw, scanh);
+                    if (usePreparedBackground) {
+                        deintLogo.PrepareLogoBackground(buffer.deint.get(), maxv, buffer.background.get());
+                    }
+                    float minResult = std::numeric_limits<float>::max();
+                    int minFadeIndex = 0;
+                    if (useFadeSIMD) {
+                        float scores[numFade];
+                        deintLogo.EvaluateLogoFadesAVX2(buffer.deint.get(), buffer.background.get(), maxv,
+                            fades, numFade, buffer.fadeWork.get(), scores);
+                        for (int fi = 0; fi < numFade; fi++) {
+                            const float result = std::abs(scores[fi]);
+                            if (result < minResult) {
+                                minResult = result;
+                                minFadeIndex = fi;
+                            }
+                        }
+                    } else {
+                        for (int fi = 0; fi < numFade; fi++) {
+                            const float result = std::abs(usePreparedBackground
+                                ? deintLogo.EvaluateLogoWithBackground(buffer.deint.get(), buffer.background.get(), maxv, fades[fi], buffer.work.get())
+                                : deintLogo.EvaluateLogo(buffer.deint.get(), maxv, fades[fi], buffer.work.get()));
+                            if (result < minResult) {
+                                minResult = result;
+                                minFadeIndex = fi;
+                            }
+                        }
+                    }
+                    minFades[i] = minFadeIndex;
+                }
+            };
+            const auto reportProgress = [&](const int i) {
+                float progress = (float)i / numFrames * 25 + progressbase;
+                if (cb(progress, i, numFrames, numFrames) == false) {
+                    THROW(RuntimeException, "Cancel requested");
+                }
+            };
+            RunLogoRemakeFrameEvaluation(numFrames, threadCount, evaluateRange, reportProgress);
         }
 
         // 評価値を集約

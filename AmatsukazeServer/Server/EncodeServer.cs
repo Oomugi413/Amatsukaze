@@ -2030,7 +2030,13 @@ namespace Amatsukaze.Server
             bool ignoreNoLogo, string jlscommand, string jlsopt, string ceopt, string trimavs, string divfile, string resumeDir, string batDir,
             string inHandle, string outHandle, int pid)
         {
+            if (mode != ProcMode.CMCheck && mode != ProcMode.DrcsCheck && profile != null)
+            {
+                CheckDoubleDeinterlace(profile);
+            }
             StringBuilder sb = new StringBuilder();
+            // CLI省略時はsplitなので、既存プロファイルも含めて常に設定を明示する。
+            sb.Append(" --audio-format-change ").Append(profile.GetAudioFormatChangeModeArgument());
 
             bool loadV2 = false;
             if (   streamFormat != VideoStreamFormat.MPEG2
@@ -2272,10 +2278,6 @@ namespace Amatsukaze.Server
                         if (profile.IgnoreNicoJKError)
                         {
                             sb.Append(" --ignore-nicojk-error");
-                        }
-                        if (profile.NicoJK18)
-                        {
-                            sb.Append(" --nicojk18");
                         }
                         if (profile.NicoJKLog)
                         {
@@ -2675,6 +2677,31 @@ namespace Amatsukaze.Server
             }
 
             throw new InvalidOperationException(name + "パスが無効です: " + path);
+        }
+
+        private static void CheckDoubleDeinterlace(ProfileSetting profile)
+        {
+            if (profile.EncoderType != EncoderType.QSVEnc
+                && profile.EncoderType != EncoderType.NVEnc
+                && profile.EncoderType != EncoderType.VCEEnc)
+            {
+                return;
+            }
+
+            bool filterDeinterlace = profile.FilterOption == FilterOption.Setting
+                && profile.FilterSetting?.EnableDeinterlace == true;
+            if (ProfileSettingExtensions.GetFilterEncoderType(profile.FilterOption).HasValue)
+            {
+                filterDeinterlace = profile.EncoderFilterSetting?.EnableDeinterlace == true
+                    || ProfileSettingExtensions.HasDeinterlaceOption(
+                        ProfileSettingExtensions.GetFilterEncoderOption(profile));
+            }
+            if (filterDeinterlace
+                && ProfileSettingExtensions.HasDeinterlaceOption(
+                    ProfileSettingExtensions.GetEncoderOption(profile)))
+            {
+                throw new ArgumentException("フィルタとエンコーダ追加オプションの両方でインターレース解除が指定されています。どちらか一方の指定を解除してください。");
+            }
         }
 
         private static void CheckSetting(ProfileSetting profile, Setting setting)
@@ -3638,6 +3665,7 @@ namespace Amatsukaze.Server
                     {
                         CheckSetting(data.Profile, AppData_.setting);
                     }
+                    CheckDoubleDeinterlace(data.Profile);
                     SaveProfile(filepath, data.Profile);
                     data.Profile.LastUpdate = File.GetLastWriteTime(filepath);
                     if (profiles.ContainsKey(data.Profile.Name))

@@ -472,7 +472,11 @@ static bool hasMp4Subtitles(const std::vector<tstring>& subsTitles) {
     bool muxerAddEncoderCmd,
     bool sarInContainerOnly,
     const tstring& encoderName,
-    const tstring& encoderOptions) {
+    const tstring& encoderOptions,
+    const std::vector<tstring>& audioTrackNames) {
+    if (!audioTrackNames.empty() && audioTrackNames.size() != inAudios.size()) {
+        THROW(ArgumentException, "音声トラック名の数が音声ファイル数と一致しません");
+    }
     std::vector<std::pair<tstring, bool>> ret;
 
     StringBuilderT sb;
@@ -511,7 +515,11 @@ static bool hasMp4Subtitles(const std::vector<tstring>& subsTitles) {
         }
         sb.append(_T("\""));
         for (int i = 0; i < (int)inAudios.size(); i++) {
-            sb.append(_T(" -add \"%s\"#audio:name=Audio%d"), inAudios[i], i);
+            if (audioTrackNames.empty()) {
+                sb.append(_T(" -add \"%s\"#audio:name=Audio%d"), inAudios[i], i);
+            } else {
+                sb.append(_T(" -add \"%s\"#audio:name=%s"), inAudios[i], audioTrackNames[i]);
+            }
         }
         if (needChapter && !needTimecode) {
             sb.append(_T(" -chap \"%s\""), chapterpath);
@@ -609,8 +617,11 @@ static bool hasMp4Subtitles(const std::vector<tstring>& subsTitles) {
         }
         sb.append(_T(" \"%s\""), inVideo);
 
-        for (const auto& inAudio : inAudios) {
-            sb.append(_T(" \"%s\""), inAudio);
+        for (int i = 0; i < (int)inAudios.size(); i++) {
+            if (!audioTrackNames.empty()) {
+                sb.append(_T(" --track-name \"0:%s\""), audioTrackNames[i]);
+            }
+            sb.append(_T(" \"%s\""), inAudios[i]);
         }
         for (int i = 0; i < (int)inSubs.size(); i++) {
             sb.append(_T(" --track-name \"0:%s\" \"%s\""), subsTitles[i], inSubs[i]);
@@ -835,6 +846,10 @@ ConfigWrapper::ConfigWrapper(
     : AMTObject(ctx)
     , conf(conf)
     , tmpDir(ctx, conf.workDir, conf.noRemoveTmp, conf.resumeDir) {
+    if (conf.audioFormatChangeMode != AFC_SPLIT
+        && (isEncodeAudio() || conf.format == FORMAT_TSREPLACE)) {
+        ctx.info(_T("音声フォーマット変更設定は音声エンコードまたはtsreplace出力では無視し、splitとして扱います。"));
+    }
     if (this->conf.encoderFilter != (ENUM_ENCODER)-1
         && this->conf.encoderFilter != ENCODER_QSVENC
         && this->conf.encoderFilter != ENCODER_NVENC
@@ -950,6 +965,11 @@ ENUM_AUDIO_ENCODER ConfigWrapper::getAudioEncoder() const {
 
 bool ConfigWrapper::isEncodeAudio() const {
     return conf.audioEncoder != AUDIO_ENCODER_NONE;
+}
+
+AUDIO_FORMAT_CHANGE_MODE ConfigWrapper::getAudioFormatChangeMode() const {
+    return (isEncodeAudio() || conf.format == FORMAT_TSREPLACE)
+        ? AFC_SPLIT : conf.audioFormatChangeMode;
 }
 
 tstring ConfigWrapper::getAudioEncoderPath() const {
@@ -1070,10 +1090,6 @@ bool ConfigWrapper::isSubtitlesEnabled() const {
 
 bool ConfigWrapper::isNicoJKEnabled() const {
     return conf.nicojkmask != 0;
-}
-
-bool ConfigWrapper::isNicoJK18Enabled() const {
-    return conf.nicojk18;
 }
 
 bool ConfigWrapper::isUseNicoJKLog() const {
@@ -1503,10 +1519,6 @@ tstring ConfigWrapper::getTmpWhisperWavPath(EncodeFileKey key, int aindex) const
 tstring ConfigWrapper::getTmpWhisperVttPath(EncodeFileKey key, int aindex) const {
     return regtmp(StringFormat(_T("%s/a%d-%d-%d-%d%s.vtt"),
         getTmpWhisperDir(), key.video, key.format, key.div, aindex, GetCMSuffix(key.cm)));
-}
-
-tstring ConfigWrapper::getTmpNicoJKXMLPath() const {
-    return regtmp(StringFormat(_T("%s/nicojk.xml"), tmpDir.path()));
 }
 
 tstring ConfigWrapper::getTmpNicoJKASSPath(NicoJKType type) const {
