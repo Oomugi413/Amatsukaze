@@ -74,7 +74,7 @@ AviSynth、フィルタ、ソフトウェアエンコーダ、muxer、字幕ツ�
 sudo apt install python3
 ```
 
-[リリース一覧](https://github.com/rigaya/Amatsukaze/releases)からLinux x64向けアーカイブをダウンロードし、実行するユーザーが読み書きできる場所に展開します。ダウンロードしたアーカイブが現在のディレクトリにある場合の例です。
+[リリース一覧](https://github.com/Oomugi413/Amatsukaze/releases)からLinux x64向けアーカイブをダウンロードし、実行するユーザーが読み書きできる場所に展開します。ダウンロードしたアーカイブが現在のディレクトリにある場合の例です。
 
 ```bash
 mkdir -p "$HOME/Amatsukaze"
@@ -91,7 +91,7 @@ tar -xf ./Amatsukaze_linux_*.tar.xz -C "$HOME/Amatsukaze"
 
   - ドライバも含めたインストール方法は下記リンク先を参照してください。
     - [qsvencc](https://github.com/rigaya/QSVEnc/blob/master/Install.ja.md)
-    - [nvencc](https://github.com/rigaya/NVEnc/blob/master/Install.ja.md)
+    - [nvencc](https://github.com/Oomugi413/NVEnc/blob/master/Install.ja.md)
     - [vceencc](https://github.com/rigaya/VCEEnc/blob/master/Install.ja.md)
 
   <details>
@@ -106,7 +106,7 @@ tar -xf ./Amatsukaze_linux_*.tar.xz -C "$HOME/Amatsukaze"
     && rm ./qsvencc.deb)
 
   # nvencc
-  (curl -s https://api.github.com/repos/rigaya/NVEnc/releases/latest \
+  (curl -s https://api.github.com/repos/Oomugi413/NVEnc/releases/latest \
     | grep "browser_download_url.*deb" | grep "amd64" | cut -d : -f 2,3 | tr -d \" \
     | wget -i - -O nvencc.deb \
     && sudo apt install -y ./nvencc.deb \

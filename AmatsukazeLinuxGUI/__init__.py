@@ -1,0 +1,2 @@
+"""Amatsukaze Linux GUI package."""
+

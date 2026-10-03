@@ -154,30 +154,40 @@ private:
     template <typename T>
     void MergeField(PVideoFrame& dst, AVFrame* top, AVFrame* bottom, const int dstBitDepth, const int srcBitDepth, IScriptEnvironment* env) {
         const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get((AVPixelFormat)(top->format));
+        if (!desc) {
+            const char* formatName = av_get_pix_fmt_name((AVPixelFormat)(top->format));
+            env->ThrowError("unsupported input pixel format: %s", formatName ? formatName : "unknown");
+        }
 
         const bool nv12 = top->format == AV_PIX_FMT_NV12 || top->format == AV_PIX_FMT_P010LE;
 
-        T* srctY = (T*)top->data[0];
-        T* srctU = (T*)top->data[1];
-        T* srctV = (!nv12) ? (T*)top->data[2] : ((T*)top->data[1] + 1);
-        T* srcbY = (T*)bottom->data[0];
-        T* srcbU = (T*)bottom->data[1];
-        T* srcbV = (!nv12) ? (T*)bottom->data[2] : ((T*)bottom->data[1] + 1);
-        T* dstY = (T*)dst->GetWritePtr(PLANAR_Y);
-        T* dstU = (T*)dst->GetWritePtr(PLANAR_U);
-        T* dstV = (T*)dst->GetWritePtr(PLANAR_V);
+        // P010を含む16bit格納形式はuint16_t、それ以外はuint8_tとして扱う。
+        // Avisynth側の出力形式と入力AVFrameの形式が異なる場合はConvertPixFuncsを使用する。
+        const int srcElementSize = (srcBitDepth > 8) ? sizeof(uint16_t) : sizeof(uint8_t);
+        const int dstElementSize = (dstBitDepth > 8) ? sizeof(uint16_t) : sizeof(uint8_t);
+        const void* srctY = top->data[0];
+        const void* srctU = top->data[1];
+        const void* srctV = (!nv12) ? top->data[2]
+            : (const uint8_t*)top->data[1] + srcElementSize;
+        const void* srcbY = bottom->data[0];
+        const void* srcbU = bottom->data[1];
+        const void* srcbV = (!nv12) ? bottom->data[2]
+            : (const uint8_t*)bottom->data[1] + srcElementSize;
+        void* dstY = dst->GetWritePtr(PLANAR_Y);
+        void* dstU = dst->GetWritePtr(PLANAR_U);
+        void* dstV = dst->GetWritePtr(PLANAR_V);
 
-        const int srctPitchY = top->linesize[0] / sizeof(T);
-        const int srctPitchUV = top->linesize[1] / sizeof(T);
-        const int srcbPitchY = bottom->linesize[0] / sizeof(T);
-        const int srcbPitchUV = bottom->linesize[1] / sizeof(T);
-        const int dstPitchY = dst->GetPitch(PLANAR_Y) / sizeof(T);
-        const int dstPitchUV = dst->GetPitch(PLANAR_U) / sizeof(T);
+        const int srctPitchY = top->linesize[0] / srcElementSize;
+        const int srctPitchUV = top->linesize[1] / srcElementSize;
+        const int srcbPitchY = bottom->linesize[0] / srcElementSize;
+        const int srcbPitchUV = bottom->linesize[1] / srcElementSize;
+        const int dstPitchY = dst->GetPitch(PLANAR_Y) / dstElementSize;
+        const int dstPitchUV = dst->GetPitch(PLANAR_U) / dstElementSize;
         const int widthUV = vi.width >> desc->log2_chroma_w;
         const int heightUV = vi.height >> desc->log2_chroma_h;
 
         if (dstBitDepth != srcBitDepth) {
-            if (srcBitDepth == 16 && convertPix.convert1) {
+            if (convertPix.convert1 && convertPix.convert2) {
                 convertPix.convert1(dstY, srctY, srcbY, vi.width, vi.height, dstPitchY, srctPitchY, srcbPitchY);
 
                 if (nv12) {
@@ -187,16 +197,28 @@ private:
                     convertPix.convert1(dstV, srctV, srcbV, widthUV, heightUV, dstPitchUV, srctPitchUV, srcbPitchUV);
                 }
             } else {
-                env->ThrowError("not supported conversion.");
+                const char* formatName = av_get_pix_fmt_name((AVPixelFormat)(top->format));
+                env->ThrowError("not supported conversion: %s (%dbit) -> Avisynth (%dbit)",
+                    formatName ? formatName : "unknown", srcBitDepth, dstBitDepth);
             }
         } else {
-            Copy1<T>(dstY, srctY, srcbY, vi.width, vi.height, dstPitchY, srctPitchY, srcbPitchY);
+            T* dstYTyped = (T*)dstY;
+            T* dstUTyped = (T*)dstU;
+            T* dstVTyped = (T*)dstV;
+            const T* srctYTyped = (const T*)srctY;
+            const T* srctUTyped = (const T*)srctU;
+            const T* srctVTyped = (const T*)srctV;
+            const T* srcbYTyped = (const T*)srcbY;
+            const T* srcbUTyped = (const T*)srcbU;
+            const T* srcbVTyped = (const T*)srcbV;
+
+            Copy1<T>(dstYTyped, srctYTyped, srcbYTyped, vi.width, vi.height, dstPitchY, srctPitchY, srcbPitchY);
 
             if (nv12) {
-                Copy2<T>(dstU, dstV, srctU, srcbU, widthUV, heightUV, dstPitchUV, srctPitchUV, srcbPitchUV);
+                Copy2<T>(dstUTyped, dstVTyped, srctUTyped, srcbUTyped, widthUV, heightUV, dstPitchUV, srctPitchUV, srcbPitchUV);
             } else {
-                Copy1<T>(dstU, srctU, srcbU, widthUV, heightUV, dstPitchUV, srctPitchUV, srcbPitchUV);
-                Copy1<T>(dstV, srctV, srcbV, widthUV, heightUV, dstPitchUV, srctPitchUV, srcbPitchUV);
+                Copy1<T>(dstUTyped, srctUTyped, srcbUTyped, widthUV, heightUV, dstPitchUV, srctPitchUV, srcbPitchUV);
+                Copy1<T>(dstVTyped, srctVTyped, srcbVTyped, widthUV, heightUV, dstPitchUV, srctPitchUV, srcbPitchUV);
             }
         }
     }
