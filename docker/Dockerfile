@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.6
+
 # 配布アーカイブを使用するLinuxコンテナ
 FROM ubuntu:24.04 AS fdkaac-builder
 
@@ -25,8 +27,53 @@ RUN apt-get update \
     && install -D /tmp/fdkaac-install/bin/fdkaac /fdkaac-output/fdkaac \
     && rm -rf /var/lib/apt/lists/*
 
+# Oomugi413版NVEncCのlibplacebo/Vulkanフィルタ用共有ライブラリをビルドする段階。
+# Ubuntu 24.04のlibplacebo-devはVulkan無効でビルドされているため、
+# libplacebo 7.360.1のVulkan対応版を使用する。
+FROM ubuntu:24.04 AS libplacebo-builder
+
+ARG LIBPLACEBO_VER=7.360.1
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        git \
+        liblcms2-dev \
+        libshaderc-dev \
+        libvulkan-dev \
+        libxxhash-dev \
+        meson \
+        ninja-build \
+        pkg-config \
+    && git clone --depth=1 --branch "v${LIBPLACEBO_VER}" --recursive \
+        https://code.videolan.org/videolan/libplacebo.git /tmp/libplacebo \
+    && meson setup /tmp/libplacebo/build /tmp/libplacebo \
+        --buildtype=release \
+        --prefix=/usr/local \
+        --libdir=lib/x86_64-linux-gnu \
+        -Ddefault_library=shared \
+        -Dprefer_static=false \
+        -Dd3d11=disabled \
+        -Ddemos=false \
+        -Dglslang=disabled \
+        -Dlcms=enabled \
+        -Ddovi=disabled \
+        -Dlibdovi=disabled \
+        -Dopengl=disabled \
+        -Dshaderc=enabled \
+        -Dtests=false \
+        -Dvulkan=enabled \
+        -Dxxhash=enabled \
+    && meson compile -C /tmp/libplacebo/build \
+    && DESTDIR=/opt/libplacebo-root meson install -C /tmp/libplacebo/build \
+    && test -f /opt/libplacebo-root/usr/local/lib/x86_64-linux-gnu/libplacebo.so.360 \
+    && rm -rf /var/lib/apt/lists/* /tmp/libplacebo
+
 # Battlemage等の新しいGPUとMesaのOpenCL (rusticl) を使うため、Ubuntu 24.04をベースにする
-# Amatsukaze本体のCUDAはcudartを静的リンクしており、ホストのlibcuda.so.1だけを使うため、
+# Amatsukaze本体とOomugi413版NVEncCはcudart/NPPを静的リンクし、NVRTCだけを別途導入するため、
 # nvidia/cudaのベースイメージは不要 (NVIDIA_REQUIRE_CUDAで古いドライバが弾かれるのも避けられる)
 FROM ubuntu:24.04
 
@@ -37,10 +84,10 @@ ARG ENABLE_VCEENC_AMF=0
 ARG QSVENCC_VER=8.32
 ARG NVENCC_VER=9.37
 ARG VCEENCC_VER=9.21
-# NVEncCのnvrtc用。24.04向けリポジトリに11.8は無いため、22.04向けのdebを直接導入する
+# Oomugi413版NVEncC用に、Ubuntu 24.04向けのNVRTC 12.9をバージョン・ハッシュ固定で導入する
 # NVEncCは無印のlibnvrtc.soをdlopenするが、このdebには含まれないためリンクを追加する
-ARG CUDA_NVRTC_DEB=cuda-nvrtc-11-8_11.8.89-1_amd64.deb
-ARG CUDA_NVRTC_SHA256=6f083fcd63b7f8ef7478bfb7b8aba938d8ca0b5684d610df1243302b12a54f06
+ARG CUDA_NVRTC_DEB=cuda-nvrtc-12-9_12.9.86-1_amd64.deb
+ARG CUDA_NVRTC_SHA256=4e1cc14cc3578dd69286d9ac6a0623297e854ba09539b1780b6989d2199395af
 # Intel GPUのドライバ類はUbuntu向けのkobuk-team PPAから導入する
 # Haswell以前はi965のみ対応のため、QSVEncCのVA-APIバックエンド用にi965も導入する
 ARG INTEL_GRAPHICS_PPA_KEY=0C0E6AF955CE463C03FC51574D098D70AFBE5E1F
@@ -60,9 +107,11 @@ ENV LANG=ja_JP.UTF-8
 ENV LC_ALL=ja_JP.UTF-8
 ENV LC_CTYPE=ja_JP.UTF-8
 ENV PATH="/app/exe_files:$PATH"
-# NVIDIA Container ToolkitにGPUとドライバ機能 (CUDA/NVENC/NVDEC) の注入を要求する
+# NVIDIA Container ToolkitにGPUとドライバ機能 (CUDA/NVENC/NVDEC/Vulkan) の注入を要求する
 ENV NVIDIA_VISIBLE_DEVICES=all
-ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics
+# フォーク版NVEncCのVulkanフィルタはヘッドレス環境向けのEGL ICDを使用する
+ENV VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_egl_icd.json
 
 # 同梱されないPythonとGPU用の実行時依存を導入する
 RUN apt-get update \
@@ -77,11 +126,12 @@ RUN apt-get update \
         intel-media-va-driver-non-free intel-opencl-icd libigfxcmrt7 \
         libmfx1 libmfx-gen1.2 libva-drm2 libva-x11-2 ocl-icd-libopencl1 \
         mesa-va-drivers mesa-opencl-icd i965-va-driver-shaders \
-    && wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/${CUDA_NVRTC_DEB}" -O /tmp/cuda-nvrtc.deb \
+        libvulkan1 liblcms2-2 libshaderc1 libxxhash0 vulkan-tools \
+    && wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/${CUDA_NVRTC_DEB}" -O /tmp/cuda-nvrtc.deb \
     && echo "${CUDA_NVRTC_SHA256}  /tmp/cuda-nvrtc.deb" | sha256sum -c - \
     && apt-get install -y --no-install-recommends /tmp/cuda-nvrtc.deb \
-    && ln -sf libnvrtc.so.11.2 /usr/local/cuda-11.8/targets/x86_64-linux/lib/libnvrtc.so \
-    && echo /usr/local/cuda-11.8/targets/x86_64-linux/lib > /etc/ld.so.conf.d/cuda-nvrtc.conf \
+    && ln -sf libnvrtc.so.12 /usr/local/cuda-12.9/targets/x86_64-linux/lib/libnvrtc.so \
+    && echo /usr/local/cuda-12.9/targets/x86_64-linux/lib > /etc/ld.so.conf.d/cuda-nvrtc.conf \
     && ldconfig \
     && wget -q "https://github.com/intel/intel-graphics-compiler/releases/download/igc-${INTEL_IGC_LEGACY_VER}/intel-igc-core_${INTEL_IGC_LEGACY_VER}_amd64.deb" -O /tmp/intel-igc-core.deb \
     && wget -q "https://github.com/intel/intel-graphics-compiler/releases/download/igc-${INTEL_IGC_LEGACY_VER}/intel-igc-opencl_${INTEL_IGC_LEGACY_VER}_amd64.deb" -O /tmp/intel-igc-opencl.deb \
@@ -95,7 +145,7 @@ RUN apt-get update \
     && ldconfig \
     && wget -q "https://github.com/rigaya/QSVEnc/releases/download/${QSVENCC_VER}/qsvencc_${QSVENCC_VER}_${ARCH}.deb" -O /tmp/qsvencc.deb \
     && apt-get install -y --no-install-recommends /tmp/qsvencc.deb \
-    && wget -q "https://github.com/rigaya/NVEnc/releases/download/${NVENCC_VER}/nvencc_${NVENCC_VER}_${ARCH}.deb" -O /tmp/nvencc.deb \
+    && wget -q "https://github.com/Oomugi413/NVEnc/releases/download/${NVENCC_VER}/nvencc_${NVENCC_VER}_${ARCH}.deb" -O /tmp/nvencc.deb \
     && apt-get install -y --no-install-recommends /tmp/nvencc.deb \
     && wget -q "https://github.com/rigaya/VCEEnc/releases/download/${VCEENCC_VER}/vceencc_${VCEENCC_VER}_${ARCH}.deb" -O /tmp/vceencc.deb \
     && apt-get install -y --no-install-recommends /tmp/vceencc.deb \
@@ -124,13 +174,25 @@ RUN apt-get update \
     && rm -f /tmp/cuda-nvrtc.deb /tmp/qsvencc.deb /tmp/nvencc.deb /tmp/vceencc.deb \
     && rm -rf /var/lib/apt/lists/*
 
+# Vulkan対応libplaceboを実行イメージへ配置する。
+COPY --from=libplacebo-builder /opt/libplacebo-root/usr/local/lib/x86_64-linux-gnu/ /usr/local/lib/x86_64-linux-gnu/
+RUN printf '%s\n' /usr/local/lib/x86_64-linux-gnu > /etc/ld.so.conf.d/libplacebo.conf \
+    && ldconfig \
+    && test -s /usr/local/lib/x86_64-linux-gnu/libplacebo.so.360
+
+# NVIDIA Container Toolkitが注入するICDは、ヘッドレスコンテナで
+# libGLX_nvidia.so.0を初期化できない場合があるため、EGL経由のICDを使用する。
+RUN mkdir -p /etc/vulkan/icd.d \
+    && printf '%s\n' '{"file_format_version":"1.0.1","ICD":{"library_path":"libEGL_nvidia.so.0","api_version":"1.3.0"}}' \
+      > /etc/vulkan/icd.d/nvidia_egl_icd.json
+
 # Amatsukaze本体を展開する
 ARG AMATSUKAZE_CACHE_BUST=
 # ビルド段階で生成したfdkaacだけを実行イメージへ引き継ぐ
 COPY --from=fdkaac-builder /fdkaac-output/ /usr/local/bin/
 RUN : "$AMATSUKAZE_CACHE_BUST" \
     && mkdir -p /app \
-    && ARCHIVE_URL=$(curl -fsSL https://api.github.com/repos/rigaya/Amatsukaze/releases/latest \
+    && ARCHIVE_URL=$(curl -fsSL https://api.github.com/repos/Oomugi413/Amatsukaze/releases/latest \
         | sed -n 's/.*"browser_download_url":[[:space:]]*"\([^"]*\.tar\.xz\)".*/\1/p' \
         | grep 'Amatsukaze_linux_.*_x64\.tar\.xz' | head -1) \
     && test -n "$ARCHIVE_URL" \

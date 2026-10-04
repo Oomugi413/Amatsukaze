@@ -1,5 +1,8 @@
 name: Build AmatsukazeAddTask Linux Packages
 
+permissions:
+  contents: write
+
 on:
   push:
     branches:

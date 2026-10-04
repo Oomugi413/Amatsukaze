@@ -12,13 +12,13 @@
 #include <immintrin.h>
 #endif
 
-template <typename T, int dstdepth, int srcdepth, bool avx2 /*最適化により、SSE版とAVX2版が同じになるのを防止するためのダミー*/>
-void Convert1(T* dst, const T* top, const T* bottom, int w, int h, int dpitch, int tpitch, int bpitch) {
+template <typename TDst, typename TSrc, int dstdepth, int srcdepth, bool avx2 /*最適化により、SSE版とAVX2版が同じになるのを防止するためのダミー*/>
+void Convert1(TDst* dst, const TSrc* top, const TSrc* bottom, int w, int h, int dpitch, int tpitch, int bpitch) {
     for (int y = 0; y < h; y += 2) {
-        T* dst0 = dst + dpitch * (y + 0);
-        T* dst1 = dst + dpitch * (y + 1);
-        const T* src0 = top + tpitch * (y + 0);
-        const T* src1 = bottom + bpitch * (y + 1);
+        TDst* dst0 = dst + dpitch * (y + 0);
+        TDst* dst1 = dst + dpitch * (y + 1);
+        const TSrc* src0 = top + tpitch * (y + 0);
+        const TSrc* src1 = bottom + bpitch * (y + 1);
         for (int x = 0; x < w; x++) {
             dst0[x] = conv_bit_depth_<dstdepth, srcdepth, 0>(src0[x]);
             dst1[x] = conv_bit_depth_<dstdepth, srcdepth, 0>(src1[x]);
@@ -49,22 +49,22 @@ void Convert2(T* dstU, T* dstV, const T* top, const T* bottom, int w, int h, int
 }
 #else
 // なぜかこっちでないと自動ベクトル化されない
-template <typename T, typename Tx2, int dstdepth, int srcdepth, bool avx2 /*最適化により、SSE版とAVX2版が同じになるのを防止するためのダミー*/>
-void Convert2(T* dstU, T* dstV, const T* top, const T* bottom, int w, int h, int dpitch, int tpitch, int bpitch) {
+template <typename TDst, typename TSrc, typename Tx2, int dstdepth, int srcdepth, bool avx2 /*最適化により、SSE版とAVX2版が同じになるのを防止するためのダミー*/>
+void Convert2(TDst* dstU, TDst* dstV, const TSrc* top, const TSrc* bottom, int w, int h, int dpitch, int tpitch, int bpitch) {
     for (int y = 0; y < h; y += 2) {
-        T* dstU0 = dstU + dpitch * (y + 0);
-        T* dstU1 = dstU + dpitch * (y + 1);
-        T* dstV0 = dstV + dpitch * (y + 0);
-        T* dstV1 = dstV + dpitch * (y + 1);
+        TDst* dstU0 = dstU + dpitch * (y + 0);
+        TDst* dstU1 = dstU + dpitch * (y + 1);
+        TDst* dstV0 = dstV + dpitch * (y + 0);
+        TDst* dstV1 = dstV + dpitch * (y + 1);
         const Tx2* src0 = (const Tx2*)(top + tpitch * (y + 0));
         const Tx2* src1 = (const Tx2*)(bottom + bpitch * (y + 1));
         for (int x = 0; x < w; x++) {
-            dstU0[x] = conv_bit_depth_<dstdepth, srcdepth, 0>(src0[x] & ((T)-1));
-            dstV0[x] = conv_bit_depth_<dstdepth, srcdepth, 0>(src0[x] >> ((sizeof(Tx2) - sizeof(T)) * 8));
+            dstU0[x] = conv_bit_depth_<dstdepth, srcdepth, 0>(src0[x] & ((Tx2)((TSrc)-1)));
+            dstV0[x] = conv_bit_depth_<dstdepth, srcdepth, 0>(src0[x] >> ((sizeof(Tx2) - sizeof(TSrc)) * 8));
         }
         for (int x = 0; x < w; x++) {
-            dstU1[x] = conv_bit_depth_<dstdepth, srcdepth, 0>(src1[x] & ((T)-1));
-            dstV1[x] = conv_bit_depth_<dstdepth, srcdepth, 0>(src1[x] >> ((sizeof(Tx2) - sizeof(T)) * 8));
+            dstU1[x] = conv_bit_depth_<dstdepth, srcdepth, 0>(src1[x] & ((Tx2)((TSrc)-1)));
+            dstV1[x] = conv_bit_depth_<dstdepth, srcdepth, 0>(src1[x] >> ((sizeof(Tx2) - sizeof(TSrc)) * 8));
         }
     }
 #if ENABLE_AVX2
@@ -84,9 +84,18 @@ void Convert2_16_to_10_AVX2(void* dstU, void* dstV, const void* top, const void*
 void Convert2_16_to_12_AVX2(void* dstU, void* dstV, const void* top, const void* bottom, int w, int h, int dpitch, int tpitch, int bpitch);
 
 struct ConvertPixFuncs {
-    decltype(&Convert1_16_to_10) convert1;
-    decltype(&Convert2_16_to_10) convert2;
+    using Convert1Func = decltype(&Convert1_16_to_10);
+    using Convert2Func = decltype(&Convert2_16_to_10);
+
+    Convert1Func convert1;
+    Convert2Func convert2;
+    int dstDepth;
+    int srcDepth;
 
     ConvertPixFuncs();
     ConvertPixFuncs(int dstDepth, int srcDepth);
+
+    bool isFor(int dstDepth_, int srcDepth_) const {
+        return dstDepth == dstDepth_ && srcDepth == srcDepth_;
+    }
 };

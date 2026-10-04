@@ -187,16 +187,21 @@ void AMTSource::UpdateVideoInfo(IScriptEnvironment* env) {
     // ビット深度は取得してないのでffmpegから取得する
     const auto streamPixFmt = (AVPixelFormat)videoStream->codecpar->format;
     const auto codecPixFmt = codecCtx()->pix_fmt;
-    const int streamBitDepth = (streamPixFmt == AV_PIX_FMT_P010LE) ? 16 : av_pix_fmt_desc_get(streamPixFmt)->comp[0].depth;
-    const int codecBitDepth = (codecPixFmt == AV_PIX_FMT_P010LE) ? 16 : av_pix_fmt_desc_get(codecPixFmt)->comp[0].depth;
-    if (streamBitDepth > 8 && codecBitDepth > 8 && streamBitDepth < codecBitDepth) {
-        // hwデコードの場合、10bitでもP010で返されることがある
-        // もとのビット深度を採用するため、streamPixFmtを使用する
+    const auto* streamPixDesc = av_pix_fmt_desc_get(streamPixFmt);
+    const auto* codecPixDesc = av_pix_fmt_desc_get(codecPixFmt);
+    const int streamBitDepth = streamPixDesc ? streamPixDesc->comp[0].depth : 0;
+    const int codecBitDepth = (codecPixFmt == AV_PIX_FMT_P010LE)
+        ? 16 : (codecPixDesc ? codecPixDesc->comp[0].depth : 0);
+
+    // Avisynth側の出力形式は、デコーダが選択した形式ではなく、入力ストリームの
+    // 画素形式を基準にする。CUVIDはP010/NV12、DefaultはYUV420P10LEなどを返す
+    // 可能性があるため、実際のAVFrameはMakeFrame()で出力形式へ変換する。
+    if (streamPixDesc && streamBitDepth >= 8) {
         vi.pixel_type = toAVSFormat(streamPixFmt, env);
-        convertPix = ConvertPixFuncs(streamBitDepth, codecBitDepth);
     } else {
         vi.pixel_type = toAVSFormat(codecPixFmt, env);
     }
+    convertPix = ConvertPixFuncs(AVSFormatBitdepth(vi.pixel_type), codecBitDepth);
 
 #if ENABLE_FFMPEG_FILTER
     if (bufferSinkCtx) {
@@ -226,12 +231,24 @@ void AMTSource::ResetDecoder(IScriptEnvironment* env) {
 PVideoFrame AMTSource::MakeFrame(AVFrame* top, AVFrame* bottom, IScriptEnvironment* env) {
     PVideoFrame ret = env->NewVideoFrame(vi);
     const auto srcFormat = (AVPixelFormat)(top->format);
-    const int srcBitDepth = (srcFormat == AV_PIX_FMT_P010LE) ? 16 : av_pix_fmt_desc_get(srcFormat)->comp[0].depth;
+    const auto* srcPixDesc = av_pix_fmt_desc_get(srcFormat);
+    if (!srcPixDesc) {
+        const char* formatName = av_get_pix_fmt_name(srcFormat);
+        env->ThrowError("unsupported input pixel format: %s", formatName ? formatName : "unknown");
+    }
+    const int srcBitDepth = (srcFormat == AV_PIX_FMT_P010LE) ? 16 : srcPixDesc->comp[0].depth;
+    const int dstBitDepth = AVSFormatBitdepth(vi.pixel_type);
+
+    // codecCtx()->pix_fmtと実際に返るAVFrameの形式が異なるデコーダがあるため、
+    // 実フレームのビット深度に合う変換関数をここで選択する。
+    if (srcBitDepth != dstBitDepth && !convertPix.isFor(dstBitDepth, srcBitDepth)) {
+        convertPix = ConvertPixFuncs(dstBitDepth, srcBitDepth);
+    }
 
     if (srcBitDepth > 8) {
-        MergeField<uint16_t>(ret, top, bottom, AVSFormatBitdepth(vi.pixel_type), srcBitDepth, env);
+        MergeField<uint16_t>(ret, top, bottom, dstBitDepth, srcBitDepth, env);
     } else {
-        MergeField<uint8_t>(ret, top, bottom, AVSFormatBitdepth(vi.pixel_type), srcBitDepth, env);
+        MergeField<uint8_t>(ret, top, bottom, dstBitDepth, srcBitDepth, env);
     }
 
     // LinuxではAvisynthPlusを使うので設定できなそう?
