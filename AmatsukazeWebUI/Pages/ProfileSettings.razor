@@ -242,6 +242,10 @@ else
                             <input type="checkbox" checked="@GetBoolValue("TsreplaceRemoveTypeD")" @onchange="@(e => OnBoolChanged(e, "TsreplaceRemoveTypeD"))" disabled="@GetBoolValue("Mpeg2Partial")" />
                             データ放送を削除する
                         </label>
+                        <label class="settings-check" style="margin-left: 1rem;" title="@TsreplaceStartupPrerollTooltip">
+                            <input type="checkbox" checked="@GetBoolValue("AddTsreplaceStartupPreroll")" @onchange="@(e => OnBoolChanged(e, "AddTsreplaceStartupPreroll"))" />
+                            先頭に準備区間を追加
+                        </label>
                     </td>
                 </tr>
             }
@@ -845,6 +849,18 @@ else
                 <tr class="profile-check-row">
                     <td colspan="2">
                         <label class="settings-check">
+                            <input type="checkbox" checked="@GetBoolValue("DisablePgsSub")" @onchange="@(e => OnBoolChanged(e, "DisablePgsSub"))" />
+                            PGS字幕を生成しない(MKV出力時)
+                        </label>
+                    </td>
+                </tr>
+                <tr>
+                    <th>PGS字幕フォント</th>
+                    <td><input style="width: 70%;" value="@GetStringValue("PgsFontFamily")" @oninput="@(e => OnStringChanged(e, "PgsFontFamily"))" placeholder="空欄なら既定フォント" /></td>
+                </tr>
+                <tr class="profile-check-row">
+                    <td colspan="2">
+                        <label class="settings-check">
                             <input type="checkbox" checked="@GetBoolValue("EnableWebVTT")" @onchange="@(e => OnBoolChanged(e, "EnableWebVTT"))" />
                             WebVTT字幕を生成する
                         </label>
@@ -1409,6 +1425,11 @@ else
         var node = GetNode(name);
         return TryGetIntFromNode(node, out var value) ? value : 0;
     }
+
+    // Blazorの属性値では文字参照が改行に変換されないため、C#文字列で改行を渡す
+    private const string TsreplaceStartupPrerollTooltip =
+        "先頭に準備区間(1.5秒)を追加し、TVTest+TVtplayで先頭のGOPが再生されない問題を回避します。\n" +
+        "一方、他のプレイヤーでは先頭フレームがその秒数分表示されることがあり、注意が必要です。";
 
     private bool GetBoolValue(string name)
     {

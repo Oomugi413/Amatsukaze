@@ -217,6 +217,10 @@ Amatsukaze本体や対応するエンコーダなどの最新版を確認し、�
 
 これで、字幕が有効になり、字幕のあるTSなら、字幕がSRTorASSに変換されて出力されます。
 
+最終出力がMKVの場合は、ARIB字幕を画像として描画したPGS字幕も自動で追加します。CLIの`--format mkv`だけでなく、`--use-mkv-when-sub-exists`でMKVに切り替わる場合も対象です。既存のASS・SRT字幕は引き続き出力し、PGSを既定トラックにはしません。MP4・M2TS・TS出力ではPGSを生成しません。
+
+PGS字幕を無効にする場合は`--no-pgs-sub`を指定します。描画フォントを指定する場合は`--pgs-font "Noto Sans CJK JP"`などを指定します。省略時はlibaribcaptionの既定フォントを使います。Linuxでは日本語フォントと`/etc/fonts`のfontconfig設定が必要です。
+
 #### 5-3. DRCS外字マッピングを追加
 
 字幕を処理すると、DRCS外字マッピングがないというエラーが出ることがあります。
@@ -1067,6 +1071,10 @@ GPLのライブラリを組み込んでいるので、全体にGPLが適用さ�
 | [danmaku2ass.py](https://github.com/m13253/danmaku2ass) | GPL-3.0 |
 | [libjpeg-turbo](https://github.com/libjpeg-turbo/libjpeg-turbo) | BSD系ライセンス（複数） |
 | [zlib](https://zlib.net/) | zlib License |
+| [libaribcaption](https://github.com/xqq/libaribcaption) | MIT |
+| [FreeType](https://freetype.org/)（Linux字幕描画） | FreeType License（FTL） |
+| [fontconfig](https://gitlab.freedesktop.org/fontconfig/fontconfig)（Linuxフォント検索） | MIT系ライセンス |
+| [expat](https://github.com/libexpat/libexpat)（Linuxフォント設定の解析） | MIT |
 | [Microsoft Visual C++ランタイム](https://visualstudio.microsoft.com/license-terms/) | Microsoft Software License Terms |
 
 同梱AviSynthプラグイン
@@ -1119,11 +1127,13 @@ bootstrap-vcpkg.bat
 vcpkg integrate install
 ```
 
-次にzlibとlibjpeg-turboをインストールします。
+次にzlib、libjpeg-turboを静的ライブラリとしてインストールします。
 
 ```bat
 vcpkg install zlib:x64-windows-static libjpeg-turbo:x64-windows-static
 ```
+
+libaribcaptionのビルドを自動で行います。そのため、Visual Studio Installerで「Windows 用 C++ CMake ツール」を導入し、gitにパスを通しておいてください。
 
 AvisynthNeoが必要です。ソースを落として、ビルドしてください。
 ビルドにはCMakeが必要です。AviSynth.libをlib/x64(or x86)へコピーしてください。

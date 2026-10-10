@@ -45,6 +45,55 @@ void VideoFrameParser::reset() {
     parser->reset();
 }
 
+extern "C" int ParseVideoAccessUnitsForTest(int streamFormat,
+    const VideoAccessUnitForTest* units, size_t unitCount, int* unitResults,
+    VideoFrameInfo* output, size_t outputCapacity, size_t* outputCount) {
+    if (outputCount == nullptr || (unitCount != 0 && units == nullptr)) {
+        return VIDEO_PARSER_FOR_TEST_INVALID_ARGUMENT;
+    }
+    *outputCount = 0;
+    try {
+        AMTContext ctx;
+        MPEG2VideoParser mpeg2parser(ctx);
+        H264VideoParser h264parser(ctx);
+        HEVCVideoParser hevcparser(ctx);
+        IVideoParser* parser = nullptr;
+        switch (streamFormat) {
+        case VS_MPEG2: parser = &mpeg2parser; break;
+        case VS_H264: parser = &h264parser; break;
+        case VS_H265: parser = &hevcparser; break;
+        default: return VIDEO_PARSER_FOR_TEST_INVALID_ARGUMENT;
+        }
+        // VideoFrameParser::setStreamFormatと同じく、使用前にリセットする
+        parser->reset();
+        std::vector<VideoFrameInfo> frames;
+        std::vector<VideoFrameInfo> unitFrames;
+        for (size_t i = 0; i < unitCount; i++) {
+            if (units[i].data == nullptr) {
+                return VIDEO_PARSER_FOR_TEST_INVALID_ARGUMENT;
+            }
+            const bool ok = parser->inputFrame(MemoryChunk(const_cast<uint8_t*>(units[i].data), units[i].length),
+                unitFrames, units[i].PTS, units[i].DTS);
+            if (unitResults != nullptr) {
+                unitResults[i] = ok ? 1 : 0;
+            }
+            frames.insert(frames.end(), unitFrames.begin(), unitFrames.end());
+        }
+        *outputCount = frames.size();
+        if (output == nullptr) {
+            return outputCapacity == 0 ? VIDEO_PARSER_FOR_TEST_SUCCESS : VIDEO_PARSER_FOR_TEST_INVALID_ARGUMENT;
+        }
+        if (outputCapacity < frames.size()) {
+            return VIDEO_PARSER_FOR_TEST_BUFFER_TOO_SMALL;
+        }
+        std::copy(frames.begin(), frames.end(), output);
+        return VIDEO_PARSER_FOR_TEST_SUCCESS;
+    } catch (...) {
+        *outputCount = 0;
+        return VIDEO_PARSER_FOR_TEST_FAILED;
+    }
+}
+
 /* virtual */ void VideoFrameParser::onPesPacket(int64_t clock, PESPacket packet) {
     if (!packet.has_PTS()) {
         ctx.error(_T("Video PES Packet に PTS がありません"));
@@ -130,6 +179,8 @@ CaptionParser::CaptionParser(AMTContext&ctx)
 
     //int64_t DTS = packet.has_DTS() ? packet.DTS : PTS;
     MemoryChunk payload = packet.paylod();
+    // 管理データやデコード結果なしのPESも、同じ補正済みPTSで通知する。
+    onRawCaptionPesPacket(PTS, payload);
 
     captions.clear();
 
@@ -223,7 +274,7 @@ void TsPacketBuffer::backAndInput() {
             numBefferedPackets_ = numMaxPackets - 1;
         }
         buffer.add(MemoryChunk(packet.data, TS_PACKET_LENGTH));
-        ++numBefferedPackets_;
+        numBefferedPackets_++;
     }
     if (handler != NULL) {
         handler->onTsPacket(-1, packet);
@@ -282,7 +333,7 @@ void TsSystemClock::inputTsPacket(TsPacket packet) {
                     if (af.PCR_flag()) {
                         pcrInfo[1].clock = af.program_clock_reference;
                         pcrInfo[1].packetIndex = numTotakPacketsReveived;
-                        ++numPcrReceived;
+                        numPcrReceived++;
                     }
 
                     // テスト用
@@ -293,7 +344,7 @@ void TsSystemClock::inputTsPacket(TsPacket packet) {
             }
         }
     }
-    ++numTotakPacketsReveived;
+    numTotakPacketsReveived++;
 }
 
 double TsSystemClock::currentBitrate() {
@@ -425,6 +476,9 @@ TsSplitter::SpAudioFrameParser::SpAudioFrameParser(AMTContext&ctx, TsSplitter& t
 }
 TsSplitter::SpCaptionParser::SpCaptionParser(AMTContext&ctx, TsSplitter& this_)
     : CaptionParser(ctx), this_(this_) {}
+/* virtual */ void TsSplitter::SpCaptionParser::onRawCaptionPesPacket(int64_t PTS, MemoryChunk payload) {
+    this_.onRawCaptionPesPacket(PTS, payload);
+}
 /* virtual */ void TsSplitter::SpCaptionParser::onCaptionPesPacket(int64_t clock, std::vector<CaptionItem>& captions, PESPacket packet) {
     this_.onCaptionPesPacket(clock, captions, packet);
 }
@@ -515,9 +569,9 @@ TsSplitter::SpCaptionParser::SpCaptionParser(AMTContext&ctx, TsSplitter& this_)
 }
 
 bool TsSplitter::checkScramble(TsPacket packet) {
-    ++numTotalPackets;
+    numTotalPackets++;
     if (packet.transport_scrambling_control()) {
-        ++numScramblePackets;
+        numScramblePackets++;
         return false;
     }
     return true;

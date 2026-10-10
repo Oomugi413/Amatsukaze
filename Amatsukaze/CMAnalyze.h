@@ -52,6 +52,16 @@ public:
 #endif
 };
 
+// ロゴが採用されなかった理由。最終エラーで「検出失敗のあと何が失敗したか」を出すために使う。
+enum class LogoMatchFailKind {
+    None = 0,
+    Registered,
+    AutoRect,
+    AutoGenerate,
+    AutoRematch,
+    AutoOther,
+};
+
 class CMAnalyze : public AMTObject {
 public:
     CMAnalyze(AMTContext& ctx,
@@ -60,6 +70,7 @@ public:
     void analyze(const int serviceId, const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, const bool analyzeChapterAndCM);
 
     const tstring& getLogoPath() const { return logopath; }
+    const tstring& getLogoMatchFailMessage() const { return logoMatchFailMessage; }
     const std::vector<int>& getTrims() const { return trims; }
     const std::vector<EncoderZone>& getZones() const { return cmzones; }
     const std::vector<int>& getDivs() const { return divs; }
@@ -88,12 +99,16 @@ private:
 
     bool logoAnalysisDone;
     tstring logopath;
+    LogoMatchFailKind logoMatchFailKind;
+    tstring logoMatchFailMessage;
+
+    void setLogoMatchFail(LogoMatchFailKind kind);
     std::vector<int> trims;
     std::vector<EncoderZone> cmzones;
     std::vector<int> sceneChanges;
     std::vector<int> divs;
 
-    void analyzeLogo(const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, Stopwatch& sw, const tstring& avspath);
+    void analyzeLogo(const int serviceId, const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, Stopwatch& sw, const tstring& avspath);
 
     void analyzeChapterCM(const int serviceId, const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, Stopwatch& sw, const tstring& avspath);
 
@@ -103,10 +118,10 @@ private:
 
     int getPreferredThreads(const int processorCount) const;
 
-    void logoFrame(const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, const tstring& avspath);
+    void logoFrame(const int serviceId, const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, const tstring& avspath);
 
     // ロゴ不一致時に自動ロゴ枠検出→ロゴ生成→仮ロゴで再解析を試行する
-    bool tryAutoDetectAndRetryLogo(const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, const tstring& avspath);
+    bool tryAutoDetectAndRetryLogo(const int serviceId, const int videoFileIndex, const VideoFormat& inputFormat, const int numFrames, const tstring& avspath);
 
     tstring MakeChapterExeArgs(int videoFileIndex, const VideoFormat& inputFormat, const tstring& avspath);
 

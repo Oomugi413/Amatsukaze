@@ -41,6 +41,23 @@ private:
 };
 }
 
+extern "C" int GenerateSilentAdtsFrameForTest(int layout, int samplingFrequencyIndex,
+    uint8_t* output, size_t outputCapacity, size_t* frameLength) {
+    constexpr int RESULT_INVALID = -1;
+    constexpr int RESULT_BUFFER_TOO_SMALL = -2;
+    if (frameLength == nullptr) return RESULT_INVALID;
+    *frameLength = 0;
+    try {
+        const auto frame = GenerateSilentAdtsFrame((AUDIO_CHANNELS)layout, samplingFrequencyIndex);
+        *frameLength = frame.size();
+        if (output == nullptr || outputCapacity < frame.size()) return RESULT_BUFFER_TOO_SMALL;
+        std::copy(frame.begin(), frame.end(), output);
+        return 0;
+    } catch (...) {
+        return RESULT_INVALID;
+    }
+}
+
 std::vector<uint8_t> GenerateSilentAdtsFrame(AUDIO_CHANNELS layout, int samplingFrequencyIndex) {
     const int config = GetAudioAdtsChannelConfiguration(layout);
     if (config < 0 || samplingFrequencyIndex < 0 || samplingFrequencyIndex > 12) {
@@ -93,7 +110,7 @@ void BuildAudioTrack(AMTContext& ctx, PacketCache& cache, const AudioTrackPlan& 
     auto silence = GenerateSilentAdtsFrame(plan.layout, plan.samplingFrequencyIndex);
     File file(path, _T("wb"));
     TrackDualMonoSplitter splitter(ctx, file);
-    for (size_t position = 0; position < plan.frames.size(); ++position) {
+    for (size_t position = 0; position < plan.frames.size(); position++) {
         const auto& ref = plan.frames[position];
         if (ref.dstLayout != plan.layout) THROW(FormatException, "出力音声のレイアウトが一致しません");
         switch (ref.operation) {
@@ -128,7 +145,7 @@ void BuildAudioTrack(AMTContext& ctx, PacketCache& cache, const AudioTrackPlan& 
         case AudioTrackOperation::CONVERT: {
             size_t end = position + 1;
             while (end < plan.frames.size() && plan.frames[end].operation == AudioTrackOperation::CONVERT &&
-                plan.frames[end].srcLayout == ref.srcLayout && plan.frames[end].dualMonoChannel == ref.dualMonoChannel) ++end;
+                plan.frames[end].srcLayout == ref.srcLayout && plan.frames[end].dualMonoChannel == ref.dualMonoChannel) end++;
             auto converted = ConvertAudioTrackRun(ctx, cache, plan, position, end, frameInfo);
             for (auto& frame : converted) file.write(MemoryChunk(frame.data(), frame.size()));
             position = end - 1;

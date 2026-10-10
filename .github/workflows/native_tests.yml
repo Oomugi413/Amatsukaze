@@ -35,7 +35,28 @@ jobs:
           docker run --rm \
             -v "${{ github.workspace }}:/work" \
             amatsukaze-native-tests \
-            bash -lc 'git config --global --add safe.directory /work && cd /work && meson setup build-native --buildtype release --pkg-config-path "$AMT_PKGCONFIG_FFNK_DIR:$AMT_BASELIBS_DIR/lib/pkgconfig" && meson compile -C build-native AmatsukazeNativeTests && meson test -C build-native --suite native --print-errorlogs'
+            bash -lc '
+              set -eu
+              git config --global --add safe.directory /work
+              cd /work
+              # 古いベースだけ字幕依存を補い、FFmpegの再ビルドは行わない。
+              caption_missing=0
+              for entry in expat:expat freetype:freetype2 fontconfig:fontconfig aribcaption:libaribcaption; do
+                archive=${entry%%:*}
+                pc=${entry#*:}
+                if [ ! -f "$AMT_BASELIBS_DIR/lib/lib${archive}.a" ] || [ ! -f "$AMT_BASELIBS_DIR/lib/pkgconfig/${pc}.pc" ]; then
+                  caption_missing=1
+                fi
+              done
+              if [ "$caption_missing" = 1 ]; then
+                apt-get update
+                apt-get install -y gettext gperf
+                sh scripts/build_caption_deps.sh /tmp/amatsukaze-caption-build "$AMT_BASELIBS_DIR"
+              fi
+              meson setup build-native --buildtype release --pkg-config-path "$AMT_PKGCONFIG_FFNK_DIR:$AMT_BASELIBS_DIR/lib/pkgconfig"
+              meson compile -C build-native
+              meson test -C build-native --suite native --print-errorlogs
+            '
 
   windows:
     name: Windows Release
@@ -59,9 +80,11 @@ jobs:
           path: |
             vcpkg
             vcpkg_installed
-          key: vcpkg-windows-${{ hashFiles('**/vcpkg.json') }}
+          # libaribcaptionはvcpkgから外し、Amatsukaze.vcxprojのビルド前イベントで自前ビルドする。
+          # 旧キャッシュに残ったaribcaption.libが自動リンクされないよう、キーを変えて復元しない。
+          key: vcpkg-windows-v2-${{ hashFiles('**/vcpkg.json') }}
           restore-keys: |
-            vcpkg-windows-
+            vcpkg-windows-v2-
       - name: Setup native dependencies
         shell: cmd
         run: |

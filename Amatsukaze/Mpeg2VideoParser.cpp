@@ -289,7 +289,8 @@ MPEG2VideoParser::MPEG2VideoParser(AMTContext& ctx)
                     format.colorSpace = sequenceHeader.matrix_coefficients;
                 }
 
-                b += sequenceHeader.numReadBytes;
+                // 次のスタートコードの先頭へ (ループのb++で進む分を引く)
+                b += sequenceHeader.numReadBytes - 1;
                 hasSequenceHeader = true;
                 isGopStart = true;
             }
@@ -321,7 +322,7 @@ MPEG2VideoParser::MPEG2VideoParser(AMTContext& ctx)
                             picType = picHeader.top_field_first ?
                                 PIC_TFF_RFF : PIC_BFF_RFF;
                         }
-                        ++receivedField;
+                        receivedField++;
                         break;
                     }
                     switch (picHeader.picture_coding_type) {
@@ -362,7 +363,8 @@ MPEG2VideoParser::MPEG2VideoParser(AMTContext& ctx)
                         break;
                     }
                 }
-                b += picHeader.numReadBytes;
+                // 次のスタートコードの先頭へ (ループのb++で進む分を引く)
+                b += picHeader.numReadBytes - 1;
             }
 
             if (receivedField > 2) {

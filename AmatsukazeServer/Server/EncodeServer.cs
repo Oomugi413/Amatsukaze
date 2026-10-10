@@ -1470,6 +1470,8 @@ namespace Amatsukaze.Server
             return value > 0 ? value : defaultValue;
         }
 
+        // tsreplaceの先頭に追加する準備区間の長さ(ms)
+        private const int TsreplaceStartupPrerollMs = 1500;
         private const int AutoLogoPendingDefaultDivX = 5;
         private const int AutoLogoPendingDefaultDivY = 5;
         private const int AutoLogoPendingDefaultSearchFrames = 10000;
@@ -2229,6 +2231,10 @@ namespace Amatsukaze.Server
                     {
                         sb.Append(" --tsreplace-remove-typed");
                     }
+                    if (profile.OutputFormat == FormatType.TSREPLACE && profile.AddTsreplaceStartupPreroll)
+                    {
+                        sb.Append(" --tsreplace-startup-preroll ").Append(TsreplaceStartupPrerollMs);
+                    }
                     if (profile.OutputFormat == FormatType.TSREPLACE && profile.TsreplaceMuxTsTempFile)
                     {
                         sb.Append(" --mux-ts-temp");
@@ -2382,6 +2388,7 @@ namespace Amatsukaze.Server
                 if (!profile.DisableSubs)
                 {
                     sb.Append(" --subtitles");
+                    sb.Append(profile.GetPgsSubtitleArguments());
                     // 字幕モード
                     string subModeStr = "arib";
                     if (profile.SubMode != SubtitleMode.Arib)
@@ -3714,9 +3721,20 @@ namespace Amatsukaze.Server
                     // リネーム
                     if (autoSelects.ContainsKey(data.Profile.Name))
                     {
-                        var profile = autoSelects[data.Profile.Name];
+                        // 名前を書き換える前に重複を拒否し、元の設定を保持する。
+                        if (data.NewName == data.Profile.Name)
+                        {
+                            return NotifyMessage("自動選択の名前は変更されていません", false);
+                        }
+                        if (!StringComparer.OrdinalIgnoreCase.Equals(data.Profile.Name, data.NewName) &&
+                            autoSelects.ContainsKey(data.NewName))
+                        {
+                            return NotifyError("自動選択「" + data.NewName + "」は既に存在します", false);
+                        }
+                        var oldName = data.Profile.Name;
+                        var profile = autoSelects[oldName];
                         profile.Name = data.NewName;
-                        autoSelects.Remove(data.Profile.Name);
+                        autoSelects.Remove(oldName);
                         autoSelects.Add(profile.Name, profile);
                         message = "自動選択「" + data.Profile.Name + "」を「" + profile.Name + "」にリネームしました";
                         autoSelectUpdated = true;

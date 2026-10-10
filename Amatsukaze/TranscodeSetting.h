@@ -156,6 +156,7 @@ std::vector<std::pair<tstring, bool>> makeMuxerArgs(
     const std::vector<tstring>& subsTitles,
     const tstring& metapath,
     const bool tsreplaceRemoveTypeD,
+    const int tsreplaceStartupPreroll,
     const tstring& tsreplaceCutList,
     bool muxerAddEncoderCmd,
     bool sarInContainerOnly,
@@ -263,6 +264,8 @@ struct Config {
     tstring preEncBatchFile;
     ENUM_FORMAT format;
     bool tsreplaceRemoveTypeD;
+    // tsreplaceの--startup-preroll値(ms) 0以下なら指定しない
+    int tsreplaceStartupPreroll;
     bool muxTsTemp;
     bool useMKVWhenSubExist;
     bool mpeg2Partial;
@@ -272,6 +275,8 @@ struct Config {
     bool chapter;
     bool outputChapter;
     bool subtitles;
+    bool pgsSub = true;
+    tstring pgsFontFamily;
     int nicojkmask;
     bool useNicoJKLog;
     BitrateSetting bitrate;
@@ -401,6 +406,8 @@ public:
 
     bool getTsreplaceRemoveTypeD() const;
 
+    int getTsreplaceStartupPreroll() const;
+
     bool isMuxTsTempEnabled() const;
 
     bool getUseMKVWhenSubExist() const;
@@ -441,6 +448,10 @@ public:
     bool isOutputChapterEnabled() const;
 
     bool isSubtitlesEnabled() const;
+
+    bool isPgsSubEnabled() const;
+
+    tstring getPgsFontFamily() const;
 
     bool isNicoJKEnabled() const;
 
@@ -599,6 +610,8 @@ public:
     tstring getTmpASSFilePath(EncodeFileKey key, int langindex) const;
 
     tstring getTmpSRTFilePath(EncodeFileKey key, int langindex) const;
+
+    tstring getTmpPGSFilePath(EncodeFileKey key, int langindex) const;
 
     tstring getTmpAMTSourcePath(int vindex) const;
 

@@ -2082,6 +2082,8 @@ namespace Amatsukaze.Models
                 profile.DisableChapter = data.Profile.DisableChapter;
                 profile.OutputChapter = data.Profile.OutputChapter;
                 profile.DisableSubs = data.Profile.DisableSubs;
+                profile.DisablePgsSub = data.Profile.DisablePgsSub;
+                profile.PgsFontFamily = data.Profile.PgsFontFamily;
                 profile.EnableWebVTT = data.Profile.EnableWebVTT;
                 profile.SubMode = (int)data.Profile.SubMode;
                 profile.WhisperModel = (int)data.Profile.WhisperModel;
@@ -2115,6 +2117,7 @@ namespace Amatsukaze.Models
                 profile.OutputFormatInt = (int)data.Profile.OutputFormat;
                 profile.UseMKVWhenSubExists = data.Profile.UseMKVWhenSubExists;
                 profile.TsreplaceRemoveTypeD = data.Profile.TsreplaceRemoveTypeD;
+                profile.AddTsreplaceStartupPreroll = data.Profile.AddTsreplaceStartupPreroll;
                 profile.Data.TsreplaceMuxTsTempFile = data.Profile.TsreplaceMuxTsTempFile;
                 profile.EnableGunreFolder = data.Profile.EnableGunreFolder;
                 profile.EnableRename = data.Profile.EnableRename;

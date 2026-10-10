@@ -20,6 +20,7 @@
 #include <cmath>
 #include "TsInfo.h"
 #include "Mpeg2PartialEncode.h"
+#include "CaptionPgs.h"
 #include <filesystem>
 
 namespace {
@@ -40,7 +41,7 @@ struct WhisperAudioEntry {
     int dualMonoChannel; // -1: original stereo, 0/1: dual mono channel selection
 };
 
-constexpr int RESUME_MANIFEST_VERSION = 3;
+constexpr int RESUME_MANIFEST_VERSION = 4;
 
 struct ResumeVideoInfo {
     int numFrames;
@@ -753,7 +754,7 @@ static tstring createWhisperWaveInput(AMTContext& ctx,
     std::vector<uint8_t> srcBuffer;
     std::vector<uint8_t> dstBuffer;
 
-    for (size_t waveIndex = 0; waveIndex < waveFrames.size(); ++waveIndex) {
+    for (size_t waveIndex = 0; waveIndex < waveFrames.size(); waveIndex++) {
         const auto& frame = waveFrames[waveIndex];
         const int sourceDualMonoChannel = fileIn.isAudioTrackPlanned
             ? fileIn.audioTrackPlan.at(entry.localIndex).frames[waveIndex].dualMonoChannel : entry.dualMonoChannel;
@@ -781,7 +782,7 @@ static tstring createWhisperWaveInput(AMTContext& ctx,
             if (fileIn.isAudioTrackPlanned && sourceDualMonoChannel >= 0) {
                 // mergeの目標が2chでも、元デュアルモノ区間は指定言語だけを両側へ渡す。
                 auto* samples = reinterpret_cast<int16_t*>(srcBuffer.data());
-                for (int sample = 0; sample < frameSamples; ++sample) {
+                for (int sample = 0; sample < frameSamples; sample++) {
                     const int16_t value = samples[sample * srcChannels + sourceDualMonoChannel];
                     samples[sample * srcChannels] = samples[sample * srcChannels + 1] = value;
                 }
@@ -904,7 +905,7 @@ StreamReformInfo AMTSplitter::split() {
     printInteraceCount();
 
     return StreamReformInfo(ctx, videoFileCount_,
-        videoFrameList_, audioFrameList_, captionTextList_, streamEventList_, timeList_);
+        videoFrameList_, audioFrameList_, captionTextList_, streamEventList_, timeList_, std::move(captionPesList_));
 }
 
 int64_t AMTSplitter::getSrcFileSize() const {
@@ -1201,6 +1202,14 @@ void AMTSplitter::printInteraceCount() {
     }
 }
 
+// 管理データを含め、描画用デコーダに必要な全字幕PESを保持する。
+void AMTSplitter::onRawCaptionPesPacket(int64_t PTS, MemoryChunk payload) {
+    CaptionPesItem item;
+    item.PTS = PTS;
+    item.data.assign(payload.data, payload.data + payload.length);
+    captionPesList_.push_back(std::move(item));
+}
+
 /* virtual */ DRCSOutInfo AMTSplitter::getDRCSOutPath(int64_t PTS, const std::string& md5) {
     DRCSOutInfo info;
     info.elapsed = (videoFrameList_.size() > 0) ? (double)(PTS - videoFrameList_[0].PTS) : -1.0;
@@ -1214,9 +1223,9 @@ void AMTSplitter::printInteraceCount() {
     // ベースクラスの処理
     TsSplitter::onPidTableChanged(video, audio, caption);
 
-    ASSERT(audio.size() > 0);
+    // 音声のない TS もある。ASSERT はリリースビルドでは無効なので、空のまま audio[0] を読まない
     videoStreamType_ = video.stype;
-    audioStreamType_ = audio[0].stype;
+    audioStreamType_ = audio.empty() ? -1 : audio[0].stype;
 
     StreamEvent ev = StreamEvent();
     ev.type = PID_TABLE_CHANGED;
@@ -1637,7 +1646,7 @@ void DoBadThing() {
         if (reformInfo.getVideoStreamFormat() != VS_MPEG2) {
             THROW(FormatException, "--mpeg2-partialの入力映像はMPEG-2である必要があります");
         }
-        for (int videoFileIndex = 0; videoFileIndex < reformInfo.getNumVideoFile(); ++videoFileIndex) {
+        for (int videoFileIndex = 0; videoFileIndex < reformInfo.getNumVideoFile(); videoFileIndex++) {
             const auto& videoFormat = reformInfo.getFormat(EncodeFileKey(videoFileIndex, 0)).videoFormat;
             if (videoFormat.format != VS_MPEG2 || !videoFormat.fixedFrameRate) {
                 THROW(FormatException, "--mpeg2-partialは固定フレームレートのMPEG-2映像だけに対応しています");
@@ -1695,7 +1704,12 @@ void DoBadThing() {
     } else {
         ctx.info(_T("[一時ファイル再利用] ロゴ・CM解析結果を再利用します"));
     }
-    std::vector<std::pair<size_t, bool>> logoFound;
+    struct LogoMatchState {
+        size_t frames;
+        bool found;
+        tstring message;
+    };
+    std::vector<LogoMatchState> logoFound;
     std::vector<std::unique_ptr<MakeChapter>> chapterMakers(numVideoFiles);
     for (int videoFileIndex = 0; videoFileIndex < numVideoFiles; videoFileIndex++) {
         cmanalyze.push_back(std::make_unique<CMAnalyze>(ctx, setting));
@@ -1732,7 +1746,10 @@ void DoBadThing() {
             }
         }
 
-        logoFound.emplace_back(numFrames, cma->getLogoPath().size() > 0);
+        logoFound.push_back(LogoMatchState{
+            (size_t)numFrames,
+            cma->getLogoPath().size() > 0,
+            cma->getLogoMatchFailMessage() });
         reformInfo.applyCMZones(videoFileIndex, cma->getZones(), cma->getDivs());
 
         if (analyzeChapterAndCM) {
@@ -1743,16 +1760,25 @@ void DoBadThing() {
     if (setting.isChapterEnabled()) {
         // ロゴがあったかチェック //
         // 映像ファイルをフレーム数でソート
-        std::sort(logoFound.begin(), logoFound.end());
+        std::sort(logoFound.begin(), logoFound.end(), [](const LogoMatchState& a, const LogoMatchState& b) {
+            return a.frames < b.frames;
+        });
         const bool logoRequired = !setting.isNoDelogo()
             || (setting.isChapterEnabled() && !setting.isNoLogoInCM());
-        if (setting.getLogoPath().size() > 0 && // ロゴ指定あり
+        if (!logoFound.empty() &&
+            setting.getLogoPath().size() > 0 && // ロゴ指定あり
             logoRequired &&
             setting.isIgnoreNoLogo() == false &&          // ロゴなし無視でない
-            logoFound.back().first >= 300 &&
-            logoFound.back().second == false)     // 最も長い映像でロゴが見つからなかった
+            logoFound.back().frames >= 300 &&
+            logoFound.back().found == false)     // 最も長い映像でロゴが見つからなかった
         {
-            THROW(NoLogoException, "マッチするロゴが見つかりませんでした");
+            const auto& longest = logoFound.back();
+            const tstring message = longest.message.empty()
+                ? tstring(_T("マッチするロゴが見つかりませんでした"))
+                : longest.message;
+            throw_exception_(NoLogoException(StringFormat(
+                _T("Exception thrown at %s:%d\r\nMessage: %s"),
+                core_utils::file_name_t(__FILENAME__).c_str(), __LINE__, message.c_str())));
         }
         ctx.infoF(_T("ロゴ・CM解析完了: %.2f秒"), sw.getAndReset());
     }
@@ -1846,7 +1872,7 @@ void DoBadThing() {
             const auto& fileIn = reformInfo.getEncodeFile(key);
             const auto fmt = reformInfo.getFormat(key);
             if (fileIn.isAudioTrackPlanned) {
-                for (int adst = 0; adst < (int)fileIn.audioTrackPlan.size(); ++adst) {
+                for (int adst = 0; adst < (int)fileIn.audioTrackPlan.size(); adst++) {
                     const auto& track = fileIn.audioTrackPlan[adst];
                     const auto filepath = setting.getIntAudioFilePath(key, adst, setting.getAudioEncoder());
                     BuildAudioTrack(ctx, audioCache, track, filepath, reformInfo.getAudioFrameList());
@@ -2382,6 +2408,68 @@ void DoBadThing() {
         }
     }
 
+    // フィルタ後の表示サイズが確定してから、最終muxと同じ規則でPGSを生成する。
+    if (setting.isPgsSubEnabled() && setting.isSubtitlesEnabled()) {
+        Stopwatch pgsWatch;
+        pgsWatch.start();
+        for (int i = 0; i < (int)keys.size(); i++) {
+            const auto key = keys[i];
+            if (getActualOutputFormat(key, reformInfo, setting) != FORMAT_MKV) {
+                continue;
+            }
+            const auto& format = outFileInfo[i].vfmt;
+            // displayWidth/Heightはリサイズ後も入力値が残るため、最終フレームサイズを使う。
+            const auto userSAR = setting.getUserSAR();
+            const auto [canvasWidth, canvasHeight] = CaptionPgsCanvasSize(format.width, format.height,
+                format.sarWidth, format.sarHeight, userSAR.first, userSAR.second);
+            const auto& captions = reformInfo.getEncodeFile(key).captionList;
+            for (int lang = 0; lang < (int)captions.size(); lang++) {
+                const auto path = setting.getTmpPGSFilePath(key, lang);
+                // 再開時の古いPGSを失敗後にmuxしないよう、生成前に除去する。
+                if (File::exists(path)) {
+                    rgy_file_remove(path.c_str());
+                }
+                try {
+                    const auto data = GenerateCaptionPgs(reformInfo, key, lang + 1,
+                        canvasWidth, canvasHeight, tchar_to_string(setting.getPgsFontFamily(), CP_UTF8),
+                        [&ctx](bool warning, const std::string& message) {
+                            const auto text = char_to_tstring(message, CP_UTF8);
+                            if (warning) {
+                                ctx.warnF(_T("PGS字幕: %s"), text.c_str());
+                            } else {
+                                ctx.infoF(_T("PGS字幕: %s"), text.c_str());
+                            }
+                        });
+                    if (!data.empty()) {
+                        FILE* file = fsopenT(path.c_str(), _T("wb"), _SH_DENYNO);
+                        if (!file) {
+                            throw std::runtime_error("PGS字幕ファイルを開けません");
+                        }
+                        const bool written = fwrite(data.data(), 1, data.size(), file) == data.size();
+                        const bool closed = fclose(file) == 0;
+                        if (!written || !closed) {
+                            throw std::runtime_error("PGS字幕ファイルの書き込みに失敗しました");
+                        }
+                        // 成功したファイルだけをmuxへ渡し、削除できない古い出力も除外する。
+                        outFileInfo[i].pgsFiles.push_back(path);
+                        ctx.infoF(_T("PGS字幕出力: %s (%dx%d)"), path.c_str(), canvasWidth, canvasHeight);
+                    }
+                } catch (const std::exception& e) {
+                    if (File::exists(path)) {
+                        rgy_file_remove(path.c_str());
+                    }
+                    ctx.warnF(_T("PGS字幕の生成に失敗、PGSなしで続行します: %s"), char_to_tstring(e.what(), CP_UTF8));
+                } catch (const Exception& e) {
+                    if (File::exists(path)) {
+                        rgy_file_remove(path.c_str());
+                    }
+                    ctx.warnF(_T("PGS字幕の生成に失敗、PGSなしで続行します: %s"), e.message());
+                }
+            }
+        }
+        ctx.infoF(_T("PGS字幕生成完了: %.2f秒"), pgsWatch.getAndReset());
+    }
+
     rm.wait(HOST_CMD_Mux);
     sw.start();
     int64_t totalOutSize = 0;
@@ -2461,6 +2549,9 @@ void DoBadThing() {
     if (ends_with(setting.getSrcFilePath(), _T(".ts"))) {
         ctx.warn(_T("一般ファイルモードでのTSファイルの処理は非推奨です"));
     }
+
+    // 一時ファイルのパスを使うので、transcodeMain と同じく最初に一時ディレクトリを作る
+    const_cast<ConfigWrapper&>(setting).CreateTempDir();
 
     auto encoder = std::unique_ptr<AMTSimpleVideoEncoder>(new AMTSimpleVideoEncoder(ctx, setting));
     encoder->encode();

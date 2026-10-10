@@ -334,7 +334,7 @@
                                   ToolTip="ts一時ファイルを作成し、入力がネットワーク上にある場合のmux速度を向上させます"/>
                         </StackPanel>
 
-                        <StackPanel>
+                        <StackPanel Orientation="Horizontal">
                             <StackPanel.Style>
                                 <Style TargetType="StackPanel">
                                     <Setter Property="Visibility" Value="Collapsed"/>
@@ -349,6 +349,9 @@
                                   IsChecked="{Binding Model.SelectedProfile.TsreplaceRemoveTypeD, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                                   IsEnabled="{Binding Model.SelectedProfile.Mpeg2PartialConstraintsEnabled}"
                                   ToolTip="データ放送を削除し、出力tsの軽量化を図ります"/>
+                            <CheckBox Content="先頭に準備区間を追加" VerticalAlignment="Center" Margin="10,5,5,5"
+                                  IsChecked="{Binding Model.SelectedProfile.AddTsreplaceStartupPreroll, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                  ToolTip="先頭に準備区間(1.5秒)を追加し、TVTest+TVtplayで先頭のGOPが再生されない問題を回避します。&#10;一方、他のプレイヤーでは先頭フレームがその秒数分表示されることがあり、注意が必要です。"/>
                         </StackPanel>
 
                     </DockPanel>
@@ -690,6 +693,16 @@
                             </Style>
                         </StackPanel.Style>
 
+                        <CheckBox Height="16" Margin="0,3" Content="PGS字幕を生成しない(MKV出力時)"
+                                  IsChecked="{Binding Model.SelectedProfile.DisablePgsSub, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                  ToolTip="MKVに追加する画像字幕を無効にします。ASS・SRT字幕は引き続き出力します。"/>
+                        <WrapPanel Margin="0,6,0,6" VerticalAlignment="Center">
+                            <TextBlock Text="PGS字幕フォント" VerticalAlignment="Center"/>
+                            <TextBox Width="230" Margin="8,0,0,0"
+                                     Text="{Binding Model.SelectedProfile.PgsFontFamily, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                     ToolTip="描画に使用するフォント名。空欄なら既定のフォントを使用します。"/>
+                            <TextBlock Text="(空欄なら既定)" Margin="8,0,0,0" VerticalAlignment="Center"/>
+                        </WrapPanel>
                         <CheckBox Height="16" Margin="0,3"  Content="WebVTT字幕を生成する"
                                   IsChecked="{Binding Model.SelectedProfile.EnableWebVTT, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                                   ToolTip="b24tovttを使用し、WebVTT字幕を生成します。"/>
