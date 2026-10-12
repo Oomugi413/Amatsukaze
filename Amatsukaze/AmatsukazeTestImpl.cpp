@@ -377,7 +377,7 @@
 /* static */ int test::FileStreamInfo(AMTContext& ctx, const ConfigWrapper& setting) {
     StreamReformInfo reformInfo = StreamReformInfo::deserialize(ctx, setting.getStreamInfoPath());
     reformInfo.prepare(false, false, false);
-    auto audioDiffInfo = reformInfo.genAudio({ CMTYPE_BOTH });
+    auto audioDiffInfo = reformInfo.genAudio({ CMTYPE_BOTH }, 0);
     audioDiffInfo.printAudioPtsDiff(ctx);
     reformInfo.printOutputMapping([&](EncodeFileKey key) {
         const auto& file = reformInfo.getEncodeFile(key);
@@ -486,7 +486,7 @@ test::TestSplitDualMono::TestSplitDualMono(AMTContext& ctx, const std::vector<ts
         StreamReformInfo reformInfo = StreamReformInfo::deserialize(ctx, setting.getStreamInfoPath());
 
         reformInfo.prepare(false, false, false);
-        auto audioDiffInfo = reformInfo.genAudio({ CMTYPE_BOTH });
+        auto audioDiffInfo = reformInfo.genAudio({ CMTYPE_BOTH }, 0);
         audioDiffInfo.printAudioPtsDiff(ctx);
 
         CaptionASSFormatter formatterASS(ctx);
@@ -817,7 +817,7 @@ void CheckCaptionMapping(AMTContext& ctx) {
     auto reform = MakeCaptionStreamFixture(ctx, true);
     reform->prepare(false, false, false);
     reform->applyCMZones(0, { { 2, 4 } }, {});
-    reform->genAudio({ CMTYPE_NONCM });
+    reform->genAudio({ CMTYPE_NONCM }, 0);
     const auto& keys = reform->getOutFileKeys();
     CaptionStreamExpect(keys.size() == 1, "字幕写像fixtureの出力ファイル数が不正");
     const auto key = keys.front();
@@ -882,4 +882,144 @@ extern "C" AMATSUKAZE_API int CheckCaptionStreamForTest(
         writeDiagnostic("字幕ストリームテストで不明な例外が発生した");
     }
     return 0;
+}
+
+namespace {
+class CollectingPsHandler : public PsStreamWriter::EventHandler {
+public:
+    std::vector<uint8_t> data;
+    void onStreamData(MemoryChunk mc) override { data.insert(data.end(), mc.data, mc.data + mc.length); }
+};
+
+std::vector<uint8_t> MakePesForTest(uint8_t streamId, int64_t pts, int64_t dts, const uint8_t* payload, size_t length) {
+    const bool hasDts = dts >= 0;
+    const int headerData = hasDts ? 10 : 5;
+    std::vector<uint8_t> pes = { 0, 0, 1, streamId, 0, 0, 0x80, (uint8_t)(hasDts ? 0xC0 : 0x80), (uint8_t)headerData };
+    auto timestamp = [&](uint8_t prefix, int64_t t) {
+        pes.push_back((uint8_t)((prefix << 4) | (((t >> 30) & 7) << 1) | 1));
+        pes.push_back((uint8_t)((t >> 22) & 0xFF));
+        pes.push_back((uint8_t)((((t >> 15) & 0x7F) << 1) | 1));
+        pes.push_back((uint8_t)((t >> 7) & 0xFF));
+        pes.push_back((uint8_t)(((t & 0x7F) << 1) | 1));
+    };
+    timestamp(hasDts ? 3 : 2, pts);
+    if (hasDts) timestamp(1, dts);
+    pes.insert(pes.end(), payload, payload + length);
+    const size_t packetLength = pes.size() - 6;
+    if (packetLength <= 0xFFFF) {
+        pes[4] = (uint8_t)(packetLength >> 8);
+        pes[5] = (uint8_t)packetLength;
+    } // 映像の大きなPESはPES_packet_length=0 (長さ不定)
+    return pes;
+}
+}
+
+extern "C" int WritePsStreamForTest(const PsWriterInputForTest* inputs, size_t inputCount,
+    uint8_t* output, size_t outputCapacity, size_t* outputLength) {
+    if ((inputCount > 0 && inputs == nullptr) || outputLength == nullptr) return -1;
+    *outputLength = 0;
+    try {
+        AMTContext ctx;
+        PsStreamWriter writer(ctx);
+        CollectingPsHandler handler;
+        writer.setHandler(&handler);
+        writer.outHeader(0x02, 0x0F); // MPEG-2 video / AAC (ADTS)
+        int64_t clock = 0;
+        for (size_t i = 0; i < inputCount; i++) {
+            const auto& input = inputs[i];
+            auto pes = MakePesForTest(input.isVideo ? 0xE0 : 0xC0, input.PTS, input.DTS, input.payload, input.payloadLength);
+            PESPacket packet(MemoryChunk(pes.data(), pes.size()));
+            if (!packet.parse()) return -1;
+            if (input.isVideo) {
+                std::vector<VideoFrameInfo> frames(1);
+                frames[0] = VideoFrameInfo();
+                frames[0].PTS = input.PTS;
+                frames[0].DTS = input.DTS >= 0 ? input.DTS : input.PTS;
+                writer.outVideoPesPacket(clock, frames, packet);
+            } else {
+                std::vector<AudioFrameData> frames(1);
+                frames[0] = AudioFrameData();
+                frames[0].PTS = input.PTS;
+                frames[0].format = { AUDIO_STEREO, 48000 };
+                writer.outAudioPesPacket(0, clock, frames, packet);
+            }
+        }
+        const uint8_t endCode[] = { 0, 0, 1, 0xB9 };
+        handler.data.insert(handler.data.end(), endCode, endCode + sizeof(endCode));
+        int verified = 0;
+        try {
+            PsStreamVerifier verifier(ctx);
+            verifier.verify(MemoryChunk(handler.data.data(), handler.data.size()));
+        } catch (const Exception&) {
+            verified = 1;
+        }
+        *outputLength = handler.data.size();
+        if (output == nullptr || outputCapacity < handler.data.size()) return -2;
+        std::copy(handler.data.begin(), handler.data.end(), output);
+        return verified;
+    } catch (...) {
+        return -1;
+    }
+}
+
+extern "C" AMATSUKAZE_API int ApplyCMCutOffsetForTest(int frameCount,
+    const EncoderZone* zones, size_t zoneCount, const int* divisions, size_t divisionCount,
+    int cmType, int offsetFrames, int* frameDivisions, size_t outputCapacity) {
+    if (frameCount <= 0 || !frameDivisions || outputCapacity < (size_t)frameCount ||
+        (zoneCount && !zones) || (divisionCount && !divisions) ||
+        cmType < CMTYPE_BOTH || cmType > CMTYPE_EDGE_TRIM) return -1;
+    try {
+        AMTContext ctx;
+        std::vector<FileVideoFrameInfo> video(frameCount);
+        std::vector<FileAudioFrameInfo> audio(frameCount);
+        for (int i = 0; i < frameCount; i++) {
+            auto& frame = video[i];
+            frame.PTS = frame.DTS = 90000 + 3000 * i;
+            frame.isGopStart = i == 0;
+            frame.progressive = true;
+            frame.pic = PIC_FRAME;
+            frame.type = i == 0 ? FRAME_I : FRAME_P;
+            frame.codedDataSize = 100;
+            frame.fileOffset = 100 * i;
+            frame.format.format = VS_MPEG2;
+            frame.format.width = frame.format.displayWidth = 1920;
+            frame.format.height = frame.format.displayHeight = 1080;
+            frame.format.sarWidth = frame.format.sarHeight = 1;
+            frame.format.frameRateNum = 30;
+            frame.format.frameRateDenom = 1;
+            frame.format.progressive = frame.format.fixedFrameRate = true;
+            audio[i].PTS = frame.PTS;
+            audio[i].numSamples = 1600;
+            audio[i].format.channels = AUDIO_STEREO;
+            audio[i].format.sampleRate = 48000;
+            audio[i].codedDataSize = 100;
+            audio[i].fileOffset = 100 * i;
+        }
+        std::vector<CaptionItem> captions;
+        std::vector<StreamEvent> events = {
+            { PID_TABLE_CHANGED, 0, 0, 1 },
+            { VIDEO_FORMAT_CHANGED, 0, 0, 0 },
+            { AUDIO_FORMAT_CHANGED, 0, 0, 0 },
+        };
+        std::vector<TimeInfo> times;
+        StreamReformInfo reform(ctx, 1, video, audio, captions, events, times);
+        reform.prepare(false, false, false);
+        std::vector<EncoderZone> cmzones;
+        if (zoneCount) cmzones.assign(zones, zones + zoneCount);
+        std::vector<int> divs;
+        if (divisionCount) divs.assign(divisions, divisions + divisionCount);
+        reform.applyCMZones(0, cmzones, divs);
+        reform.genAudio({ (CMType)cmType }, offsetFrames);
+        std::fill(frameDivisions, frameDivisions + frameCount, -1);
+        for (const auto& key : reform.getOutFileKeys()) {
+            const auto& file = reform.getEncodeFile(key);
+            for (const auto index : file.videoFrames) {
+                if (index < 0 || index >= frameCount || frameDivisions[index] != -1) return -1;
+                frameDivisions[index] = key.div;
+            }
+        }
+        return 0;
+    } catch (...) {
+        return -1;
+    }
 }

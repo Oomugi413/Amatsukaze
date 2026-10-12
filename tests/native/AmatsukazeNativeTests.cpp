@@ -1,7 +1,11 @@
 ﻿// Amatsukaze の公開ネイティブ単体テスト実行器
 #include "AMTLogo.h"
+#include "LogoScan.h"
 #include "AdtsParser.h"
+#include "AmatsukazeTestImpl.h"
 #include "AudioTrackBuilder.h"
+#include "AudioTrackConverter.h"
+#include "AudioTrackPlanner.h"
 #include "CaptionData.h"
 #include "CaptionPgs.h"
 #include "EncoderOptionParser.h"
@@ -11,8 +15,10 @@
 #include "StreamUtils.h"
 #include "TsInfo.h"
 #include "TsSplitter.h"
+#include "WaveWriter.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -22,7 +28,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <map>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -754,6 +762,21 @@ bool TestMpeg2VideoParser(tstring& diagnostic) {
         _T("MPEG-2のビットレート/VBV/プロファイルが一致しません"), diagnostic)) return false;
     if (!Expect(!frames[0].progressive, _T("インタレースのフレームがprogressive扱いです"), diagnostic)) return false;
 
+    // 長い非ヘッダー領域、偽候補、末尾の不完全コードを挟んでも解析結果を維持する。
+    auto paddedUnits = units;
+    for (auto& unit : paddedUnits) {
+        std::vector<uint8_t> prefix(4096, 0x55);
+        prefix.insert(prefix.end(), { 1, 0, 1, 0xb3, 0, 1, 0, 0, 0 });
+        unit.insert(unit.begin(), prefix.begin(), prefix.end());
+        unit.insert(unit.end(), { 0, 0, 1 });
+    }
+    if (!ParseVideoUnits(VS_MPEG2, paddedUnits, timestamps, frames, unitResults, diagnostic)) return false;
+    if (!Expect(unitResults == expectedResults && frames.size() == std::size(expectedFrames),
+        _T("MPEG-2の候補探索でフレーム数または解析結果が変わりました"), diagnostic)) return false;
+    for (size_t i = 0; i < frames.size(); i++) {
+        if (!ExpectVideoFrame(frames[i], expectedFrames[i], i, diagnostic)) return false;
+    }
+
     // 720x480 4:3 23.976fps プログレッシブ、表示領域と色情報あり、GOPヘッダあり
     const Mpeg2SequenceParams progressive = { 720, 480, 2, 1, true, 15000, 112, true, 704, 480, true, 1 };
     const std::vector<std::vector<uint8_t>> progressiveUnits = {
@@ -1062,6 +1085,1642 @@ bool TestAdtsParser(tstring& diagnostic) {
     // フレーム長に満たないデータだけでは出力しない
     if (!ParseAdts({ { head, 0 } }, frames, results, diagnostic)) return false;
     return Expect(frames.empty() && results[0] == 0, _T("不完全なフレームを出力しました"), diagnostic);
+}
+
+bool TestAudioPesPipeline(tstring& diagnostic) {
+    constexpr int SFI_48000 = 3;
+    constexpr int SFI_44100 = 4;
+    const auto stereo = MakeSilentAdts(AUDIO_STEREO, SFI_48000);
+    const auto mono = MakeSilentAdts(AUDIO_MONO, SFI_44100);
+    const auto surround = MakeSilentAdts(AUDIO_32_LFE, SFI_48000);
+    const size_t half = stereo.size() / 2;
+    const std::vector<uint8_t> head(stereo.begin(), stereo.begin() + half);
+    const std::vector<uint8_t> tail(stereo.begin() + half, stereo.end());
+    const std::vector<std::vector<uint8_t>> payloads = {
+        Concat({ stereo, head }), Concat({ tail, stereo }), mono, surround, stereo,
+    };
+    std::vector<AudioPesForTest> inputs;
+    for (const auto& payload : payloads) inputs.push_back({ payload.data(), payload.size(), 90000 });
+    const int status = VerifyAudioPesPipelineForTest(inputs.data(), inputs.size());
+    if (status != 0) {
+        diagnostic = strsprintf(_T("音声並行処理の一致・所有・順序・終了・例外回収の検証に失敗: %d"), status);
+        return false;
+    }
+    return true;
+}
+
+// 音声トラックプラン: テスト専用C ABIの入出力をSTLで扱いやすくまとめる
+struct AudioPlanData {
+    AudioTrackPlanForTest header;
+    std::vector<AudioTrackReferenceForTest> frames;
+    tstring name() const { return header.name; }
+};
+
+constexpr int AUDIO_FRAME_SAMPLES = 1024;
+
+std::vector<AudioTrackFrameInfoForTest> MakeAudioFrames(std::initializer_list<AUDIO_CHANNELS> layouts) {
+    std::vector<AudioTrackFrameInfoForTest> frames;
+    for (const auto layout : layouts) frames.push_back({ (int)layout, 48000, AUDIO_FRAME_SAMPLES });
+    return frames;
+}
+
+// AACの1フレームを48kHzで見た時間 (90kHzクロック)
+double AudioDuration(int frames) {
+    return (double)frames * AUDIO_FRAME_SAMPLES * 90000.0 / 48000;
+}
+
+int PlanAudioTracks(bool merge, const std::vector<std::vector<int>>& tracks,
+    const std::vector<AudioTrackFrameInfoForTest>& info, double duration, std::vector<AudioPlanData>& plans) {
+    std::vector<int> indices;
+    std::vector<size_t> lengths;
+    for (const auto& track : tracks) {
+        indices.insert(indices.end(), track.begin(), track.end());
+        lengths.push_back(track.size());
+    }
+    size_t planCount = 0, refCount = 0;
+    int status = PlanAudioTracksForTest(merge ? 1 : 0, indices.data(), lengths.data(), lengths.size(),
+        info.data(), info.size(), duration, nullptr, 0, &planCount, nullptr, 0, &refCount);
+    plans.clear();
+    if (status != AUDIO_TRACK_PLAN_FOR_TEST_BUFFER_TOO_SMALL) return status;
+    std::vector<AudioTrackPlanForTest> headers(planCount);
+    std::vector<AudioTrackReferenceForTest> refs(refCount);
+    status = PlanAudioTracksForTest(merge ? 1 : 0, indices.data(), lengths.data(), lengths.size(),
+        info.data(), info.size(), duration, headers.data(), headers.size(), &planCount, refs.data(), refs.size(), &refCount);
+    if (status != AUDIO_TRACK_PLAN_FOR_TEST_SUCCESS) return status;
+    size_t offset = 0;
+    for (const auto& header : headers) {
+        AudioPlanData plan;
+        plan.header = header;
+        plan.frames.assign(refs.begin() + offset, refs.begin() + offset + header.frameCount);
+        offset += header.frameCount;
+        plans.push_back(std::move(plan));
+    }
+    return status;
+}
+
+int ValidateAudioPlans(const std::vector<AudioPlanData>& plans, double duration) {
+    std::vector<AudioTrackPlanForTest> headers;
+    std::vector<AudioTrackReferenceForTest> refs;
+    for (const auto& plan : plans) {
+        headers.push_back(plan.header);
+        headers.back().frameCount = plan.frames.size();
+        refs.insert(refs.end(), plan.frames.begin(), plan.frames.end());
+    }
+    // 空のbufferでもnullptrにならないよう1要素確保する
+    refs.push_back({});
+    return ValidateAudioTrackPlansForTest(headers.data(), headers.size(), refs.data(), duration);
+}
+
+bool ExpectPlanned(bool merge, const std::vector<std::vector<int>>& tracks,
+    const std::vector<AudioTrackFrameInfoForTest>& info, double duration, std::vector<AudioPlanData>& plans,
+    const TCHAR* message, tstring& diagnostic) {
+    const int status = PlanAudioTracks(merge, tracks, info, duration, plans);
+    if (status == AUDIO_TRACK_PLAN_FOR_TEST_SUCCESS) return true;
+    diagnostic = strsprintf(_T("%s (プラン生成に失敗: %d)"), message, status);
+    return false;
+}
+
+bool ExpectPlanRejected(bool merge, const std::vector<std::vector<int>>& tracks,
+    const std::vector<AudioTrackFrameInfoForTest>& info, double duration, const TCHAR* message, tstring& diagnostic) {
+    std::vector<AudioPlanData> plans;
+    return Expect(PlanAudioTracks(merge, tracks, info, duration, plans) == AUDIO_TRACK_PLAN_FOR_TEST_REJECTED, message, diagnostic);
+}
+
+bool ExpectValidateRejected(const std::vector<AudioPlanData>& plans, double duration, const TCHAR* message, tstring& diagnostic) {
+    return Expect(ValidateAudioPlans(plans, duration) == AUDIO_TRACK_PLAN_FOR_TEST_REJECTED, message, diagnostic);
+}
+
+bool IsAudioRef(const AudioTrackReferenceForTest& ref, AudioTrackOperation operation, int frameIndex) {
+    return ref.operation == (int)operation && ref.frameIndex == frameIndex;
+}
+
+bool TestAudioTrackSeparatePlanner(tstring& diagnostic) {
+    const auto info = MakeAudioFrames({ AUDIO_STEREO, AUDIO_STEREO, AUDIO_32_LFE, AUDIO_32_LFE, AUDIO_32_LFE, AUDIO_MONO });
+    std::vector<AudioPlanData> plans;
+    if (!ExpectPlanned(false, { { 0, 2, 3, 4 }, { -1, -1, 5, -1 } }, info, AudioDuration(4), plans, _T("分離プラン"), diagnostic)) return false;
+    if (!Expect(plans.size() == 3, _T("変化後のトラック数が不正です"), diagnostic)) return false;
+    if (!Expect(plans[0].header.sourceTrack == 0 && plans[0].header.layout == AUDIO_32_LFE && plans[0].name() == _T("Audio0-5.1ch"),
+        _T("最長レイアウトが先頭になりません"), diagnostic)) return false;
+    if (!Expect(plans[0].header.sampleRate == 48000 && plans[0].header.samplingFrequencyIndex == 3,
+        _T("サンプリング周波数のインデックスが不正です"), diagnostic)) return false;
+    if (!Expect(plans[0].frames[0].operation == (int)AudioTrackOperation::SILENCE, _T("異なるレイアウトが無音になりません"), diagnostic)) return false;
+    if (!Expect(plans[0].frames[1].operation == (int)AudioTrackOperation::COPY && plans[0].frames[1].frameIndex == 2 &&
+        plans[0].frames[1].srcLayout == AUDIO_32_LFE && plans[0].frames[1].dstLayout == AUDIO_32_LFE &&
+        plans[0].frames[1].dualMonoChannel == -1, _T("5.1chのコピー参照が不正です"), diagnostic)) return false;
+    if (!Expect(plans[1].header.layout == AUDIO_STEREO && plans[1].frames[0].frameIndex == 0, _T("ステレオのコピーが不正です"), diagnostic)) return false;
+    if (!Expect(plans[2].header.sourceTrack == 1 && plans[2].name() == _T("Audio1-1ch") && plans[2].frames[2].frameIndex == 5,
+        _T("途中で出現する音声が欠落しました"), diagnostic)) return false;
+
+    if (!ExpectPlanned(false, { { 2, 3 }, { -1, -1 } }, info, AudioDuration(2), plans, _T("CMカット後の分離プラン"), diagnostic)) return false;
+    if (!Expect(plans.size() == 1, _T("CMカット後に消えたトラックが残っています"), diagnostic)) return false;
+    if (!ExpectPlanned(false, { { 0, 2 } }, info, AudioDuration(2), plans, _T("同じ時間の分離プラン"), diagnostic)) return false;
+    if (!Expect(plans.size() == 2 && plans.front().header.layout == AUDIO_32_LFE, _T("同じ時間のレイアウト順が不正です"), diagnostic)) return false;
+
+    // デュアルモノ混在: 主音声 (lang1) のモノラルが先頭、続いて副音声、最後にステレオ
+    const auto dualInfo = MakeAudioFrames({ AUDIO_STEREO, AUDIO_2LANG, AUDIO_2LANG, AUDIO_MONO });
+    if (!ExpectPlanned(false, { { 0, 1, 2, 3 } }, dualInfo, AudioDuration(4), plans, _T("デュアルモノ混在プラン"), diagnostic)) return false;
+    if (!Expect(plans.size() == 3, _T("デュアルモノ混在のトラック数が不正です"), diagnostic)) return false;
+    if (!Expect(plans[0].header.logicalTrack == 0 && plans[0].header.layout == AUDIO_MONO, _T("デュアルモノの主音声順が不正です"), diagnostic)) return false;
+    if (!Expect(plans[0].frames[1].dualMonoChannel == 0 && plans[0].frames[3].dualMonoChannel == -1,
+        _T("主音声のコピー参照が不正です"), diagnostic)) return false;
+    if (!Expect(plans[1].header.logicalTrack == 1 && plans[1].frames[1].dualMonoChannel == 1 &&
+        plans[1].frames[0].operation == (int)AudioTrackOperation::SILENCE &&
+        plans[1].frames[3].operation == (int)AudioTrackOperation::SILENCE, _T("副音声の無音区間が不正です"), diagnostic)) return false;
+    if (!Expect(plans[0].name() == _T("Audio0-lang1-1ch") && plans[1].name() == _T("Audio0-lang2-1ch") &&
+        plans[2].name() == _T("Audio0-lang1-2ch"), _T("デュアルモノ混在の言語とレイアウト名が不正です"), diagnostic)) return false;
+
+    std::vector<AudioPlanData> mixed;
+    if (!ExpectPlanned(false, { { 0, 1, 2, 3 }, { 0, 1, 2, 3 } }, dualInfo, AudioDuration(4), mixed, _T("複数デュアルモノプラン"), diagnostic)) return false;
+    std::vector<tstring> names;
+    for (const auto& plan : mixed) {
+        if (!Expect(plan.name().find(_T(' ')) == tstring::npos, _T("音声名に空白が含まれています"), diagnostic)) return false;
+        if (!Expect(std::find(names.begin(), names.end(), plan.name()) == names.end(), _T("音声名が重複しています"), diagnostic)) return false;
+        names.push_back(plan.name());
+    }
+
+    // 検証関数: 壊したプランを拒否する (plans はデュアルモノ混在の結果)
+    if (!Expect(ValidateAudioPlans(plans, AudioDuration(4)) == AUDIO_TRACK_PLAN_FOR_TEST_SUCCESS, _T("正しいプランが検証で拒否されました"), diagnostic)) return false;
+    auto badPlans = plans;
+    badPlans[0].header.sampleRate = 0;
+    badPlans[0].header.samplingFrequencyIndex = -1;
+    if (!ExpectValidateRejected(badPlans, AudioDuration(4), _T("不正なサンプルレートが拒否されませんでした"), diagnostic)) return false;
+    badPlans = plans;
+    badPlans[0].frames.pop_back();
+    if (!ExpectValidateRejected(badPlans, AudioDuration(4), _T("フレーム数の不一致が拒否されませんでした"), diagnostic)) return false;
+    badPlans = plans;
+    badPlans[0].frames[0].dstLayout = AUDIO_STEREO;
+    if (!ExpectValidateRejected(badPlans, AudioDuration(4), _T("出力レイアウトの不一致が拒否されませんでした"), diagnostic)) return false;
+    badPlans = plans;
+    badPlans[0].frames[1].operation = 99;
+    if (!ExpectValidateRejected(badPlans, AudioDuration(4), _T("未定義の操作が拒否されませんでした"), diagnostic)) return false;
+    badPlans = plans;
+    badPlans[0].frames[1].srcLayout = AUDIO_STEREO;
+    if (!ExpectValidateRejected(badPlans, AudioDuration(4), _T("COPYの入力レイアウト不一致が拒否されませんでした"), diagnostic)) return false;
+
+    // 入力の異常系
+    if (!ExpectPlanRejected(false, { { 0 }, { 1, 2 } }, info, AudioDuration(1), _T("トラック間のフレーム数不一致が拒否されませんでした"), diagnostic)) return false;
+    if (!ExpectPlanRejected(false, { { 99 } }, info, AudioDuration(1), _T("範囲外のフレーム参照が拒否されませんでした"), diagnostic)) return false;
+    if (!ExpectPlanRejected(false, { { -2 } }, info, AudioDuration(1), _T("負のフレーム参照が拒否されませんでした"), diagnostic)) return false;
+    if (!ExpectPlanRejected(false, { { 0, 1 } }, info, AudioDuration(5), _T("映像時間との差が拒否されませんでした"), diagnostic)) return false;
+    auto badInfo = info;
+    badInfo[1].sampleRate = 44100;
+    if (!ExpectPlanRejected(false, { { 0, 1 } }, badInfo, AudioDuration(2), _T("サンプルレートの混在が拒否されませんでした"), diagnostic)) return false;
+    badInfo = info;
+    badInfo[0].sampleRate = 12345;
+    if (!ExpectPlanRejected(false, { { 0 } }, badInfo, AudioDuration(1), _T("未対応のサンプルレートが拒否されませんでした"), diagnostic)) return false;
+    badInfo = info;
+    badInfo[0].numSamples = 2048;
+    if (!ExpectPlanRejected(false, { { 0 } }, badInfo, AudioDuration(1), _T("AAC-LCでないフレーム長が拒否されませんでした"), diagnostic)) return false;
+    badInfo = info;
+    badInfo[0].channels = AUDIO_22;
+    if (!ExpectPlanRejected(false, { { 0 } }, badInfo, AudioDuration(1), _T("未対応のレイアウトが拒否されませんでした"), diagnostic)) return false;
+    if (!ExpectPlanned(false, { { -1, -1 } }, info, AudioDuration(2), plans, _T("全区間無音の分離プラン"), diagnostic)) return false;
+    return Expect(plans.empty(), _T("全区間が無音のトラックが残っています"), diagnostic);
+}
+
+bool TestAudioTrackMergePlanner(tstring& diagnostic) {
+    const auto info = MakeAudioFrames({ AUDIO_STEREO, AUDIO_32_LFE, AUDIO_32_LFE, AUDIO_32_LFE, AUDIO_STEREO, AUDIO_2LANG });
+    std::vector<AudioPlanData> plans;
+    if (!ExpectPlanned(true, { { 0, 1, 2, -1 }, { -1, 4, -1, -1 } }, info, AudioDuration(4), plans, _T("統合プラン"), diagnostic)) return false;
+    if (!Expect(plans.size() == 2 && plans[0].header.layout == AUDIO_32_LFE && plans[0].name() == _T("Audio0") &&
+        plans[1].header.sourceTrack == 1 && plans[1].name() == _T("Audio1"), _T("統合の最長レイアウトまたはトラック順が不正です"), diagnostic)) return false;
+    const auto& first = plans[0].frames;
+    if (!Expect(IsAudioRef(first[0], AudioTrackOperation::CONVERT, 0) && first[0].srcLayout == AUDIO_STEREO && first[0].dstLayout == AUDIO_32_LFE &&
+        IsAudioRef(first[1], AudioTrackOperation::COPY, 1) && first[3].operation == (int)AudioTrackOperation::SILENCE,
+        _T("統合のCOPY/CONVERT/SILENCE参照が不正です"), diagnostic)) return false;
+
+    if (!ExpectPlanned(true, { { 0, 4, 1 } }, info, AudioDuration(3), plans, _T("ステレオ最長の統合プラン"), diagnostic)) return false;
+    if (!Expect(plans[0].header.layout == AUDIO_STEREO && plans[0].frames[2].operation == (int)AudioTrackOperation::CONVERT &&
+        plans[0].frames[2].srcLayout == AUDIO_32_LFE && plans[0].frames[2].dstLayout == AUDIO_STEREO,
+        _T("ステレオ最長時の5.1ch変換が不正です"), diagnostic)) return false;
+    if (!ExpectPlanned(true, { { 0, 1 } }, info, AudioDuration(2), plans, _T("同率の統合プラン"), diagnostic)) return false;
+    if (!Expect(plans.size() == 1 && plans[0].header.layout == AUDIO_32_LFE, _T("統合の同率時に多チャンネルを選びません"), diagnostic)) return false;
+
+    if (!ExpectPlanned(true, { { 0, 4, 5 } }, info, AudioDuration(3), plans, _T("デュアルモノ統合プラン"), diagnostic)) return false;
+    if (!Expect(plans.size() == 2 && plans[0].header.layout == AUDIO_STEREO && plans[1].header.layout == AUDIO_MONO,
+        _T("デュアルモノ論理トラックの統合レイアウトが不正です"), diagnostic)) return false;
+    if (!Expect(plans[0].frames[2].operation == (int)AudioTrackOperation::CONVERT && plans[0].frames[2].dualMonoChannel == 0 &&
+        plans[0].frames[2].srcLayout == AUDIO_MONO && plans[1].frames[2].operation == (int)AudioTrackOperation::COPY &&
+        plans[1].frames[2].dualMonoChannel == 1 && plans[1].frames[0].operation == (int)AudioTrackOperation::SILENCE,
+        _T("デュアルモノ統合の主副言語参照が不正です"), diagnostic)) return false;
+
+    if (!ExpectPlanned(true, { { 0, 5, 5 } }, info, AudioDuration(3), plans, _T("モノラル最長の統合プラン"), diagnostic)) return false;
+    if (!Expect(plans[0].header.layout == AUDIO_MONO && plans[0].frames[0].operation == (int)AudioTrackOperation::CONVERT &&
+        plans[0].frames[1].dualMonoChannel == 0, _T("モノラル最長時のステレオ変換が不正です"), diagnostic)) return false;
+
+    // 検証関数: 壊した統合プランを拒否する
+    auto invalid = plans;
+    invalid[0].frames[0].srcLayout = AUDIO_MONO;
+    if (!ExpectValidateRejected(invalid, AudioDuration(3), _T("CONVERTの入出力が同じレイアウトのプランが拒否されませんでした"), diagnostic)) return false;
+    invalid = plans;
+    invalid[0].frames[0].frameIndex = -1;
+    if (!ExpectValidateRejected(invalid, AudioDuration(3), _T("フレーム参照が負のCONVERTが拒否されませんでした"), diagnostic)) return false;
+    invalid = plans;
+    invalid[0].frames[0].srcLayout = AUDIO_NONE;
+    if (!ExpectValidateRejected(invalid, AudioDuration(3), _T("入力レイアウトが未定義のCONVERTが拒否されませんでした"), diagnostic)) return false;
+
+    if (!ExpectPlanned(true, { { 0 }, { -1 } }, info, AudioDuration(1), plans, _T("CMカット後の統合プラン"), diagnostic)) return false;
+    if (!Expect(plans.size() == 1, _T("統合でCMカット後の全無音トラックが残っています"), diagnostic)) return false;
+    if (!ExpectPlanned(true, { { -1 } }, info, AudioDuration(1), plans, _T("全区間無音の統合プラン"), diagnostic)) return false;
+    return Expect(plans.empty(), _T("統合で全無音トラックが残っています"), diagnostic);
+}
+
+// 無音ADTSフレームのバイト列が設計書 (doc/amatsukaze_audio_format.md) の手組み結果と一致すること
+bool TestAudioSilentAdtsBytes(tstring& diagnostic) {
+    constexpr int SFI_48000 = 3;
+    struct Expected { AUDIO_CHANNELS layout; const char* hex; };
+    const Expected expected[] = {
+        { AUDIO_MONO, "fff14c40017ffc00c80007" },
+        { AUDIO_STEREO, "fff14c8001dffc2064000190000e" },
+        { AUDIO_32_LFE, "fff14d80039ffc00c800010320000c800011320000c8000306400038" },
+    };
+    for (const auto& item : expected) {
+        const auto actual = MakeSilentAdts(item.layout, SFI_48000);
+        std::string hex;
+        for (const auto byte : actual) {
+            hex += "0123456789abcdef"[byte >> 4];
+            hex += "0123456789abcdef"[byte & 15];
+        }
+        if (hex != item.hex) {
+            diagnostic = strsprintf(_T("無音AACのバイト列が設計書と一致しません: レイアウト=%d"), (int)item.layout);
+            return false;
+        }
+    }
+    // 全対応レイアウトで生成でき、ADTSヘッダのフレーム長が実バイト数と一致すること
+    for (const auto layout : { AUDIO_MONO, AUDIO_STEREO, AUDIO_30, AUDIO_31, AUDIO_32, AUDIO_32_LFE }) {
+        const auto frame = MakeSilentAdts(layout, SFI_48000);
+        if (!Expect(frame.size() > 7 && frame[0] == 0xFF && (frame[1] & 0xF0) == 0xF0, _T("無音AACのADTS同期語が不正です"), diagnostic)) return false;
+        const size_t length = ((frame[3] & 3) << 11) | (frame[4] << 3) | (frame[5] >> 5);
+        if (!Expect(length == frame.size(), _T("無音AACのADTSフレーム長が実バイト数と一致しません"), diagnostic)) return false;
+    }
+    // 異常系: デュアルモノ (単一フレームで表せない) とサンプリング周波数インデックスの範囲外は拒否する
+    if (!Expect(MakeSilentAdts(AUDIO_2LANG, SFI_48000).empty(), _T("デュアルモノの無音生成が拒否されませんでした"), diagnostic)) return false;
+    return Expect(MakeSilentAdts(AUDIO_MONO, 15).empty(), _T("範囲外のサンプリング周波数インデックスが拒否されませんでした"), diagnostic);
+}
+
+// 音声のチャンネル変換 (係数と並び順)。PCMはWAV順のインターリーブで、5.1chはFL, FR, FC, LFE, BL, BR
+int ConvertChannels(const std::vector<float>& input, AUDIO_CHANNELS src, AUDIO_CHANNELS dst, std::vector<float>& output) {
+    size_t count = 0;
+    int status = ConvertAudioChannelsForTest(input.data(), input.size(), src, dst, nullptr, 0, &count);
+    output.clear();
+    if (status != -2) return status;
+    output.resize(count);
+    return ConvertAudioChannelsForTest(input.data(), input.size(), src, dst, output.data(), output.size(), &count);
+}
+
+bool ExpectConverted(const std::vector<float>& input, AUDIO_CHANNELS src, AUDIO_CHANNELS dst,
+    const std::vector<float>& expected, const TCHAR* message, tstring& diagnostic) {
+    std::vector<float> actual;
+    if (!Expect(ConvertChannels(input, src, dst, actual) == 0 && actual.size() == expected.size(), message, diagnostic)) return false;
+    for (size_t i = 0; i < expected.size(); i++) {
+        if (!ExpectNear(actual[i], expected[i], 2e-6, message, diagnostic)) return false;
+    }
+    return true;
+}
+
+bool TestAudioChannelConversion(tstring& diagnostic) {
+    // 5.1chからステレオへのダウンミックス: (主チャンネル + 0.707 * (FC + サラウンド)) / (1 + 2 * 0.707)
+    const double normalizer = 1.0 / (1.0 + 2.0 * 0.707);
+    const double surround = 0.707 * normalizer;
+    const std::vector<std::vector<float>> impulseExpected = {
+        { (float)normalizer, 0 }, { 0, (float)normalizer }, { (float)surround, (float)surround },
+        { 0, 0 }, { (float)surround, 0 }, { 0, (float)surround },
+    };
+    for (int channel = 0; channel < 6; channel++) {
+        std::vector<float> impulse(6, 0);
+        impulse[channel] = 1;
+        if (!ExpectConverted(impulse, AUDIO_32_LFE, AUDIO_STEREO, impulseExpected[channel],
+            _T("5.1chからステレオへの係数または並び順が不正です"), diagnostic)) return false;
+    }
+    if (!ExpectConverted({ 0.25f, -0.5f }, AUDIO_STEREO, AUDIO_32_LFE, { 0.25f, -0.5f, 0, 0, 0, 0 },
+        _T("ステレオから5.1chへの配置が不正です"), diagnostic)) return false;
+    if (!ExpectConverted({ 0.25f }, AUDIO_MONO, AUDIO_STEREO, { 0.25f, 0.25f },
+        _T("モノラルから左右への展開が不正です"), diagnostic)) return false;
+    if (!ExpectConverted({ 0.25f, -0.5f }, AUDIO_STEREO, AUDIO_MONO, { -0.125f },
+        _T("左右の平均がモノラルになりません"), diagnostic)) return false;
+    // モノラルと5.1chの間は、ステレオを経由して変換する
+    if (!ExpectConverted({ 0.25f }, AUDIO_MONO, AUDIO_32_LFE, { 0.25f, 0.25f, 0, 0, 0, 0 },
+        _T("モノラルから5.1chへの変換が不正です"), diagnostic)) return false;
+    if (!ExpectConverted({ 1, 0, 0, 0, 0, 0 }, AUDIO_32_LFE, AUDIO_MONO, { (float)(normalizer / 2) },
+        _T("5.1chからモノラルへの変換が不正です"), diagnostic)) return false;
+    const std::vector<float> ordered = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    if (!ExpectConverted(ordered, AUDIO_32_LFE, AUDIO_32_LFE, ordered, _T("同じレイアウトで順番が変化しました"), diagnostic)) return false;
+    // 複数サンプルでは、サンプルごとに独立して変換する
+    if (!ExpectConverted({ 0.25f, -0.5f, 1.0f, 0.5f }, AUDIO_STEREO, AUDIO_MONO, { -0.125f, 0.75f },
+        _T("複数サンプルのモノラル化が不正です"), diagnostic)) return false;
+
+    std::vector<float> output;
+    if (!Expect(ConvertChannels({ 1, 2, 3 }, AUDIO_STEREO, AUDIO_MONO, output) == -1, _T("チャンネル数で割り切れないPCM長が拒否されませんでした"), diagnostic)) return false;
+    if (!Expect(ConvertChannels({ 1 }, AUDIO_MONO, AUDIO_30, output) == -1, _T("未対応の組み合わせが拒否されませんでした"), diagnostic)) return false;
+    if (!Expect(ConvertChannels({ 1, 2 }, AUDIO_2LANG, AUDIO_STEREO, output) == -1, _T("デュアルモノの変換が拒否されませんでした"), diagnostic)) return false;
+    return Expect(ConvertChannels({}, AUDIO_STEREO, AUDIO_MONO, output) == 0 && output.empty(), _T("空PCMの変換が不正です"), diagnostic);
+}
+
+// コマンドライン引数: 解析結果をキー=値のテキストで受け取り、値を比較する
+using CommandLineResult = std::map<tstring, tstring>;
+
+int ParseCommandLine(const std::vector<tstring>& args, CommandLineResult& result) {
+    std::vector<const TCHAR*> argv = { _T("AmatsukazeTest") };
+    for (const auto& arg : args) argv.push_back(arg.c_str());
+    result.clear();
+    size_t length = 0;
+    int status = ParseCommandLineForTest((int)argv.size(), argv.data(), nullptr, 0, &length);
+    if (status != -2) return status;
+    std::vector<TCHAR> buffer(length + 1);
+    status = ParseCommandLineForTest((int)argv.size(), argv.data(), buffer.data(), buffer.size(), &length);
+    if (status != 0) return status;
+    const tstring text(buffer.data(), length);
+    size_t begin = 0;
+    while (begin < text.size()) {
+        size_t end = text.find(_T('\n'), begin);
+        if (end == tstring::npos) end = text.size();
+        const tstring line = text.substr(begin, end - begin);
+        const size_t equal = line.find(_T('='));
+        if (equal != tstring::npos) result[line.substr(0, equal)] = line.substr(equal + 1);
+        begin = end + 1;
+    }
+    return 0;
+}
+
+bool ExpectCommandLine(const std::vector<tstring>& args, const std::vector<std::pair<tstring, tstring>>& expected,
+    const TCHAR* name, tstring& diagnostic) {
+    CommandLineResult result;
+    const int status = ParseCommandLine(args, result);
+    if (status != 0) {
+        diagnostic = strsprintf(_T("%s: 引数を解析できません (結果=%d)"), name, status);
+        return false;
+    }
+    for (const auto& item : expected) {
+        const auto found = result.find(item.first);
+        if (found == result.end() || found->second != item.second) {
+            diagnostic = strsprintf(_T("%s: %s の期待値=\"%s\", 実際=\"%s\""), name, item.first.c_str(), item.second.c_str(),
+                found == result.end() ? _T("(なし)") : found->second.c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ExpectCommandLineStatus(const std::vector<tstring>& args, int expectedStatus, const TCHAR* name, tstring& diagnostic) {
+    CommandLineResult result;
+    const int status = ParseCommandLine(args, result);
+    if (status == expectedStatus) return true;
+    diagnostic = strsprintf(_T("%s: 結果の期待値=%d, 実際=%d"), name, expectedStatus, status);
+    return false;
+}
+
+bool TestCommandLineArguments(tstring& diagnostic) {
+    // 探索対象の実行ファイル名はPATHやモジュール位置で変わるため、比較する実行ファイルは存在しない絶対パスを明示指定する。
+    // パス区切りは両OSで'/'に正規化される。出力ファイルは .mp4 .mkv .m2ts .ts (大文字小文字不問) だけが除かれ、他の拡張子は残る。
+    const tstring encoderOptions = _T("--preset slow --profile main --crf 23 --qcomp 0.7 --vbv-bufsize 10000 --keyint -1 --level 3");
+    std::vector<tstring> args = {
+        _T("-s"), _T("12345"), _T("-i"), _T("C:\\hoge\\input.ts"), _T("-o"), _T("C:\\oops\\output.mmp4"),
+        _T("-w"), _T("C:\\hoge\\"), _T("-et"), _T("x265"), _T("--dump"),
+        _T("-e"), _T("D:\\program\\revXXX-x265.exe"), _T("-eo"), encoderOptions,
+        _T("-m"), _T("D:\\program\\revXXX-muxer.exe"), _T("-t"), _T("D:\\program\\timelineditro.exe"),
+        _T("-j"), _T("JJJJJJJJSON.json"), _T("--mode"), _T("test_parseargs"),
+    };
+    if (!ExpectCommandLine(args, {
+        { _T("service_id"), _T("12345") }, { _T("src"), _T("C:/hoge/input.ts") }, { _T("src_original"), _T("C:/hoge/input.ts") },
+        { _T("out_base"), _T("C:/oops/output.mmp4") },
+        { _T("encoder"), strsprintf(_T("%d"), (int)ENCODER_X265) }, { _T("encoder_path"), _T("D:/program/revXXX-x265.exe") },
+        { _T("encoder_options"), encoderOptions }, { _T("muxer_path"), _T("D:/program/revXXX-muxer.exe") },
+        { _T("timelineeditor_path"), _T("D:/program/timelineditro.exe") }, { _T("json"), _T("JJJJJJJJSON.json") },
+        { _T("dump"), _T("1") }, { _T("mode"), _T("test_parseargs") }, { _T("nicojk_mask"), _T("0") },
+    }, _T("全オプション指定(10進のサービスID)"), diagnostic)) return false;
+
+    // サービスIDの16進指定 (0x6308 = 25352)。先頭が小文字の0xの場合だけ16進として扱う
+    args[1] = _T("0x6308");
+    if (!ExpectCommandLine(args, { { _T("service_id"), _T("25352") } }, _T("サービスIDの16進指定"), diagnostic)) return false;
+    // 旧来の綴り違いの --serivceid も受け付ける
+    if (!ExpectCommandLine({ _T("--serivceid"), _T("0x10"), _T("--serviceid"), _T("7"), _T("--mode"), _T("cm"), _T("-i"), _T("a.ts") },
+        { { _T("service_id"), _T("7") } }, _T("--serviceid と --serivceid"), diagnostic)) return false;
+
+    // 未知のオプションは拒否する (旧テストは先頭の -s を --ourput に差し替えていた)
+    args[0] = _T("--ourput");
+    if (!ExpectCommandLineStatus(args, 1, _T("未知のオプション"), diagnostic)) return false;
+
+    // 最小構成の既定値 (実行ファイル位置に依存しない項目のみ)
+    if (!ExpectCommandLine({ _T("-i"), _T("a.ts"), _T("-o"), _T("b.mp4") }, {
+        { _T("mode"), _T("ts") }, { _T("src"), _T("a.ts") }, { _T("src_original"), _T("a.ts") }, { _T("out_base"), _T("b") },
+        { _T("service_id"), _T("-1") }, { _T("encoder"), strsprintf(_T("%d"), (int)ENCODER_X264) },
+        { _T("enc_parallel"), _T("1") }, { _T("min_output_duration"), _T("5") }, { _T("max_frames"), _T("9000") },
+        { _T("nicojk_mask"), _T("0") }, { _T("dump"), _T("0") }, { _T("json"), _T("") }, { _T("sar_x"), _T("0") }, { _T("sar_y"), _T("0") },
+    }, _T("最小構成の既定値"), diagnostic)) return false;
+    // 空文字列の引数は無視され、出力は最後の既知拡張子だけが除かれる
+    if (!ExpectCommandLine({ _T(""), _T("-i"), _T("a.ts"), _T("-o"), _T("dir/b.c.mkv"), _T("-w"), _T("work"), _T("") },
+        { { _T("out_base"), _T("dir/b.c") } }, _T("空引数と拡張子の除去"), diagnostic)) return false;
+    if (!ExpectCommandLine({ _T("-i"), _T("a.ts"), _T("-o"), _T("noext") }, { { _T("out_base"), _T("noext") } },
+        _T("拡張子のない出力"), diagnostic)) return false;
+    if (!ExpectCommandLine({ _T("-i"), _T("a.ts"), _T("-o"), _T("Up.M2TS") }, { { _T("out_base"), _T("Up") } },
+        _T("大文字拡張子の除去"), diagnostic)) return false;
+    if (!ExpectCommandLine({ _T("--input"), _T("x.ts"), _T("--original-input-file"), _T("orig.ts"), _T("--output"), _T("y.mp4") },
+        { { _T("src"), _T("x.ts") }, { _T("src_original"), _T("orig.ts") } }, _T("元入力ファイルの指定"), diagnostic)) return false;
+
+    // モードごとの必須引数
+    if (!ExpectCommandLineStatus({ _T("-o"), _T("b.mp4") }, 1, _T("tsモードで入力なし"), diagnostic)) return false;
+    if (!ExpectCommandLineStatus({ _T("-i"), _T("a.ts") }, 1, _T("tsモードで出力なし"), diagnostic)) return false;
+    if (!ExpectCommandLineStatus({ _T("--mode"), _T("cm") }, 1, _T("cmモードで入力なし"), diagnostic)) return false;
+    if (!ExpectCommandLine({ _T("--mode"), _T("cm"), _T("-i"), _T("a.ts") }, { { _T("mode"), _T("cm") } },
+        _T("cmモードは出力不要"), diagnostic)) return false;
+    if (!ExpectCommandLineStatus({ _T("--mode"), _T("probe_audio") }, 1, _T("probeモードで入力なし"), diagnostic)) return false;
+
+    // 値が欠けた末尾のオプションと、数値でない値
+    for (const TCHAR* option : { _T("-i"), _T("-o"), _T("-s"), _T("-e"), _T("--mode"), _T("--logo") }) {
+        if (!ExpectCommandLineStatus({ _T("-i"), _T("a.ts"), _T("-o"), _T("b.mp4"), option }, 1,
+            strsprintf(_T("値が欠けた末尾の %s"), option).c_str(), diagnostic)) return false;
+    }
+    // 数値は厳密に解析し、空・末尾のゴミ・範囲外はすべて引数の拒否になる (その他の例外にはならない)
+    const std::vector<tstring> numberBase = { _T("-i"), _T("a.ts"), _T("-o"), _T("b.mp4") };
+    auto withNumber = [&numberBase](std::initializer_list<tstring> extra) {
+        std::vector<tstring> result = numberBase;
+        result.insert(result.end(), extra.begin(), extra.end());
+        return result;
+    };
+    for (const TCHAR* value : { _T("abc"), _T("12abc"), _T(""), _T("0x"), _T("0xZZ"), _T("0x-1"), _T("0x0x10"), _T("99999999999"), _T("1.5") }) {
+        if (!ExpectCommandLineStatus(withNumber({ _T("-s"), value }), 1, strsprintf(_T("不正なサービスID \"%s\""), value).c_str(), diagnostic)) return false;
+    }
+    if (!ExpectCommandLine(withNumber({ _T("-s"), _T("0X10") }), { { _T("service_id"), _T("16") } }, _T("大文字0Xの16進サービスID"), diagnostic)) return false;
+    if (!ExpectCommandLine(withNumber({ _T("-s"), _T("0xaBc") }), { { _T("service_id"), _T("2748") } }, _T("16進数字の大文字小文字混在"), diagnostic)) return false;
+    if (!ExpectCommandLine(withNumber({ _T("-s"), _T("-1") }), { { _T("service_id"), _T("-1") } }, _T("負のサービスID"), diagnostic)) return false;
+    for (const TCHAR* option : { _T("--enc-parallel"), _T("--min-output-duration"), _T("-ab"), _T("--tsreplace-startup-preroll"),
+        _T("-eb"), _T("--max-fade-length"), _T("--direct-logo-analysis"), _T("--auto-logo-detect"),
+        _T("--auto-logo-detect-search-frames"), _T("--auto-logo-detect-div-x"), _T("--auto-logo-detect-div-y"),
+        _T("--auto-logo-detect-block-size"), _T("--auto-logo-detect-threshold"), _T("--auto-logo-detect-margin-x"),
+        _T("--auto-logo-detect-margin-y"), _T("-om"), _T("--nicojkmask"), _T("--max-frames"), _T("--parallel-logo-analysis") }) {
+        for (const TCHAR* value : { _T("abc"), _T("1x"), _T(""), _T("99999999999") }) {
+            if (!ExpectCommandLineStatus(withNumber({ option, value }), 1,
+                strsprintf(_T("%s の不正値 \"%s\""), option, value).c_str(), diagnostic)) return false;
+        }
+        if (!ExpectCommandLineStatus(withNumber({ option, _T("1") }), 0, strsprintf(_T("%s の正常値"), option).c_str(), diagnostic)) return false;
+    }
+    if (!ExpectCommandLine(withNumber({ _T("--parallel-logo-analysis"), _T("auto") }), {}, _T("ロゴ解析並列数のauto"), diagnostic)) return false;
+
+    // 種別を表す値は、未知の名前を警告だけで通さず拒否する (サーバーが渡す綴りは受理する)
+    for (const TCHAR* option : { _T("-et"), _T("-eft"), _T("-aet"), _T("--mpeg2decoder"), _T("--h264decoder"), _T("--hevcdecoder") }) {
+        if (!ExpectCommandLineStatus(withNumber({ option, _T("unknown") }), 1, strsprintf(_T("%s の未知の値"), option).c_str(), diagnostic)) return false;
+    }
+    for (const TCHAR* name : { _T("x264"), _T("x265"), _T("QSVEnc"), _T("NVEnc"), _T("VCEEnc"), _T("SVT-AV1"), _T("nvenc"), _T("svt-av1") }) {
+        if (!ExpectCommandLineStatus(withNumber({ _T("-et"), name }), 0, strsprintf(_T("-et %s"), name).c_str(), diagnostic)) return false;
+    }
+    for (const TCHAR* name : { _T("QSVEnc"), _T("NVEnc"), _T("VCEEnc") }) {
+        if (!ExpectCommandLineStatus(withNumber({ _T("-eft"), name }), 0, strsprintf(_T("-eft %s"), name).c_str(), diagnostic)) return false;
+    }
+    for (const TCHAR* name : { _T("neroAac"), _T("qaac"), _T("fdkaac"), _T("opusenc") }) {
+        if (!ExpectCommandLineStatus(withNumber({ _T("-aet"), name }), 0, strsprintf(_T("-aet %s"), name).c_str(), diagnostic)) return false;
+    }
+    for (const TCHAR* option : { _T("--mpeg2decoder"), _T("--h264decoder"), _T("--hevcdecoder") }) {
+        for (const TCHAR* name : { _T("default"), _T("QSV"), _T("CUVID") }) {
+            if (!ExpectCommandLineStatus(withNumber({ option, name }), 0, strsprintf(_T("%s %s"), option, name).c_str(), diagnostic)) return false;
+        }
+        if (!ExpectCommandLineStatus(withNumber({ option, _T("vaapi") }), 1, strsprintf(_T("%s vaapi"), option).c_str(), diagnostic)) return false;
+    }
+
+    // 値の範囲と書式
+    const std::vector<tstring> base = { _T("-i"), _T("a.ts"), _T("-o"), _T("b.mp4") };
+    auto with = [&base](std::initializer_list<tstring> extra) {
+        std::vector<tstring> result = base;
+        result.insert(result.end(), extra.begin(), extra.end());
+        return result;
+    };
+    if (!ExpectCommandLine(with({ _T("--enc-parallel"), _T("3") }), { { _T("enc_parallel"), _T("3") } }, _T("エンコード並列数"), diagnostic)) return false;
+    if (!ExpectCommandLineStatus(with({ _T("--enc-parallel"), _T("0") }), 1, _T("並列数0"), diagnostic)) return false;
+    if (!ExpectCommandLine(with({ _T("--min-output-duration"), _T("0") }), { { _T("min_output_duration"), _T("5") } },
+        _T("最小出力時間0は既定値5へ正規化"), diagnostic)) return false;
+    if (!ExpectCommandLineStatus(with({ _T("--min-output-duration"), _T("-1") }), 1, _T("最小出力時間が負"), diagnostic)) return false;
+    if (!ExpectCommandLine(with({ _T("--sar"), _T("16:9") }), { { _T("sar_x"), _T("16") }, { _T("sar_y"), _T("9") } }, _T("SAR指定"), diagnostic)) return false;
+    if (!ExpectCommandLineStatus(with({ _T("--sar"), _T("16") }), 1, _T("片方だけのSAR"), diagnostic)) return false;
+    if (!ExpectCommandLine(with({ _T("--max-frames"), _T("120") }), { { _T("max_frames"), _T("120") } }, _T("最大フレーム数"), diagnostic)) return false;
+    if (!ExpectCommandLine(with({ _T("--format"), _T("mkv") }), { { _T("format"), strsprintf(_T("%d"), (int)FORMAT_MKV) } }, _T("出力形式"), diagnostic)) return false;
+    if (!ExpectCommandLineStatus(with({ _T("--format"), _T("avi") }), 1, _T("未知の出力形式"), diagnostic)) return false;
+    if (!ExpectCommandLineStatus(with({ _T("--audio-format-change"), _T("foo") }), 1, _T("未知の音声フォーマット変更モード"), diagnostic)) return false;
+    if (!ExpectCommandLineStatus(with({ _T("--print-prefix"), _T("foo") }), 1, _T("未知の出力接頭辞"), diagnostic)) return false;
+    if (!ExpectCommandLineStatus(with({ _T("-et"), _T("x262") }), 1, _T("x262のMP4出力"), diagnostic)) return false;
+    if (!ExpectCommandLine(with({ _T("--logo"), _T("l1.lgd"), _T("--logo"), _T("l2\\l3.lgd"), _T("--erase-logo"), _T("e.lgd") }),
+        { { _T("logo"), _T("l1.lgd|l2/l3.lgd") }, { _T("erase_logo"), _T("e.lgd") } }, _T("複数のロゴ指定"), diagnostic)) return false;
+    // 実況はオプションで有効化したときだけマスクが有効になる
+    if (!ExpectCommandLine(with({ _T("--nicojkmask"), _T("3") }), { { _T("nicojk_mask"), _T("0") } }, _T("実況なしのマスク"), diagnostic)) return false;
+    if (!ExpectCommandLine(with({ _T("--nicojk"), _T("--nicojkmask"), _T("3") }), { { _T("nicojk_mask"), _T("3") } }, _T("実況ありのマスク"), diagnostic)) return false;
+    if (!ExpectCommandLine(with({ _T("--chapter"), _T("--ignore-no-logo"), _T("--subtitles"), _T("--2pass") }),
+        { { _T("chapter"), _T("1") }, { _T("subtitles"), _T("1") }, { _T("two_pass"), _T("1") } }, _T("真偽値オプション"), diagnostic)) return false;
+    // ロゴ未指定のチャプター生成は拒否する
+    return ExpectCommandLineStatus(with({ _T("--chapter") }), 1, _T("ロゴなしのチャプター生成"), diagnostic);
+}
+
+// 保持フレームの期待区間を手書きし、境界補正の実装とは独立に判定する。
+bool TestCMCutOffset(tstring& diagnostic) {
+    struct Scenario {
+        const TCHAR* name;
+        CMType type;
+        int offset;
+        std::vector<EncoderZone> cmzones;
+        std::vector<EncoderZone> expected;
+        std::vector<int> divisions;
+    };
+    const int maximum = (std::numeric_limits<int>::max)();
+    const Scenario scenarios[] = {
+        { _T("無効時の従来保持列"), CMTYPE_NONCM, 0, {{10,20},{30,40}}, {{0,10},{20,30},{40,60}}, {} },
+        { _T("全CM境界を2フレーム補正"), CMTYPE_NONCM, 2, {{10,20},{30,40}}, {{0,8},{22,28},{42,60}}, {} },
+        { _T("短い本編は消失"), CMTYPE_NONCM, 5, {{10,20},{30,40}}, {{0,5},{45,60}}, {} },
+        { _T("前後CMだけを補正"), CMTYPE_EDGE_TRIM, 5, {{0,10},{25,30},{50,60}}, {{15,45}}, {} },
+        { _T("前後CMなしの内部CMは維持"), CMTYPE_EDGE_TRIM, 5, {{10,20},{30,40}}, {{0,60}}, {} },
+        { _T("先頭CMだけ補正"), CMTYPE_NONCM, 5, {{0,10}}, {{15,60}}, {} },
+        { _T("末尾CMだけ補正"), CMTYPE_NONCM, 5, {{50,60}}, {{0,45}}, {} },
+        { _T("CM出力は補正しない"), CMTYPE_CM, 5, {{10,20},{30,40}}, {{10,20},{30,40}}, {} },
+        { _T("全体出力は補正しない"), CMTYPE_BOTH, 5, {{10,20},{30,40}}, {{0,60}}, {} },
+        { _T("CMなしは録画全体を保持"), CMTYPE_NONCM, maximum, {}, {{0,60}}, {} },
+        { _T("全CMは空出力"), CMTYPE_NONCM, 5, {{0,60}}, {}, {} },
+        { _T("前後カットの全CMは空出力"), CMTYPE_EDGE_TRIM, 5, {{0,60}}, {}, {} },
+        { _T("大値でもオーバーフローしない"), CMTYPE_NONCM, maximum, {{10,20},{30,40}}, {}, {} },
+        { _T("前後カットの短い本編は消失"), CMTYPE_EDGE_TRIM, maximum, {{0,10},{50,60}}, {}, {} },
+        { _T("短い先頭本編消失後も内部CMを維持"), CMTYPE_EDGE_TRIM, 5, {{0,10},{13,20},{50,60}}, {{13,45}}, {} },
+        { _T("前後の本編消失後も内部CMを維持"), CMTYPE_EDGE_TRIM, maximum, {{0,10},{25,30},{50,60}}, {{25,30}}, {} },
+        { _T("本編途中の分割では追加カットしない"), CMTYPE_NONCM, 2,
+            {{10,20},{30,40}}, {{0,8},{22,28},{42,60}}, {0,5,25,45,60} },
+        { _T("CM境界で分割しても補正する"), CMTYPE_NONCM, 2,
+            {{10,20},{30,40}}, {{0,8},{22,28},{42,60}}, {0,10,20,30,40,60} },
+        { _T("前後カットは分割点で補正しない"), CMTYPE_EDGE_TRIM, 5,
+            {{0,10},{25,30},{50,60}}, {{15,45}}, {0,20,40,60} },
+    };
+    constexpr int FRAME_COUNT = 60;
+    for (const auto& scenario : scenarios) {
+        std::vector<int> actual(FRAME_COUNT, -9), expected(FRAME_COUNT, -1);
+        for (const auto& range : scenario.expected) {
+            for (int frame = range.startFrame; frame < range.endFrame; frame++) {
+                const auto& divs = scenario.divisions;
+                expected[frame] = divs.empty() ? 0 : (int)(std::upper_bound(divs.begin(), divs.end(), frame) - divs.begin()) - 1;
+            }
+        }
+        const int status = ApplyCMCutOffsetForTest(FRAME_COUNT, scenario.cmzones.data(), scenario.cmzones.size(),
+            scenario.divisions.data(), scenario.divisions.size(), scenario.type, scenario.offset, actual.data(), actual.size());
+        if (status != 0) {
+            diagnostic = strsprintf(_T("%s: CM境界補正を実行できません(結果=%d)"), scenario.name, status);
+            return false;
+        }
+        for (int frame = 0; frame < FRAME_COUNT; frame++) {
+            if (actual[frame] != expected[frame]) {
+                diagnostic = strsprintf(_T("%s: フレーム%dの出力先期待値=%d、実際=%d"),
+                    scenario.name, frame, expected[frame], actual[frame]);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool TestCMCutOffsetCommandLine(tstring& diagnostic) {
+    const std::vector<tstring> base = { _T("-i"), _T("a.ts"), _T("-o"), _T("b.mp4") };
+    if (!ExpectCommandLine(base, {{_T("cm_cut_offset_frames"), _T("0")}},
+        _T("CMカット点補正の既定値"), diagnostic)) return false;
+    for (const TCHAR* value : { _T("1"), _T("5"), _T("2147483647") }) {
+        auto args = base;
+        args.insert(args.end(), {_T("--cm-cut-offset"), value});
+        if (!ExpectCommandLine(args, {{_T("cm_cut_offset_frames"), value}},
+            _T("正のCMカット点補正"), diagnostic)) return false;
+    }
+    for (const TCHAR* value : { _T("0"), _T("-1"), _T("abc"), _T("1x"), _T("1.5"), _T(""), _T("2147483648") }) {
+        auto args = base;
+        args.insert(args.end(), {_T("--cm-cut-offset"), value});
+        if (!ExpectCommandLineStatus(args, 1, strsprintf(_T("CMカット点補正の不正値%s"), value).c_str(), diagnostic)) return false;
+    }
+    auto args = base;
+    args.push_back(_T("--cm-cut-offset"));
+    return ExpectCommandLineStatus(args, 1, _T("CMカット点補正の値欠落"), diagnostic);
+}
+
+// WAVEヘッダ: 44バイトの全フィールドを仕様どおりに検証する
+bool ExpectLe(const std::vector<uint8_t>& bytes, size_t offset, int size, uint64_t expected, const TCHAR* name, tstring& diagnostic) {
+    uint64_t actual = 0;
+    for (int i = size - 1; i >= 0; i--) actual = (actual << 8) | bytes[offset + i];
+    if (actual == expected) return true;
+    diagnostic = strsprintf(_T("%s: 期待値=%llu, 実際=%llu"), name, (unsigned long long)expected, (unsigned long long)actual);
+    return false;
+}
+
+bool ExpectTag(const std::vector<uint8_t>& bytes, size_t offset, const char* tag, const TCHAR* name, tstring& diagnostic) {
+    if (std::equal(tag, tag + 4, bytes.begin() + offset)) return true;
+    diagnostic = strsprintf(_T("%s のタグが一致しません"), name);
+    return false;
+}
+
+int MakeWaveHeader(int channels, int sampleRate, int bits, int64_t samples, std::vector<uint8_t>& header) {
+    header.assign(64, 0);
+    size_t length = 0;
+    const int status = WriteWaveHeaderForTest(channels, sampleRate, bits, samples, header.data(), header.size(), &length);
+    header.resize(status == 0 ? length : 0);
+    return status;
+}
+
+bool ExpectWaveHeader(int channels, int sampleRate, int bits, int64_t samples, const TCHAR* name, tstring& diagnostic) {
+    std::vector<uint8_t> h;
+    if (!Expect(MakeWaveHeader(channels, sampleRate, bits, samples, h) == 0 && h.size() == 44, name, diagnostic)) return false;
+    const uint64_t blockAlign = (uint64_t)channels * (bits / 8);
+    const uint64_t dataSize = blockAlign * (uint64_t)samples;
+    return ExpectTag(h, 0, "RIFF", name, diagnostic) && ExpectLe(h, 4, 4, 36 + dataSize, _T("RIFFサイズ"), diagnostic) &&
+        ExpectTag(h, 8, "WAVE", name, diagnostic) && ExpectTag(h, 12, "fmt ", name, diagnostic) &&
+        ExpectLe(h, 16, 4, 16, _T("fmtチャンクサイズ"), diagnostic) && ExpectLe(h, 20, 2, 1, _T("PCM形式"), diagnostic) &&
+        ExpectLe(h, 22, 2, channels, _T("チャンネル数"), diagnostic) && ExpectLe(h, 24, 4, sampleRate, _T("サンプルレート"), diagnostic) &&
+        ExpectLe(h, 28, 4, (uint64_t)sampleRate * blockAlign, _T("バイトレート"), diagnostic) &&
+        ExpectLe(h, 32, 2, blockAlign, _T("ブロックアライン"), diagnostic) && ExpectLe(h, 34, 2, bits, _T("量子化ビット数"), diagnostic) &&
+        ExpectTag(h, 36, "data", name, diagnostic) && ExpectLe(h, 40, 4, dataSize, _T("dataサイズ"), diagnostic);
+}
+
+bool TestWaveHeader(tstring& diagnostic) {
+    if (!ExpectWaveHeader(2, 48000, 16, 1000, _T("16bitステレオ48kHz"), diagnostic)) return false;
+    if (!ExpectWaveHeader(1, 24000, 8, 7200000, _T("8bitモノラル24kHz"), diagnostic)) return false;
+    if (!ExpectWaveHeader(6, 48000, 24, 12345, _T("24bit 5.1ch"), diagnostic)) return false;
+    if (!ExpectWaveHeader(1, 16000, 16, 0, _T("サンプル0"), diagnostic)) return false;
+    // 全体が2^32-1バイトちょうどまでは書ける。RIFFサイズ欄 (全体-8) は32bitに収まる
+    const int64_t maxSamples = ((int64_t(1) << 32) - 1 - 44);
+    if (!ExpectWaveHeader(1, 8000, 8, maxSamples, _T("上限ちょうど"), diagnostic)) return false;
+    std::vector<uint8_t> h;
+    if (!Expect(MakeWaveHeader(1, 8000, 8, maxSamples + 1, h) == -1, _T("上限を1バイト超えるデータが拒否されませんでした"), diagnostic)) return false;
+    if (!Expect(MakeWaveHeader(2, 48000, 16, int64_t(1) << 40, h) == -1, _T("巨大なサンプル数が拒否されませんでした"), diagnostic)) return false;
+    if (!Expect(MakeWaveHeader(0, 48000, 16, 1, h) == -1, _T("チャンネル数0が拒否されませんでした"), diagnostic)) return false;
+    if (!Expect(MakeWaveHeader(2, 0, 16, 1, h) == -1, _T("サンプルレート0が拒否されませんでした"), diagnostic)) return false;
+    if (!Expect(MakeWaveHeader(2, 48000, 12, 1, h) == -1, _T("8の倍数でないビット数が拒否されませんでした"), diagnostic)) return false;
+    if (!Expect(MakeWaveHeader(2, 48000, 16, -1, h) == -1, _T("負のサンプル数が拒否されませんでした"), diagnostic)) return false;
+    size_t length = 0;
+    uint8_t small[10];
+    return Expect(WriteWaveHeaderForTest(2, 48000, 16, 1, small, sizeof(small), &length) == -2 && length == 44,
+        _T("小さい出力バッファが正しく扱われません"), diagnostic);
+}
+
+// 無音ADTSをFAADとlibavcodecで復号すると、全サンプルが0になる
+bool TestAudioSilentAdtsDecode(tstring& diagnostic) {
+    constexpr int SFI_48000 = 3;
+    constexpr int FRAMES = 20;
+    struct Case { AUDIO_CHANNELS layout; int channels; };
+    const Case cases[] = { { AUDIO_MONO, 1 }, { AUDIO_STEREO, 2 }, { AUDIO_30, 3 }, { AUDIO_31, 4 }, { AUDIO_32, 5 }, { AUDIO_32_LFE, 6 } };
+    for (const auto& item : cases) {
+        SilentAdtsDecodeResultForTest result = {};
+        if (!Expect(DecodeSilentAdtsForTest(item.layout, SFI_48000, FRAMES, &result) == 0,
+            strsprintf(_T("%dchの無音ADTSを復号できません"), item.channels).c_str(), diagnostic)) return false;
+        // 同梱FAADはモノラルをPS対応のため2chへ展開する
+        const int faadChannels = item.layout == AUDIO_MONO ? 2 : item.channels;
+        if (!Expect(result.faadChannels == faadChannels && result.avChannels == item.channels,
+            strsprintf(_T("%dch: 復号チャンネル数が不正 (FAAD=%d, libavcodec=%d)"), item.channels, result.faadChannels, result.avChannels).c_str(), diagnostic)) return false;
+        // 復号器の遅延で先頭フレームが出ない場合があるため、1フレーム分の不足までは許す
+        const long long faadUnit = 1024LL * faadChannels, avUnit = 1024LL * item.channels;
+        if (!Expect(result.faadSamples > 0 && result.faadSamples % faadUnit == 0 && result.faadSamples >= (FRAMES - 1) * faadUnit && result.faadSamples <= FRAMES * faadUnit,
+            strsprintf(_T("%dch: FAADのサンプル数が不正 (%lld)"), item.channels, result.faadSamples).c_str(), diagnostic)) return false;
+        if (!Expect(result.avSamples > 0 && result.avSamples % avUnit == 0 && result.avSamples >= (FRAMES - 1) * avUnit && result.avSamples <= FRAMES * avUnit,
+            strsprintf(_T("%dch: libavcodecのサンプル数が不正 (%lld)"), item.channels, result.avSamples).c_str(), diagnostic)) return false;
+        if (!Expect(result.faadMaxAbs == 0, strsprintf(_T("%dch: FAADの復号結果が無音ではありません (最大絶対値=%d)"), item.channels, result.faadMaxAbs).c_str(), diagnostic)) return false;
+        if (!Expect(result.avMaxAbs == 0.0, strsprintf(_T("%dch: libavcodecの復号結果が無音ではありません (最大絶対値=%g)"), item.channels, result.avMaxAbs).c_str(), diagnostic)) return false;
+    }
+    SilentAdtsDecodeResultForTest result = {};
+    return Expect(DecodeSilentAdtsForTest(AUDIO_2LANG, SFI_48000, FRAMES, &result) == -1, _T("未対応レイアウトが拒否されませんでした"), diagnostic);
+}
+
+// ビット単位でバイト列を組み立てる (本体のBitWriterに依存せず、期待値を独立に作る)
+class BitPacker {
+public:
+    void put(uint32_t value, int bits) {
+        for (int i = bits - 1; i >= 0; i--) {
+            if (bitCount % 8 == 0) bytes.push_back(0);
+            if ((value >> i) & 1) bytes.back() |= (uint8_t)(0x80 >> (bitCount % 8));
+            bitCount++;
+        }
+    }
+    void align() { bitCount = (bitCount + 7) / 8 * 8; }
+    std::vector<uint8_t> bytes;
+    int bitCount = 0;
+};
+
+std::vector<uint8_t> MakeAdtsFrame(int id, int channelConfig, int sfi, const std::vector<uint8_t>& payload) {
+    BitPacker header;
+    header.put(0xFFF, 12);
+    header.put(id, 1);
+    header.put(0, 2);
+    header.put(1, 1); // protection_absent
+    header.put(1, 2); // AAC-LC
+    header.put(sfi, 4);
+    header.put(0, 1);
+    header.put(channelConfig, 3);
+    header.put(0, 4); // original, home, copyright x2
+    header.put((uint32_t)(7 + payload.size()), 13);
+    header.put(0x7FF, 11);
+    header.put(0, 2);
+    std::vector<uint8_t> frame = header.bytes;
+    frame.insert(frame.end(), payload.begin(), payload.end());
+    return frame;
+}
+
+// 無音のSCE (単一チャンネルエレメント): id(3) tag(4) global_gain(8) と、スペクトル情報を持たない14ビット
+void PutSilentSce(BitPacker& packer, int tag) {
+    packer.put(0, 3);
+    packer.put(tag, 4);
+    packer.put(100, 8);
+    packer.put(0, 14);
+}
+
+// channel_configuration=0 で、PCEが2つのSCEを宣言するデュアルモノの無音フレーム
+std::vector<uint8_t> MakeDualMonoSilentAdts(int sfi) {
+    BitPacker pce;
+    pce.put(5, 3);   // ID_PCE
+    pce.put(0, 4);   // element_instance_tag
+    pce.put(1, 2);   // object_type (AAC-LC)
+    pce.put(sfi, 4);
+    pce.put(2, 4);   // 前方のエレメント数
+    pce.put(0, 4);   // 側方
+    pce.put(0, 4);   // 後方
+    pce.put(0, 2);   // LFE
+    pce.put(0, 3);   // assoc data
+    pce.put(0, 4);   // valid cc
+    pce.put(0, 3);   // mono / stereo / matrix mixdown
+    for (int e = 0; e < 2; e++) {
+        pce.put(0, 1); // is_cpe=0 (SCE)
+        pce.put(e, 4);
+    }
+    pce.align();
+    pce.put(0, 8);   // コメントなし
+    PutSilentSce(pce, 0);
+    PutSilentSce(pce, 1);
+    pce.put(7, 3);   // ID_END
+    pce.align();
+    return MakeAdtsFrame(0, 0, sfi, pce.bytes);
+}
+
+// 分離後の1チャンネル分のフレーム: MPEG-2 ID、channel_configuration=1、元のエレメントのタグを保つ
+std::vector<uint8_t> MakeSplitMonoFrame(int sfi, int tag) {
+    BitPacker payload;
+    PutSilentSce(payload, tag);
+    payload.put(7, 3);
+    payload.align();
+    return MakeAdtsFrame(1, 1, sfi, payload.bytes);
+}
+
+bool TestDualMonoSplitter(tstring& diagnostic) {
+    constexpr int SFI_48000 = 3;
+    constexpr int REPEAT = 3;
+    const auto dual = MakeDualMonoSilentAdts(SFI_48000);
+    std::vector<uint8_t> out0(256), out1(256);
+    size_t length0 = 0, length1 = 0;
+    int frames0 = 0, frames1 = 0;
+    if (!Expect(SplitDualMonoAdtsForTest(dual.data(), dual.size(), REPEAT, out0.data(), out0.size(), &length0, &frames0,
+        out1.data(), out1.size(), &length1, &frames1) == 0, _T("デュアルモノの分離に失敗しました"), diagnostic)) return false;
+    if (!Expect(frames0 == REPEAT && frames1 == REPEAT, _T("分離後のフレーム数が入力と一致しません"), diagnostic)) return false;
+    out0.resize(length0);
+    out1.resize(length1);
+    // 主音声 (タグ0) と副音声 (タグ1) が、それぞれ1チャンネルのADTSフレームになる
+    std::vector<uint8_t> expected0, expected1;
+    for (int i = 0; i < REPEAT; i++) {
+        const auto f0 = MakeSplitMonoFrame(SFI_48000, 0);
+        const auto f1 = MakeSplitMonoFrame(SFI_48000, 1);
+        expected0.insert(expected0.end(), f0.begin(), f0.end());
+        expected1.insert(expected1.end(), f1.begin(), f1.end());
+    }
+    if (!Expect(out0 == expected0, _T("主音声のADTSフレームが期待値と一致しません"), diagnostic)) return false;
+    if (!Expect(out1 == expected1, _T("副音声のADTSフレームが期待値と一致しません"), diagnostic)) return false;
+    // 分離前後の長さ: 入力は2エレメント分、出力は各1エレメント分で、全フレームが7バイトのヘッダを持つ
+    if (!Expect(dual.size() > out0.size() / REPEAT, _T("分離後のフレームが入力より大きくなりました"), diagnostic)) return false;
+    // 不正入力: ADTSでないデータは拒否する
+    const uint8_t garbage[] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    size_t l0 = 0, l1 = 0;
+    int c0 = 0, c1 = 0;
+    uint8_t buffer[64];
+    if (!Expect(SplitDualMonoAdtsForTest(garbage, sizeof(garbage), 1, buffer, sizeof(buffer), &l0, &c0, buffer, sizeof(buffer), &l1, &c1) == -1,
+        _T("ADTSでないデータが拒否されませんでした"), diagnostic)) return false;
+    // 通常のステレオ (エレメントが2つではない) は分離できない
+    const auto stereo = MakeSilentAdts(AUDIO_STEREO, SFI_48000);
+    if (!Expect(SplitDualMonoAdtsForTest(stereo.data(), stereo.size(), 1, buffer, sizeof(buffer), &l0, &c0, buffer, sizeof(buffer), &l1, &c1) == -1,
+        _T("デュアルモノでないフレームが拒否されませんでした"), diagnostic)) return false;
+    return Expect(SplitDualMonoAdtsForTest(dual.data(), dual.size(), 1, buffer, 3, &l0, &c0, buffer, sizeof(buffer), &l1, &c1) == -2 && l0 > 3,
+        _T("小さい出力バッファが正しく扱われません"), diagnostic);
+}
+
+// MakeVFRBitrateZones の性質テスト: 固定seedの乱数入力で、仕様から独立に求められる不変条件を検証する。
+// ゾーンは先頭から末尾までを隙間なく覆い、各ゾーンのビットレートは、その範囲の8フレーム単位の
+// ビットレート (フレーム間隔から求めた値にCMゾーンで補正をかけたもの) の平均になる。
+struct ZoneScenario {
+    int frames;
+    double fpsNum, fpsDenom;
+    int minRun, maxRun;
+    double bitrateCM, timeFactor, costLimit;
+    int cmZones;
+    bool overhang = false; // 映像の範囲外にはみ出すCMゾーン (先頭より前、末尾より後ろ、完全に範囲外、空) を加える
+};
+
+bool CheckZoneScenario(const ZoneScenario& scenario, uint32_t seed, const TCHAR* name, tstring& diagnostic) {
+    std::mt19937 random(seed);
+    const double tick = 1000.0 * scenario.fpsDenom / scenario.fpsNum;
+    std::vector<double> timeCodes;
+    double elapsed = 0;
+    int remain = scenario.frames;
+    while (remain > 0) {
+        const int run = std::min(remain, scenario.minRun + (int)(random() % (uint32_t)(scenario.maxRun - scenario.minRun + 1)));
+        const int ticks = 1 + (int)(random() % 3);
+        for (int i = 0; i < run; i++) {
+            timeCodes.push_back(elapsed);
+            elapsed += tick * ticks;
+        }
+        remain -= run;
+    }
+    timeCodes.push_back(elapsed);
+    // 重ならないCMゾーン (フレーム範囲内)
+    std::vector<VFRBitrateZoneInputForTest> cmzones;
+    int position = 0;
+    for (int i = 0; i < scenario.cmZones && position < scenario.frames - 16; i++) {
+        const int start = position + (int)(random() % 200);
+        const int end = std::min(scenario.frames, start + 16 + (int)(random() % 600));
+        if (start >= end) break;
+        cmzones.push_back({ start, end });
+        position = end;
+    }
+    if (scenario.overhang) {
+        const int n = scenario.frames;
+        cmzones.push_back({ -50, 20 });
+        cmzones.push_back({ n - 30, n + 500 });
+        cmzones.push_back({ n + 10, n + 100 });
+        cmzones.push_back({ 40, 40 });
+    }
+    size_t count = 0;
+    int status = MakeVFRBitrateZonesForTest(timeCodes.data(), timeCodes.size(), cmzones.data(), cmzones.size(),
+        scenario.bitrateCM, (int)scenario.fpsNum, (int)scenario.fpsDenom, scenario.timeFactor, scenario.costLimit, nullptr, 0, &count);
+    if (!Expect(status == VFR_BITRATE_ZONES_FOR_TEST_SUCCESS && count > 0, strsprintf(_T("%s: ゾーンを生成できません"), name).c_str(), diagnostic)) return false;
+    std::vector<VFRBitrateZoneOutputForTest> zones(count);
+    status = MakeVFRBitrateZonesForTest(timeCodes.data(), timeCodes.size(), cmzones.data(), cmzones.size(),
+        scenario.bitrateCM, (int)scenario.fpsNum, (int)scenario.fpsDenom, scenario.timeFactor, scenario.costLimit, zones.data(), zones.size(), &count);
+    if (!Expect(status == VFR_BITRATE_ZONES_FOR_TEST_SUCCESS && count == zones.size(), strsprintf(_T("%s: ゾーンを取得できません"), name).c_str(), diagnostic)) return false;
+
+    // 独立に求める8フレーム単位のビットレート
+    const int unit = 8;
+    const int unitCount = (scenario.frames + unit - 1) / unit;
+    std::vector<double> units(unitCount);
+    for (int i = 0; i < unitCount; i++) {
+        const int start = i * unit;
+        const int end = std::min(scenario.frames, start + unit);
+        const double ratio = (timeCodes[end] - timeCodes[start]) / 1000.0 * scenario.fpsNum / scenario.fpsDenom / (end - start);
+        units[i] = (ratio - 1.0) * scenario.timeFactor + 1.0;
+    }
+    for (const auto& zone : cmzones) {
+        // 映像の範囲外にはみ出した部分は切り詰める。端数のユニットは対象にしない
+        for (int k = (std::max(0, zone.startFrame) + unit - 1) / unit; k < std::min(scenario.frames, zone.endFrame) / unit; k++) {
+            units[k] *= scenario.bitrateCM;
+        }
+    }
+    // 上限判定が末尾ブロックを数えないため、ゾーン数は最大で1000ではなく1001になる (既知。修正はゾーン数の分布を変える)
+    if (!Expect(zones.size() <= 1001, strsprintf(_T("%s: ゾーン数が上限を超えています (%zu)"), name, zones.size()).c_str(), diagnostic)) return false;
+    if (!Expect(zones.front().startFrame == 0 && zones.back().endFrame == scenario.frames,
+        strsprintf(_T("%s: ゾーンが先頭から末尾までを覆っていません"), name).c_str(), diagnostic)) return false;
+    for (size_t i = 0; i < zones.size(); i++) {
+        const auto& zone = zones[i];
+        if (!Expect(zone.startFrame < zone.endFrame && (i == 0 || zone.startFrame == zones[i - 1].endFrame) && zone.startFrame % unit == 0,
+            strsprintf(_T("%s: ゾーン%zuの境界が不正です (%d-%d)"), name, i, zone.startFrame, zone.endFrame).c_str(), diagnostic)) return false;
+        double sum = 0;
+        const int firstUnit = zone.startFrame / unit, lastUnit = (zone.endFrame + unit - 1) / unit;
+        for (int k = firstUnit; k < lastUnit; k++) sum += units[k];
+        if (!ExpectNear(zone.bitrate, sum / (lastUnit - firstUnit), 1e-9,
+            strsprintf(_T("%s: ゾーン%zuのビットレート"), name, i).c_str(), diagnostic)) return false;
+        if (!Expect(zone.bitrate > 0, strsprintf(_T("%s: ゾーン%zuのビットレートが正ではありません"), name, i).c_str(), diagnostic)) return false;
+    }
+    return true;
+}
+
+bool TestBitrateZonesProperties(tstring& diagnostic) {
+    const ZoneScenario scenarios[] = {
+        //  frames   fps                  run       bitrateCM timeFactor costLimit CMゾーン数
+        { 1,      60000, 1001, 1, 1,     1.0, 1.0, 0.15, 0 },
+        { 7,      60000, 1001, 1, 3,     1.0, 1.0, 0.15, 0 },
+        { 8,      30000, 1001, 1, 3,     1.0, 1.0, 0.15, 0 },
+        { 9,      30000, 1001, 1, 4,     0.6, 1.0, 0.15, 0 },
+        { 100,    60000, 1001, 1, 20,    0.6, 0.25, 0.15, 1 },
+        { 1234,   60000, 1001, 5, 60,    0.6, 1.0, 0.15, 3 },
+        { 1234,   24000, 1001, 5, 60,    1.5, 1.0, 0.0, 3 },
+        { 20000,  60000, 1001, 8, 200,   0.6, 1.0, 1.0, 20 },
+        { 20000,  30000, 1001, 1, 3,     0.6, 0.25, 0.15, 20 },
+        // 範囲外にはみ出すCMゾーン (先頭より前、末尾より後ろ、完全に範囲外、空)
+        { 100,    60000, 1001, 1, 20,    0.6, 1.0, 0.15, 0, true },
+        { 1234,   30000, 1001, 5, 60,    1.5, 1.0, 0.15, 2, true },
+        { 7,      60000, 1001, 1, 3,     0.6, 1.0, 0.15, 0, true },
+        // 1時間級の長さで細かく変化し、上限1000を超えるブロック数から併合される
+        { 200000, 60000, 1001, 8, 16,    0.6, 1.0, 0.15, 100 },
+    };
+    uint32_t seed = 20261012;
+    for (size_t i = 0; i < std::size(scenarios); i++, seed += 7) {
+        if (!CheckZoneScenario(scenarios[i], seed, strsprintf(_T("シナリオ%zu"), i).c_str(), diagnostic)) return false;
+    }
+    return true;
+}
+
+// MPEG-PS: PsStreamWriterで書き出し、PsStreamVerifierと独立の構文解析の両方で検証する
+struct PsPesRecord {
+    int64_t pts = -1;
+    int64_t dts = -1;
+    std::vector<uint8_t> payload;
+};
+
+int64_t ReadPesTimestamp(const uint8_t* p) {
+    return ((int64_t)((p[0] >> 1) & 7) << 30) | ((int64_t)p[1] << 22) | ((int64_t)(p[2] >> 1) << 15) |
+        ((int64_t)p[3] << 7) | (int64_t)(p[4] >> 1);
+}
+
+bool ParsePsStream(const std::vector<uint8_t>& ps, std::vector<PsPesRecord> records[2], int& psmCount, tstring& diagnostic) {
+    const CRC32 crc;
+    size_t pos = 0;
+    int64_t previousScr = -1;
+    psmCount = 0;
+    bool first = true;
+    while (pos + 4 <= ps.size()) {
+        if (!Expect(ps[pos] == 0 && ps[pos + 1] == 0 && ps[pos + 2] == 1, _T("開始コードがありません"), diagnostic)) return false;
+        const uint8_t id = ps[pos + 3];
+        if (id == 0xB9) return Expect(pos + 4 == ps.size(), _T("終了コードの後にデータがあります"), diagnostic);
+        if (id == 0xBA) {
+            if (!Expect(pos + 14 <= ps.size(), _T("パックヘッダが途中で終わっています"), diagnostic)) return false;
+            const uint8_t* h = &ps[pos + 4];
+            if (!Expect((h[0] & 0xC4) == 0x44 && (h[2] & 4) && (h[4] & 4) && (h[5] & 1), _T("パックヘッダのマーカービットが不正です"), diagnostic)) return false;
+            const int64_t base = ((int64_t)((h[0] >> 3) & 7) << 30) | ((int64_t)(h[0] & 3) << 28) | ((int64_t)h[1] << 20) |
+                ((int64_t)((h[2] >> 3) & 0x1F) << 15) | ((int64_t)(h[2] & 3) << 13) | ((int64_t)h[3] << 5) | (int64_t)((h[4] >> 3) & 0x1F);
+            const int64_t scr = base * 300 + (((h[4] & 3) << 7) | (h[5] >> 1));
+            if (!Expect(scr >= previousScr, _T("SCRが逆行しています"), diagnostic)) return false;
+            previousScr = scr;
+            pos += 14 + (ps[pos + 13] & 7);
+            continue;
+        }
+        if (!Expect(pos + 6 <= ps.size(), _T("PESヘッダが途中で終わっています"), diagnostic)) return false;
+        const size_t length = ((size_t)ps[pos + 4] << 8) | ps[pos + 5];
+        if (!Expect(pos + 6 + length <= ps.size(), _T("PESパケットが途中で終わっています"), diagnostic)) return false;
+        const uint8_t* body = &ps[pos + 6];
+        if (id == 0xBC) {
+            psmCount++;
+            if (!Expect(first, _T("プログラムストリームマップが先頭にありません"), diagnostic)) return false;
+            // CRC付きセクションの全体のCRCは0になる
+            if (!Expect(crc.calc(&ps[pos], (int)(6 + length), 0xFFFFFFFFu) == 0, _T("プログラムストリームマップのCRCが不正です"), diagnostic)) return false;
+            // 単一のストリームマップ: (stream_type, elementary_stream_id) が映像 (MPEG-2=0x02, 0xE0) と音声 (ADTS AAC=0x0F, 0xC0)
+            // 本体 (2バイトのフラグ、program_stream_info_length、elementary_stream_map_length、2ストリーム分、CRC) = 18バイト
+            if (!Expect(length == 18 && body[6] == 0x02 && body[7] == 0xE0 && body[10] == 0x0F && body[11] == 0xC0,
+                _T("プログラムストリームマップの内容が不正です"), diagnostic)) return false;
+        } else if (id == 0xE0 || id == 0xC0) {
+            const bool video = id == 0xE0;
+            const int flags = body[1] >> 6;
+            const int headerLength = body[2];
+            if (!Expect((body[0] & 0xC0) == 0x80 && length >= 3 + (size_t)headerLength, _T("PESヘッダが不正です"), diagnostic)) return false;
+            auto& list = records[video ? 0 : 1];
+            if (flags != 0) {
+                PsPesRecord record;
+                record.pts = ReadPesTimestamp(body + 3);
+                if (flags == 3) record.dts = ReadPesTimestamp(body + 8);
+                list.push_back(record);
+            } else if (!Expect(!list.empty(), _T("タイムスタンプのない先頭PESがあります"), diagnostic)) {
+                return false;
+            }
+            list.back().payload.insert(list.back().payload.end(), body + 3 + headerLength, body + length);
+        } else if (!Expect(false, _T("想定外のstream_idです"), diagnostic)) {
+            return false;
+        }
+        first = false;
+        pos += 6 + length;
+    }
+    diagnostic = _T("終了コードがありません");
+    return false;
+}
+
+bool TestPsWriterRoundTrip(tstring& diagnostic) {
+    struct Packet { bool video; int64_t pts, dts; size_t size; };
+    // 映像は大きなPES (32000バイトごとに分割される) を含む。音声はPTSのみ
+    const Packet packets[] = {
+        { true, 90000, 86997, 100 }, { false, 90000, -1, 200 }, { true, 93003, 90000, 40000 }, { false, 91920, -1, 300 },
+        { true, 96006, 93003, 70000 }, { false, 93840, -1, 213 }, { true, (int64_t(1) << 33) - 3003, (int64_t(1) << 33) - 6006, 1 },
+    };
+    std::vector<std::vector<uint8_t>> payloads;
+    std::vector<PsWriterInputForTest> inputs;
+    for (size_t i = 0; i < std::size(packets); i++) {
+        std::vector<uint8_t> payload(packets[i].size);
+        for (size_t k = 0; k < payload.size(); k++) payload[k] = (uint8_t)(k * 7 + i * 13 + 1);
+        payloads.push_back(std::move(payload));
+    }
+    for (size_t i = 0; i < std::size(packets); i++) {
+        inputs.push_back({ packets[i].video ? 1 : 0, packets[i].pts, packets[i].dts, payloads[i].data(), payloads[i].size() });
+    }
+    size_t length = 0;
+    int status = WritePsStreamForTest(inputs.data(), inputs.size(), nullptr, 0, &length);
+    if (!Expect(status == -2 && length > 0, _T("PS出力の必要サイズを取得できません"), diagnostic)) return false;
+    std::vector<uint8_t> ps(length);
+    status = WritePsStreamForTest(inputs.data(), inputs.size(), ps.data(), ps.size(), &length);
+    if (!Expect(status == 0 && length == ps.size(), strsprintf(_T("PsStreamVerifierがPS出力を拒否しました (結果=%d)"), status).c_str(), diagnostic)) return false;
+
+    std::vector<PsPesRecord> records[2];
+    int psmCount = 0;
+    if (!ParsePsStream(ps, records, psmCount, diagnostic)) return false;
+    if (!Expect(psmCount == 1, _T("プログラムストリームマップの数が不正です"), diagnostic)) return false;
+    size_t videoIndex = 0, audioIndex = 0;
+    if (!Expect(records[0].size() == 4 && records[1].size() == 3, _T("映像・音声のPESの数が入力と一致しません"), diagnostic)) return false;
+    for (size_t i = 0; i < std::size(packets); i++) {
+        const auto& record = packets[i].video ? records[0][videoIndex++] : records[1][audioIndex++];
+        if (!Expect(record.pts == packets[i].pts && record.dts == packets[i].dts, strsprintf(_T("パケット%zuのPTS/DTSが一致しません"), i).c_str(), diagnostic)) return false;
+        if (!Expect(record.payload == payloads[i], strsprintf(_T("パケット%zuのペイロードが一致しません"), i).c_str(), diagnostic)) return false;
+    }
+    // 壊れたストリームは独立の解析でも拒否される (終了コードの欠落)
+    std::vector<uint8_t> truncated(ps.begin(), ps.end() - 4);
+    std::vector<PsPesRecord> unused[2];
+    int unusedCount = 0;
+    tstring ignored;
+    return Expect(!ParsePsStream(truncated, unused, unusedCount, ignored), _T("終了コードのないPSが受理されました"), diagnostic);
+}
+
+// 音声トラックの構築・StreamReformの音声: 一時ディレクトリは自分で作り、終了時に必ず削除する
+class ScopedTempDirectory {
+public:
+    ScopedTempDirectory() {
+        static int counter = 0;
+        const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+        path_ = std::filesystem::temp_directory_path() / (std::string("amt_native_test_") + std::to_string(stamp) + "_" + std::to_string(counter++));
+        std::error_code error;
+        created_ = std::filesystem::create_directories(path_, error);
+    }
+    ~ScopedTempDirectory() {
+        if (created_) {
+            std::error_code error;
+            std::filesystem::remove_all(path_, error);
+        }
+    }
+    ScopedTempDirectory(const ScopedTempDirectory&) = delete;
+    ScopedTempDirectory& operator=(const ScopedTempDirectory&) = delete;
+    bool ok() const { return created_; }
+    tstring path() const { return path_.native(); }
+private:
+    std::filesystem::path path_;
+    bool created_ = false;
+};
+
+struct ReformRun {
+    AudioReformResultForTest result = {};
+    std::vector<int> track0, track1;
+    std::vector<int64_t> track0Pts;
+};
+
+bool RunAudioReform(int missingFrames, bool cut, int sourcePhaseTicks, int fallback, AUDIO_FORMAT_CHANGE_MODE mode,
+    const tstring& directory, ReformRun& run, tstring& diagnostic) {
+    constexpr size_t CAPACITY = 1024;
+    run = ReformRun();
+    run.track0.assign(CAPACITY, -9);
+    run.track1.assign(CAPACITY, -9);
+    run.track0Pts.assign(CAPACITY, -9);
+    AudioReformScenarioForTest scenario = { missingFrames, cut ? 1 : 0, sourcePhaseTicks, fallback, (int)mode, directory.c_str() };
+    const int status = RunAudioReformScenarioForTest(&scenario, &run.result, run.track0.data(), run.track0Pts.data(), run.track1.data(), CAPACITY);
+    run.track0.resize(std::max(0, run.result.track0Count));
+    run.track1.resize(std::max(0, run.result.track1Count));
+    run.track0Pts.resize(run.track0.size());
+    if (status == 0) return true;
+    diagnostic = strsprintf(_T("音声シナリオ(欠落=%d, cut=%d, 位相=%d, fallback=%d, mode=%d)を実行できません: 結果=%d %s"),
+        missingFrames, cut ? 1 : 0, sourcePhaseTicks, fallback, (int)mode, status, run.result.message);
+    return false;
+}
+
+// 旧 AudioTrackStreamReformTest の RunScenario の判定
+bool CheckAudioReformScenario(int missingFrames, bool cut, int sourcePhaseTicks, int fallback, AUDIO_FORMAT_CHANGE_MODE mode,
+    const tstring& directory, tstring& diagnostic) {
+    const tstring name = strsprintf(_T("欠落=%d cut=%d 位相=%d fallback=%d mode=%d"), missingFrames, cut ? 1 : 0, sourcePhaseTicks, fallback, (int)mode);
+    ReformRun run;
+    if (!RunAudioReform(missingFrames, cut, sourcePhaseTicks, fallback, mode, directory, run, diagnostic)) return false;
+    const auto& r = run.result;
+    const auto fail = [&](const TCHAR* message) {
+        diagnostic = name + _T(": ") + message;
+        return false;
+    };
+    if (fallback != 0 && fallback != 5) {
+        return r.numEncoders > 1 ? true : fail(_T("未対応音声がジョブ全体のsplitに戻りません"));
+    }
+    if (r.outFileCount != 1) return fail(_T("音声変更でファイルが分割されました"));
+    if (r.trackCount != 2) return fail(_T("途中で増えた音声トラックが失われました"));
+    if (run.track0.size() != run.track1.size()) return fail(_T("音声列の長さが一致しません"));
+    if (run.track1.front() != -1 || run.track1.back() != -1) return fail(_T("副音声の先頭と末尾が無音になりません"));
+    if (!cut) {
+        for (int i = 100; i < 100 + missingFrames; i++) {
+            if ((run.track0[i] == -1) != (missingFrames > 5)) return fail(_T("MAX_DUP閾値前後の処理が不正です"));
+        }
+        if (!(run.track1[210] >= 0 && run.track1[300] == -1 && run.track1[420] >= 0)) return fail(_T("副音声の消失または再出現が不正です"));
+    } else if (std::count_if(run.track1.begin(), run.track1.end(), [](int v) { return v >= 0; }) != 50) {
+        return fail(_T("CMカット後の副音声の再出現区間が不正です"));
+    }
+    if (sourcePhaseTicks != 0) {
+        // 位相が0.7フレームずれた連続音声を、再選択も欠落もせず全フレーム (1920ティック間隔) 使う
+        for (size_t i = 1; i < run.track0.size(); i++) {
+            if (!(run.track0[i - 1] >= 0 && run.track0[i] >= 0 && run.track0Pts[i] - run.track0Pts[i - 1] == 1920)) {
+                return fail(_T("位相が0.7フレームの連続音声を再選択または欠落しました"));
+            }
+        }
+    }
+    if (mode == AFC_MERGE) {
+        const int expectedTracks = fallback == 5 ? 3 : 2;
+        if (r.planCount != expectedTracks) return fail(_T("統合音声の論理トラック数が不正です"));
+        for (int track = 0; track < r.planCount; track++) {
+            if (tstring(r.planName[track]) != strsprintf(_T("Audio%d"), track)) return fail(_T("統合音声のトラック名が不正です"));
+        }
+        if (fallback != 5 && !r.planHasConvert[0]) return fail(_T("異なるレイアウトがCONVERT参照になりませんでした"));
+    }
+    if (fallback == 5 && r.planCount != 3) return fail(_T("cfg0デュアルモノが主副monoへ展開されませんでした"));
+    if (r.validatePlans != 0) return fail(_T("プランの検証が失敗しました"));
+    for (int i = 0; i < r.planCount; i++) {
+        if (r.planFrameCount[i] != r.track0Count) return fail(_T("プランと参照列の長さが一致しません"));
+    }
+    if (!(r.pcmFrontFrameIndex == -1 && r.pcmFrontWaveLength == 0)) return fail(_T("無音参照のPCM入力が不正です"));
+    return true;
+}
+
+bool TestAudioReformSeparate(tstring& diagnostic) {
+    return CheckAudioReformScenario(5, false, 0, 0, AFC_SEPARATE, tstring(), diagnostic) &&
+        CheckAudioReformScenario(6, false, 0, 0, AFC_SEPARATE, tstring(), diagnostic) &&
+        CheckAudioReformScenario(20, true, 0, 0, AFC_SEPARATE, tstring(), diagnostic) &&
+        CheckAudioReformScenario(0, false, 1344, 0, AFC_SEPARATE, tstring(), diagnostic);
+}
+
+bool TestAudioReformMerge(tstring& diagnostic) {
+    return CheckAudioReformScenario(5, false, 0, 0, AFC_MERGE, tstring(), diagnostic) &&
+        CheckAudioReformScenario(6, false, 0, 0, AFC_MERGE, tstring(), diagnostic) &&
+        CheckAudioReformScenario(20, true, 0, 0, AFC_MERGE, tstring(), diagnostic) &&
+        CheckAudioReformScenario(0, false, 1344, 0, AFC_MERGE, tstring(), diagnostic);
+}
+
+// 未対応の音声 (周波数混在、非対応レイアウト、AAC Main、PCEのステレオ) があると、ジョブ全体がsplitに戻る
+bool TestAudioReformUnsupportedFallback(tstring& diagnostic) {
+    ScopedTempDirectory directory;
+    if (!Expect(directory.ok(), _T("一時ディレクトリを作成できません"), diagnostic)) return false;
+    for (const auto mode : { AFC_SEPARATE, AFC_MERGE }) {
+        for (int fallback = 1; fallback <= 4; fallback++) {
+            if (!CheckAudioReformScenario(0, false, 0, fallback, mode, directory.path(), diagnostic)) return false;
+        }
+    }
+    return true;
+}
+
+// cfg0 (PCE) の2SCE音声は、主副の2本のmonoトラックとして展開される
+bool TestAudioReformCfg0DualMono(tstring& diagnostic) {
+    ScopedTempDirectory directory;
+    if (!Expect(directory.ok(), _T("一時ディレクトリを作成できません"), diagnostic)) return false;
+    return CheckAudioReformScenario(0, false, 0, 5, AFC_SEPARATE, directory.path(), diagnostic) &&
+        CheckAudioReformScenario(0, false, 0, 5, AFC_MERGE, directory.path(), diagnostic);
+}
+
+// BuildAudioTrack の入出力
+struct BuiltTracks {
+    std::vector<BuildAudioTracksPlanResultForTest> plans;
+    std::vector<uint8_t> output;
+    int status = 0;
+};
+
+BuiltTracks BuildTracks(const std::vector<std::vector<uint8_t>>& frames, const std::vector<int>& channels,
+    const std::vector<int>& trackFrames, bool merge, const tstring& directory) {
+    std::vector<uint8_t> stream;
+    std::vector<size_t> lengths;
+    for (const auto& frame : frames) {
+        stream.insert(stream.end(), frame.begin(), frame.end());
+        lengths.push_back(frame.size());
+    }
+    BuildAudioTracksInputForTest input = { stream.data(), stream.size(), lengths.data(), channels.data(), frames.size(),
+        trackFrames.data(), trackFrames.size(), merge ? 1 : 0, directory.c_str() };
+    BuiltTracks built;
+    size_t planCount = 0, outputLength = 0;
+    built.status = BuildAudioTracksForTest(&input, nullptr, 0, &planCount, nullptr, 0, &outputLength);
+    if (built.status != -2 && built.status != 0) return built;
+    built.plans.assign(planCount, BuildAudioTracksPlanResultForTest());
+    built.output.assign(outputLength, 0);
+    built.status = BuildAudioTracksForTest(&input, built.plans.data(), built.plans.size(), &planCount,
+        built.output.data(), built.output.size(), &outputLength);
+    return built;
+}
+
+std::vector<uint8_t> PlanOutput(const BuiltTracks& built, size_t plan) {
+    const auto& p = built.plans[plan];
+    return std::vector<uint8_t>(built.output.begin() + p.outputOffset, built.output.begin() + p.outputOffset + p.outputLength);
+}
+
+// ADTSのフレーム列を (先頭位置, 長さ) に分ける。ヘッダが壊れていれば false
+bool SplitAdtsStream(const std::vector<uint8_t>& bytes, std::vector<std::pair<size_t, size_t>>& frames) {
+    frames.clear();
+    for (size_t position = 0; position < bytes.size();) {
+        if (position + 7 > bytes.size() || bytes[position] != 0xFF || (bytes[position + 1] & 0xF0) != 0xF0) return false;
+        const size_t length = ((bytes[position + 3] & 3) << 11) | (bytes[position + 4] << 3) | (bytes[position + 5] >> 5);
+        if (length < 7 || position + length > bytes.size()) return false;
+        frames.push_back({ position, length });
+        position += length;
+    }
+    return true;
+}
+
+int AdtsChannelConfig(const std::vector<uint8_t>& bytes, size_t position) {
+    return ((bytes[position + 2] & 1) << 2) | (bytes[position + 3] >> 6);
+}
+
+int ChannelConfigOfLayout(int layout) {
+    switch (layout) {
+    case AUDIO_MONO: return 1;
+    case AUDIO_STEREO: return 2;
+    case AUDIO_32_LFE: return 6;
+    default: return -1;
+    }
+}
+
+// channel_configuration=0 で1つのCPE (ステレオ) を持つPCE付きのフレーム。BuildAudioTrackのCOPYは拒否する
+std::vector<uint8_t> MakePceStereoSilentAdts(int sfi) {
+    const auto stereo = MakeSilentAdts(AUDIO_STEREO, sfi);
+    BitPacker pce;
+    pce.put(5, 3);
+    pce.put(0, 4);
+    pce.put(1, 2);
+    pce.put(sfi, 4);
+    pce.put(1, 4); // 前方のエレメント数
+    pce.put(0, 4);
+    pce.put(0, 4);
+    pce.put(0, 2);
+    pce.put(0, 3);
+    pce.put(0, 4);
+    pce.put(0, 3);
+    pce.put(1, 1); // is_cpe=1
+    pce.put(0, 4);
+    pce.align();
+    pce.put(0, 8);
+    std::vector<uint8_t> payload = pce.bytes;
+    payload.insert(payload.end(), stereo.begin() + 7, stereo.end()); // CPE + END
+    return MakeAdtsFrame(0, 0, sfi, payload);
+}
+
+bool TestAudioBuilderCopySilence(tstring& diagnostic) {
+    ScopedTempDirectory directory;
+    if (!Expect(directory.ok(), _T("一時ディレクトリを作成できません"), diagnostic)) return false;
+    const auto frame = MakeSilentAdts(AUDIO_STEREO, 3);
+    const auto built = BuildTracks({ frame, frame }, { AUDIO_STEREO, AUDIO_STEREO }, { 0, -1, 1 }, false, directory.path());
+    if (!Expect(built.status == 0 && built.plans.size() == 1 && built.plans[0].status == 0, _T("コピーと無音のトラックを構築できません"), diagnostic)) return false;
+    // 出力は「コピー」「無音」「コピー」の順。無音フレームは同じレイアウトの無音生成と同じバイト列になる
+    std::vector<uint8_t> expected;
+    for (int i = 0; i < 3; i++) expected.insert(expected.end(), frame.begin(), frame.end());
+    return Expect(PlanOutput(built, 0) == expected, _T("PacketCacheコピーと無音の結合が不正です"), diagnostic);
+}
+
+bool TestAudioBuilderDualMono(tstring& diagnostic) {
+    constexpr int SFI_48000 = 3;
+    ScopedTempDirectory directory;
+    if (!Expect(directory.ok(), _T("一時ディレクトリを作成できません"), diagnostic)) return false;
+    const auto dual = MakeDualMonoSilentAdts(SFI_48000);
+    // ADTSパーサがcfg0の2SCE音声をデュアルモノとして判定する
+    std::vector<std::pair<std::vector<uint8_t>, int64_t>> packets;
+    for (int i = 0; i < 3; i++) packets.push_back({ dual, (int64_t)i * 1920 });
+    std::vector<AudioFrameInfoForTest> parsed;
+    std::vector<int> packetResults;
+    if (!ParseAdts(packets, parsed, packetResults, diagnostic)) return false;
+    if (!Expect(!parsed.empty(), _T("cfg0デュアルモノをADTS parserで読めませんでした"), diagnostic)) return false;
+    for (const auto& frame : parsed) {
+        if (!Expect(frame.channels == AUDIO_2LANG, _T("PCEの2SCE音声がデュアルモノとして判定されませんでした"), diagnostic)) return false;
+    }
+    const auto stereo = MakeSilentAdts(AUDIO_STEREO, SFI_48000);
+    const auto built = BuildTracks({ dual, stereo, dual }, { AUDIO_2LANG, AUDIO_STEREO, AUDIO_2LANG }, { 0, 1, 2 }, false, directory.path());
+    if (!Expect(built.status == 0 && built.plans.size() == 3, _T("デュアルモノ混在の出力トラック数が不正です"), diagnostic)) return false;
+    // 主音声mono、副音声mono、ステレオの順。分離後のADTSは、それぞれのレイアウトのチャンネル構成になる
+    const int expectedLayouts[] = { AUDIO_MONO, AUDIO_MONO, AUDIO_STEREO };
+    for (size_t track = 0; track < built.plans.size(); track++) {
+        const auto output = PlanOutput(built, track);
+        std::vector<std::pair<size_t, size_t>> frames;
+        if (!Expect(built.plans[track].status == 0 && built.plans[track].layout == expectedLayouts[track] && SplitAdtsStream(output, frames) && frames.size() == 3,
+            _T("デュアルモノ分離後のトラックを読めません"), diagnostic)) return false;
+        for (const auto& item : frames) {
+            if (!Expect(AdtsChannelConfig(output, item.first) == ChannelConfigOfLayout(expectedLayouts[track]),
+                _T("デュアルモノ分離後のチャンネル構成が不正です"), diagnostic)) return false;
+        }
+    }
+    return true;
+}
+
+bool TestAudioBuilderRejectPce(tstring& diagnostic) {
+    ScopedTempDirectory directory;
+    if (!Expect(directory.ok(), _T("一時ディレクトリを作成できません"), diagnostic)) return false;
+    const auto pce = MakePceStereoSilentAdts(3);
+    // 前提: cfg0のステレオ (CPE) をADTSパーサはステレオとしては読まない
+    const auto built = BuildTracks({ pce }, { AUDIO_STEREO }, { 0 }, false, directory.path());
+    if (!Expect(built.status == 0 && built.plans.size() == 1, _T("プランを作成できません"), diagnostic)) return false;
+    if (!Expect(built.plans[0].status == 1, _T("Builder直呼びでchannel_config=0が拒否されませんでした"), diagnostic)) return false;
+    return Expect(tstring(built.plans[0].message).find(_T("ADTSヘッダ")) != tstring::npos,
+        _T("PCE音声がCOPYヘッダ検証で拒否されませんでした"), diagnostic);
+}
+
+bool TestAudioBuilderMergeConvert(tstring& diagnostic) {
+    constexpr int SFI_48000 = 3;
+    ScopedTempDirectory directory;
+    if (!Expect(directory.ok(), _T("一時ディレクトリを作成できません"), diagnostic)) return false;
+    const auto stereo = MakeSilentAdts(AUDIO_STEREO, SFI_48000);
+    const auto surround = MakeSilentAdts(AUDIO_32_LFE, SFI_48000);
+    for (const bool upmix : { false, true }) {
+        // upmix: ステレオ→5.1chに切り替わる。downmix: 5.1chが最後の1フレームだけ現れる
+        const std::vector<int> channels = upmix ? std::vector<int>{ AUDIO_STEREO, AUDIO_32_LFE, AUDIO_32_LFE }
+                                                : std::vector<int>{ AUDIO_STEREO, AUDIO_STEREO, AUDIO_32_LFE };
+        std::vector<std::vector<uint8_t>> frames;
+        for (const int channel : channels) frames.push_back(channel == AUDIO_STEREO ? stereo : surround);
+        const auto built = BuildTracks(frames, channels, { 0, 1, 2 }, true, directory.path());
+        const int targetLayout = upmix ? AUDIO_32_LFE : AUDIO_STEREO;
+        if (!Expect(built.status == 0 && built.plans.size() == 1 && built.plans[0].layout == targetLayout && built.plans[0].status == 0,
+            _T("統合変換の目標レイアウトが不正です"), diagnostic)) return false;
+        const auto output = PlanOutput(built, 0);
+        std::vector<std::pair<size_t, size_t>> adts;
+        if (!Expect(SplitAdtsStream(output, adts) && adts.size() == 3, _T("統合変換の出力のフレーム数が入力トラックと一致しません"), diagnostic)) return false;
+        for (const auto& item : adts) {
+            if (!Expect(AdtsChannelConfig(output, item.first) == ChannelConfigOfLayout(targetLayout),
+                _T("統合変換の出力のチャンネル構成が不正です"), diagnostic)) return false;
+        }
+    }
+    return true;
+}
+
+// 既知PCM: 固定seedの周波数・位相を持つ正弦波の和 (チャンネルごとに別の周波数)
+std::vector<float> MakeKnownPcm(int channels, size_t samplesPerChannel, uint32_t seed, double amplitude, double noise = 0) {
+    std::mt19937 random(seed);
+    constexpr int PARTIALS = 5;
+    constexpr double PI = 3.14159265358979323846;
+    std::vector<double> frequency(channels * PARTIALS), phase(channels * PARTIALS);
+    for (int i = 0; i < channels * PARTIALS; i++) {
+        frequency[i] = 200.0 + (random() % 9000);
+        phase[i] = 2.0 * PI * (random() % 10000) / 10000.0;
+    }
+    std::vector<float> pcm(samplesPerChannel * channels);
+    for (size_t n = 0; n < samplesPerChannel; n++) {
+        for (int c = 0; c < channels; c++) {
+            double v = 0;
+            for (int k = 0; k < PARTIALS; k++) {
+                v += std::sin(2.0 * PI * frequency[c * PARTIALS + k] * n / 48000.0 + phase[c * PARTIALS + k]);
+            }
+            double sample = amplitude * v / PARTIALS;
+            if (noise > 0) {
+                // Box-Muller (std::normal_distributionは実装依存なので使わない)
+                const double u1 = ((random() >> 8) + 1.0) / 16777217.0, u2 = (random() >> 8) / 16777216.0;
+                sample += noise * std::sqrt(-2.0 * std::log(u1)) * std::cos(2.0 * PI * u2);
+            }
+            pcm[n * channels + c] = (float)sample;
+        }
+    }
+    return pcm;
+}
+
+bool EncodeAdts(const std::vector<float>& pcm, int layout, std::vector<uint8_t>& adts, tstring& diagnostic) {
+    const size_t samples = pcm.size() / (layout == AUDIO_MONO ? 1 : layout == AUDIO_STEREO ? 2 : 6);
+    size_t length = 0;
+    if (!Expect(EncodePcmToAdtsForTest(pcm.data(), samples, layout, nullptr, 0, &length) == -2 && length > 0, _T("AACエンコード結果の大きさを取得できません"), diagnostic)) return false;
+    adts.assign(length, 0);
+    return Expect(EncodePcmToAdtsForTest(pcm.data(), samples, layout, adts.data(), adts.size(), &length) == 0 && length == adts.size(),
+        _T("PCMをAACへエンコードできません"), diagnostic);
+}
+
+bool DecodeAdts(const std::vector<uint8_t>& adts, int decoder, std::vector<float>& pcm, int& channels, tstring& diagnostic) {
+    size_t count = 0;
+    if (!Expect(DecodeAdtsToPcmForTest(adts.data(), adts.size(), decoder, nullptr, 0, &count, &channels) == -2 && count > 0,
+        _T("ADTSの復号結果の大きさを取得できません"), diagnostic)) return false;
+    pcm.assign(count, 0);
+    return Expect(DecodeAdtsToPcmForTest(adts.data(), adts.size(), decoder, pcm.data(), pcm.size(), &count, &channels) == 0,
+        _T("ADTSを復号できません"), diagnostic);
+}
+
+// FAADとlibavcodecで同じAACを復号した結果の一致。
+// 許容誤差は、AAC復号器の適合基準 (ISO/IEC 14496-4) の考え方による。16bit出力のフルアキュラシーでは、
+// 参照復号との差のRMSが16bit量子化誤差のRMS (2^-15/√12) 以下、最大誤差が2^-14以下であることが求められる。
+bool TestAudioAacDecoderAgreement(tstring& diagnostic) {
+    const double RMS_LIMIT = std::pow(2.0, -15) / std::sqrt(12.0);
+    const double MAX_LIMIT = std::pow(2.0, -14);
+    constexpr int FRAMES = 64;
+    const struct { int layout; int channels; } cases[] = { { AUDIO_MONO, 1 }, { AUDIO_STEREO, 2 } };
+    for (const auto& item : cases) {
+        const tstring name = strsprintf(_T("%dch"), item.channels);
+        const auto pcm = MakeKnownPcm(item.channels, (size_t)FRAMES * 1024, 20260928 + item.channels, 0.5);
+        std::vector<uint8_t> adts;
+        if (!EncodeAdts(pcm, item.layout, adts, diagnostic)) return false;
+        std::vector<float> faad, av;
+        int faadChannels = 0, avChannels = 0;
+        if (!DecodeAdts(adts, 0, faad, faadChannels, diagnostic) || !DecodeAdts(adts, 1, av, avChannels, diagnostic)) return false;
+        // libavcodecは全フレーム分を出力し、FAADは先頭1フレーム分の出力を出さない。FAADのモノラルはPS対応で2chへ展開される
+        const int expectedFaadChannels = item.channels == 1 ? 2 : item.channels;
+        if (!Expect(avChannels == item.channels && faadChannels == expectedFaadChannels, (name + _T(": 復号チャンネル数が不正です")).c_str(), diagnostic)) return false;
+        const size_t avFrames = av.size() / avChannels / 1024, faadFrames = faad.size() / faadChannels / 1024;
+        if (!Expect(avFrames == FRAMES && faadFrames == FRAMES - 1 && av.size() % (avChannels * 1024) == 0 && faad.size() % (faadChannels * 1024) == 0,
+            strsprintf(_T("%s: 復号フレーム数が不正です (libavcodec=%zu, FAAD=%zu)"), name.c_str(), avFrames, faadFrames).c_str(), diagnostic)) return false;
+        // 無音の一致で通らないよう、復号結果が十分な振幅を持つことを確かめる
+        float peak = 0;
+        for (float v : av) peak = std::max(peak, std::abs(v));
+        if (!Expect(peak > 0.2f, (name + _T(": 復号結果の振幅が小さすぎます")).c_str(), diagnostic)) return false;
+        for (int c = 0; c < expectedFaadChannels; c++) {
+            const int avChannel = item.channels == 1 ? 0 : c;
+            double squares = 0, maximum = 0;
+            const size_t count = faad.size() / faadChannels;
+            for (size_t i = 0; i < count; i++) {
+                const double d = (double)faad[i * faadChannels + c] - av[(i + 1024) * avChannels + avChannel];
+                squares += d * d;
+                maximum = std::max(maximum, std::abs(d));
+            }
+            const double rms = std::sqrt(squares / count);
+            if (!Expect(rms <= RMS_LIMIT && maximum <= MAX_LIMIT,
+                strsprintf(_T("%s ch%d: 復号結果の差が大きすぎます (RMS=%g/%g, 最大=%g/%g)"), name.c_str(), c, rms, RMS_LIMIT, maximum, MAX_LIMIT).c_str(), diagnostic)) return false;
+        }
+    }
+    return true;
+}
+
+// CONVERT (チャンネル数の変換と再エンコード)
+struct ConvertSources {
+    std::vector<std::vector<uint8_t>> frames[7]; // チャンネル数ごとのADTSフレーム
+};
+
+bool MakeConvertSources(ConvertSources& sources, tstring& diagnostic) {
+    constexpr size_t SAMPLES = 160 * 1024;
+    const struct { int channels; int layout; } layouts[] = { { 1, AUDIO_MONO }, { 2, AUDIO_STEREO }, { 6, AUDIO_32_LFE } };
+    for (const auto& item : layouts) {
+        // 広帯域の入力: 周期波だけだと相関ピークを誤判定しうるので雑音を加える
+        const auto pcm = MakeKnownPcm(item.channels, SAMPLES, 20260928 + item.channels, 0.25, 0.005);
+        std::vector<uint8_t> adts;
+        std::vector<std::pair<size_t, size_t>> frames;
+        if (!EncodeAdts(pcm, item.layout, adts, diagnostic)) return false;
+        if (!Expect(SplitAdtsStream(adts, frames) && frames.size() == SAMPLES / 1024, _T("変換元AACのフレーム数が不正です"), diagnostic)) return false;
+        for (const auto& f : frames) sources.frames[item.channels].emplace_back(adts.begin() + f.first, adts.begin() + f.first + f.second);
+    }
+    return true;
+}
+
+int LayoutOfChannels(int channels) { return channels == 1 ? AUDIO_MONO : channels == 2 ? AUDIO_STEREO : AUDIO_32_LFE; }
+
+struct ConvertResult {
+    int status = 0;
+    std::vector<uint8_t> adts;
+    tstring message;
+};
+
+ConvertResult RunConvert(const std::vector<std::vector<uint8_t>>& frames, const std::vector<int>& frameChannels,
+    const std::vector<int64_t>& pts, const std::vector<int>& refIndex, const std::vector<int>& refConvert,
+    int dstLayout, int dualMonoChannel, const tstring& directory) {
+    std::vector<uint8_t> stream;
+    std::vector<size_t> lengths;
+    for (const auto& f : frames) {
+        stream.insert(stream.end(), f.begin(), f.end());
+        lengths.push_back(f.size());
+    }
+    ConvertAdtsTrackInputForTest input = { stream.data(), stream.size(), lengths.data(), frameChannels.data(),
+        pts.empty() ? nullptr : pts.data(), frames.size(), refIndex.data(), refConvert.data(), refIndex.size(),
+        dstLayout, dualMonoChannel, directory.c_str() };
+    ConvertResult result;
+    size_t length = 0;
+    TCHAR message[96] = {};
+    result.status = ConvertAdtsTrackForTest(&input, nullptr, 0, &length, message, std::size(message));
+    if (result.status == -2) {
+        result.adts.assign(length, 0);
+        result.status = ConvertAdtsTrackForTest(&input, result.adts.data(), result.adts.size(), &length, message, std::size(message));
+    }
+    result.message = message;
+    return result;
+}
+
+double MaxAbs(const std::vector<float>& values, size_t begin, size_t end, size_t stride, size_t offset) {
+    double maximum = 0;
+    for (size_t i = begin; i < end; i++) maximum = std::max(maximum, (double)std::abs(values[i * stride + offset]));
+    return maximum;
+}
+
+bool ExpectConvertCase(const ConvertSources& sources, int src, int dst, int count, int prefix, int suffix,
+    const tstring& directory, tstring& diagnostic) {
+    const tstring name = strsprintf(_T("CONVERT %dch→%dch (N=%d 前=%d 後=%d)"), src, dst, count, prefix, suffix);
+    std::vector<std::vector<uint8_t>> selected;
+    std::vector<int> channels, convert;
+    for (int i = 0; i < prefix; i++) { selected.push_back(sources.frames[dst][10 + i]); channels.push_back(LayoutOfChannels(dst)); convert.push_back(0); }
+    for (int i = 0; i < count; i++) { selected.push_back(sources.frames[src][20 + i]); channels.push_back(LayoutOfChannels(src)); convert.push_back(1); }
+    for (int i = 0; i < suffix; i++) { selected.push_back(sources.frames[dst][30 + i]); channels.push_back(LayoutOfChannels(dst)); convert.push_back(0); }
+    std::vector<int> indices(selected.size());
+    for (size_t i = 0; i < indices.size(); i++) indices[i] = (int)i;
+    const auto result = RunConvert(selected, channels, {}, indices, convert, LayoutOfChannels(dst), -1, directory);
+    if (!Expect(result.status == 0, (name + _T(": 変換に失敗しました: ") + result.message).c_str(), diagnostic)) return false;
+    std::vector<std::pair<size_t, size_t>> frames;
+    if (!Expect(SplitAdtsStream(result.adts, frames) && frames.size() == selected.size(), (name + _T(": 出力のフレーム数が入力トラックと一致しません")).c_str(), diagnostic)) return false;
+    // 前後のCOPYはバイト単位で変化しない
+    for (size_t i = 0; i < frames.size(); i++) {
+        const bool copy = !convert[i];
+        const std::vector<uint8_t> actual(result.adts.begin() + frames[i].first, result.adts.begin() + frames[i].first + frames[i].second);
+        if (copy && !Expect(actual == selected[i], (name + _T(": COPYのフレームが変化しました")).c_str(), diagnostic)) return false;
+    }
+    std::vector<float> decoded;
+    int decodedChannels = 0;
+    if (!DecodeAdts(result.adts, 1, decoded, decodedChannels, diagnostic)) return false;
+    if (!Expect(decodedChannels == dst && decoded.size() == selected.size() * 1024 * dst, (name + _T(": 復号後のサンプル数が不正です")).c_str(), diagnostic)) return false;
+    if (count < 96) return true;
+
+    // CONVERT元の範囲だけを単独で復号し、変換後の期待信号を求める。両復号器の初期の重なりを除いた内部で位置を比較する
+    std::vector<uint8_t> sourceAdts;
+    for (int i = 0; i < count; i++) sourceAdts.insert(sourceAdts.end(), selected[prefix + i].begin(), selected[prefix + i].end());
+    std::vector<float> reference;
+    int referenceChannels = 0;
+    if (!DecodeAdts(sourceAdts, 1, reference, referenceChannels, diagnostic)) return false;
+    const double normalizer = 1 + 2 * 0.707;
+    const size_t total = (size_t)count * 1024;
+    const int outputSignals = dst == 1 ? 1 : 2;
+    std::vector<std::vector<double>> expected(outputSignals, std::vector<double>(total));
+    for (size_t n = 0; n < total; n++) {
+        const float* row = &reference[n * src];
+        if (src == 6) {
+            for (int side = 0; side < 2; side++) expected[side][n] = (row[side] + 0.707 * (row[2] + row[4 + side])) / normalizer;
+        } else if (src == 2 && dst == 1) {
+            expected[0][n] = (row[0] + row[1]) / 2;
+        } else if (src == 1) {
+            expected[0][n] = expected[1][n] = row[0];
+        } else {
+            expected[0][n] = row[0];
+            expected[1][n] = row[1];
+        }
+    }
+    const size_t begin = 4 * 1024, end = (size_t)(count - 4) * 1024;
+    for (int c = 0; c < outputSignals; c++) {
+        std::vector<double> converted(total);
+        for (size_t n = 0; n < total; n++) converted[n] = decoded[((size_t)prefix * 1024 + n) * dst + c];
+        int bestLag = 0;
+        double best = -2;
+        for (int lag = -32; lag <= 32; lag++) {
+            double ab = 0, aa = 0, bb = 0;
+            for (size_t n = begin; n < end; n++) {
+                const double a = expected[c][n], b = converted[n + lag];
+                ab += a * b; aa += a * a; bb += b * b;
+            }
+            const double correlation = ab / std::sqrt(aa * bb);
+            if (correlation > best) { best = correlation; bestLag = lag; }
+        }
+        if (!Expect(bestLag == 0, strsprintf(_T("%s ch%d: サンプル位置がずれています (ラグ=%d)"), name.c_str(), c, bestLag).c_str(), diagnostic)) return false;
+        if (!Expect(best > 0.9, strsprintf(_T("%s ch%d: 変換後の信号の相関が低すぎます (%g)"), name.c_str(), c, best).c_str(), diagnostic)) return false;
+    }
+    if (dst == 6) {
+        const size_t from = ((size_t)prefix + 4) * 1024, to = ((size_t)prefix + count - 4) * 1024;
+        for (int c = 2; c < 6; c++) {
+            if (!Expect(MaxAbs(decoded, from, to, 6, c) < 1e-6, strsprintf(_T("%s: 追加チャンネル%dが無音になりません"), name.c_str(), c).c_str(), diagnostic)) return false;
+        }
+    }
+    return true;
+}
+
+bool TestAudioConvertPosition(tstring& diagnostic) {
+    ScopedTempDirectory directory;
+    if (!Expect(directory.ok(), _T("一時ディレクトリを作成できません"), diagnostic)) return false;
+    ConvertSources sources;
+    if (!MakeConvertSources(sources, diagnostic)) return false;
+    const struct { int src, dst; } pairs[] = { { 2, 6 }, { 6, 2 }, { 1, 2 }, { 2, 1 } };
+    const struct { int count, prefix, suffix; } shapes[] = { { 1, 0, 0 }, { 2, 0, 0 }, { 96, 0, 0 }, { 1, 8, 8 }, { 2, 8, 8 }, { 96, 8, 8 }, { 12, 0, 8 }, { 12, 8, 0 } };
+    for (const auto& p : pairs) {
+        for (const auto& s : shapes) {
+            if (!ExpectConvertCase(sources, p.src, p.dst, s.count, s.prefix, s.suffix, directory.path(), diagnostic)) return false;
+        }
+    }
+    return true;
+}
+
+// cfg0 (PCE) のデュアルモノの無音を、主副それぞれのmonoからステレオへCONVERTしても無音のまま
+bool TestAudioConvertDualMono(tstring& diagnostic) {
+    ScopedTempDirectory directory;
+    if (!Expect(directory.ok(), _T("一時ディレクトリを作成できません"), diagnostic)) return false;
+    const auto dual = MakeDualMonoSilentAdts(3);
+    for (int language = 0; language < 2; language++) {
+        const tstring name = strsprintf(_T("デュアルモノの言語%d"), language + 1);
+        const std::vector<std::vector<uint8_t>> frames(12, dual);
+        const std::vector<int> channels(12, AUDIO_2LANG), convert(12, 1);
+        std::vector<int> indices(12);
+        for (int i = 0; i < 12; i++) indices[i] = i;
+        const auto result = RunConvert(frames, channels, {}, indices, convert, AUDIO_STEREO, language, directory.path());
+        std::vector<std::pair<size_t, size_t>> adts;
+        if (!Expect(result.status == 0 && SplitAdtsStream(result.adts, adts) && adts.size() == 12, (name + _T(": 変換結果のフレーム数が不正です")).c_str(), diagnostic)) return false;
+        std::vector<float> decoded;
+        int decodedChannels = 0;
+        if (!DecodeAdts(result.adts, 1, decoded, decodedChannels, diagnostic)) return false;
+        if (!Expect(decodedChannels == 2 && decoded.size() == 12 * 1024 * 2 && MaxAbs(decoded, 0, decoded.size(), 1, 0) == 0.0,
+            (name + _T(": 無音がゼロになりません")).c_str(), diagnostic)) return false;
+    }
+    return true;
+}
+
+// 100秒の欠落をまたぐと、前の有音の履歴は無音のCONVERTへ漏れない
+bool TestAudioConvertLongGap(tstring& diagnostic) {
+    ScopedTempDirectory directory;
+    if (!Expect(directory.ok(), _T("一時ディレクトリを作成できません"), diagnostic)) return false;
+    // 有音の2chフレーム1つと、その後の完全に無音の2chフレーム12個
+    std::vector<uint8_t> loudAdts;
+    std::vector<std::pair<size_t, size_t>> loudFrames;
+    if (!EncodeAdts(MakeKnownPcm(2, 48 * 1024, 20260928, 0.3), AUDIO_STEREO, loudAdts, diagnostic)) return false;
+    if (!Expect(SplitAdtsStream(loudAdts, loudFrames) && loudFrames.size() == 48, _T("有音フレームを作れません"), diagnostic)) return false;
+    const auto silence = MakeSilentAdts(AUDIO_STEREO, 3);
+    std::vector<std::vector<uint8_t>> frames = { std::vector<uint8_t>(loudAdts.begin() + loudFrames[40].first, loudAdts.begin() + loudFrames[40].first + loudFrames[40].second) };
+    for (int i = 0; i < 12; i++) frames.push_back(silence);
+    const std::vector<int> channels(13, AUDIO_STEREO), convert(12, 1);
+    std::vector<int> indices(12);
+    for (int i = 0; i < 12; i++) indices[i] = i + 1;
+    // 有音フレームの時刻が100秒前 (90kHzで9000000) の場合
+    std::vector<int64_t> pts = { 0 };
+    for (int i = 0; i < 12; i++) pts.push_back(9000000 + (int64_t)i * 1920);
+    const auto separated = RunConvert(frames, channels, pts, indices, convert, AUDIO_32_LFE, -1, directory.path());
+    std::vector<std::pair<size_t, size_t>> adts;
+    if (!Expect(separated.status == 0 && SplitAdtsStream(separated.adts, adts) && adts.size() == 12, _T("長欠落の変換結果のフレーム数が不正です"), diagnostic)) return false;
+    std::vector<float> decoded;
+    int decodedChannels = 0;
+    if (!DecodeAdts(separated.adts, 1, decoded, decodedChannels, diagnostic)) return false;
+    if (!Expect(decodedChannels == 6 && decoded.size() == 12 * 1024 * 6, _T("長欠落の復号後のサンプル数が不正です"), diagnostic)) return false;
+    double leaked = 0;
+    for (float v : decoded) leaked = std::max(leaked, (double)std::abs(v));
+    if (!Expect(leaked == 0.0, strsprintf(_T("100秒前の有音の履歴が無音のCONVERTへ漏れました (最大絶対値=%g)"), leaked).c_str(), diagnostic)) return false;
+
+    // 対照: 時刻が連続していれば有音フレームが履歴として使われ、その影響が出力に出る (上の判定が漏れを検出できる条件であることの確認)
+    std::vector<int64_t> contiguous;
+    for (int i = 0; i < 13; i++) contiguous.push_back((int64_t)i * 1920);
+    const auto joined = RunConvert(frames, channels, contiguous, indices, convert, AUDIO_32_LFE, -1, directory.path());
+    std::vector<float> joinedPcm;
+    int joinedChannels = 0;
+    if (!Expect(joined.status == 0, _T("連続した時刻の変換に失敗しました"), diagnostic) || !DecodeAdts(joined.adts, 1, joinedPcm, joinedChannels, diagnostic)) return false;
+    double used = 0;
+    for (float v : joinedPcm) used = std::max(used, (double)std::abs(v));
+    return Expect(used > 0.0, _T("対照の連続した時刻でも出力が無音のままで、漏れを検出できる条件ではありません"), diagnostic);
 }
 
 // TS: パケットとPSIセクションの組み立て
@@ -1398,6 +3057,52 @@ struct LogoHeaderStorage {
     logo::LogoHeader* get() { return reinterpret_cast<logo::LogoHeader*>(bytes); }
 };
 
+// 少数・多数のマスク、暗部・明部、飽和、正負の相関を旧走査とbit単位で比較する。
+bool TestLogoCorrelationFusion(tstring& diagnostic) {
+    constexpr int width = 48, height = 40, scaleCount = 32;
+    std::vector<std::pair<int, int>> coordinates;
+    for (int y = 2; y < height - 2; y++) {
+        for (int x = 2; x < width - 2; x++) coordinates.emplace_back(x, y);
+    }
+    std::vector<float> work(width * height + 8);
+    std::vector<float> kernels(coordinates.size() * 25 + 8);
+    // idx==scaleCountの従来の境界参照を含め、末尾にも安全な番兵を置く。
+    std::vector<LogoCorrelationScaleLimit> scales(coordinates.size() * scaleCount + 1);
+    uint32_t state = 0x13579bdf;
+    auto random = [&]() { state = state * 1664525u + 1013904223u; return state; };
+    for (auto& k : kernels) k = ((int)(random() % 2001) - 1000) / 317.0f;
+    for (auto& scale : scales) {
+        scale.scale = ((int)(random() % 2001) - 1000) / 173.0f;
+        scale.scale2 = (random() % 1001) / 1000.0f;
+    }
+    for (float maxv : { 255.0f, 1023.0f }) {
+        for (int pattern = 0; pattern < 7; pattern++) {
+            for (size_t i = 0; i < work.size(); i++) {
+                switch (pattern) {
+                case 0: work[i] = 0.0f; break;
+                case 1: work[i] = maxv; break;
+                case 2: work[i] = -maxv * 0.25f; break;
+                case 3: work[i] = maxv * 1.1f; break;
+                case 4: work[i] = (i & 1) ? maxv : 0.0f; break;
+                case 5: work[i] = (random() % 1001) * (maxv / 1000.0f); break;
+                default: work[i] = ((int)(random() % 1401) - 200) * (maxv / 1000.0f); break;
+                }
+            }
+            for (size_t count : { size_t(0), size_t(1), size_t(7), size_t(31), coordinates.size() }) {
+                float reference = 0, fused = 0;
+                if (!CompareLogoCorrelationForTest(kernels.data(), work.data(), width, coordinates.data(),
+                    count, scales.data(), scaleCount, maxv, &reference, &fused)) return true;
+                if (std::memcmp(&reference, &fused, sizeof(float)) != 0) {
+                    diagnostic = strsprintf(_T("相関走査bit不一致: maxv=%.0f, pattern=%d, count=%d, 旧=%.9g, 新=%.9g"),
+                        maxv, pattern, (int)count, reference, fused);
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 bool TestLogoFile(tstring& diagnostic) {
     constexpr int LOGO_W = 8, LOGO_H = 4, LOG_UV = 1;
     constexpr size_t SIZE_Y = LOGO_W * LOGO_H;
@@ -1565,9 +3270,35 @@ constexpr TestCase TEST_CASES[] = {
     { _T("h264_video_parser"), TestH264VideoParser },
     { _T("h264_pan_scan"), TestH264PanScan },
     { _T("adts_parser"), TestAdtsParser },
+    { _T("audio_pes_pipeline"), TestAudioPesPipeline },
+    { _T("audio_track_separate_planner"), TestAudioTrackSeparatePlanner },
+    { _T("audio_track_merge_planner"), TestAudioTrackMergePlanner },
+    { _T("audio_silent_adts_bytes"), TestAudioSilentAdtsBytes },
+    { _T("audio_channel_conversion"), TestAudioChannelConversion },
+    { _T("command_line_arguments"), TestCommandLineArguments },
+    { _T("cm_cut_offset"), TestCMCutOffset },
+    { _T("cm_cut_offset_command_line"), TestCMCutOffsetCommandLine },
+    { _T("wave_header"), TestWaveHeader },
+    { _T("audio_silent_adts_decode"), TestAudioSilentAdtsDecode },
+    { _T("dual_mono_splitter"), TestDualMonoSplitter },
+    { _T("bitrate_zones_properties"), TestBitrateZonesProperties },
+    { _T("ps_writer_round_trip"), TestPsWriterRoundTrip },
+    { _T("audio_aac_decoder_agreement"), TestAudioAacDecoderAgreement },
+    { _T("audio_convert_position"), TestAudioConvertPosition },
+    { _T("audio_convert_dual_mono"), TestAudioConvertDualMono },
+    { _T("audio_convert_long_gap"), TestAudioConvertLongGap },
+    { _T("audio_reform_separate"), TestAudioReformSeparate },
+    { _T("audio_reform_merge"), TestAudioReformMerge },
+    { _T("audio_reform_unsupported_fallback"), TestAudioReformUnsupportedFallback },
+    { _T("audio_reform_cfg0_dual_mono"), TestAudioReformCfg0DualMono },
+    { _T("audio_builder_copy_silence"), TestAudioBuilderCopySilence },
+    { _T("audio_builder_dual_mono"), TestAudioBuilderDualMono },
+    { _T("audio_builder_reject_pce"), TestAudioBuilderRejectPce },
+    { _T("audio_builder_merge_convert"), TestAudioBuilderMergeConvert },
     { _T("ts_selector"), TestTsSelector },
     { _T("arib_string"), TestAribString },
     { _T("logo_file"), TestLogoFile },
+    { _T("logo_correlation_fusion"), TestLogoCorrelationFusion },
     { _T("caption_pes_serialization"), TestCaptionPesSerialization },
     { _T("caption_pes_wrap"), TestCaptionPesWrap },
     { _T("caption_interval_mapping"), TestCaptionIntervalMapping },

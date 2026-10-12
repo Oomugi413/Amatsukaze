@@ -8,6 +8,8 @@
 #pragma once
 
 #include <time.h>
+#include <climits>
+#include <algorithm>
 #include <mutex>
 #include "TranscodeManager.h"
 #include "AmatsukazeTestImpl.h"
@@ -67,6 +69,8 @@ static void printHelp(const tchar* bin) {
         "                      指定がない場合はビットレートオプションを追加しない\n"
         "  -bcm|--bitrate-cm <float>   CM判定されたところのビットレート倍率\n"
         "  --cm-quality-offset <float> CM判定されたところの品質オフセット\n"
+        "  --cm-cut-offset <frames> CMカット点を正の指定フレーム数だけ本編の内側にする\n"
+        "                      本編のみ/前後CMカット出力に適用。--trimavs指定時は無効\n"
         "  --2pass             2passエンコード\n"
         "  --splitsub          メイン以外のフォーマットは結合しない\n"
         "  -aet|--audio-encoder-type <タイプ> 音声エンコーダ[]"
@@ -196,7 +200,7 @@ static ENUM_ENCODER encoderFtomString(const tstring& str) {
     } else if (str == _T("x262")) {
         return ENCODER_X262;
     }
-    return (ENUM_ENCODER)-1;
+    return ENCODER_INVALID;
 }
 
 static ENUM_AUDIO_ENCODER audioEncoderFtomString(const tstring& str) {
@@ -209,7 +213,7 @@ static ENUM_AUDIO_ENCODER audioEncoderFtomString(const tstring& str) {
     } else if (str == _T("opusenc")) {
         return AUDIO_ENCODER_OPUSENC;
     }
-    return (ENUM_AUDIO_ENCODER)-1;
+    return AUDIO_ENCODER_INVALID;
 }
 
 static DECODER_TYPE decoderFromString(const tstring& str) {
@@ -220,7 +224,32 @@ static DECODER_TYPE decoderFromString(const tstring& str) {
     } else if (str == _T("cuvid") || str == _T("CUVID") || str == _T("nvdec") || str == _T("NVDec")) {
         return DECODER_CUVID;
     }
-    return (DECODER_TYPE)-1;
+    return DECODER_INVALID;
+}
+
+// 整数オプションを厳密に解析する。値が空、末尾にゴミがある、intの範囲外の場合は引数エラーにする。
+// 16進数 (base=16) は符号と0x接頭辞を含まない16進数字だけを受け付ける。
+static int parseIntOption(const tstring& key, const tstring& value, int base = 10) {
+    bool valid = !value.empty();
+    long long result = 0;
+    if (valid && base == 16) {
+        valid = std::all_of(value.begin(), value.end(), [](tchar c) {
+            return (c >= _T('0') && c <= _T('9')) || (c >= _T('a') && c <= _T('f')) || (c >= _T('A') && c <= _T('F'));
+        });
+    }
+    if (valid) {
+        try {
+            size_t pos = 0;
+            result = std::stoll(value, &pos, base);
+            valid = pos == value.size() && result >= INT_MIN && result <= INT_MAX;
+        } catch (const std::exception&) {
+            valid = false;
+        }
+    }
+    if (!valid) {
+        THROWF(ArgumentException, "%" PRITSTR "の値が不正です: %" PRITSTR "", key, value);
+    }
+    return (int)result;
 }
 
 static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const tchar* argv[]) {
@@ -233,7 +262,7 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
     Config conf = Config();
     conf.workDir = _T("./");
     conf.encoderOptions = _T("");
-    conf.encoderFilter = (ENUM_ENCODER)-1;
+    conf.encoderFilter = ENCODER_INVALID;
     conf.encoderFilterPath = _T("");
     conf.encoderFilterOptions = _T("");
     conf.encoderFilterDeinterlace = false;
@@ -267,6 +296,7 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
     conf.userSAR = { 0, 0 };
     conf.bitrateCM = 1.0;
     conf.cmQualityOffset = 0.0;
+    conf.cmCutOffsetFrames = 0;
     conf.x265TimeFactor = 0.25;
     conf.serviceId = -1;
     conf.cmoutmask = 1;
@@ -330,8 +360,8 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
         } else if (key == _T("-et") || key == _T("--encoder-type")) {
             tstring arg = getParam(argc, argv, i++);
             conf.encoder = encoderFtomString(arg);
-            if (conf.encoder == (ENUM_ENCODER)-1) {
-                printTStderr(StringFormat(_T("--encoder-typeの指定が間違っています: %s\n"), arg.c_str()));
+            if (conf.encoder == ENCODER_INVALID) {
+                THROWF(ArgumentException, "--encoder-typeの指定が間違っています: %" PRITSTR "", arg);
             }
         } else if (key == _T("-e") || key == _T("--encoder")) {
             conf.encoderPath = pathNormalize(getParam(argc, argv, i++));
@@ -340,8 +370,8 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
         } else if (key == _T("-eft") || key == _T("--encoder-filter-type")) {
             tstring arg = getParam(argc, argv, i++);
             conf.encoderFilter = encoderFtomString(arg);
-            if (conf.encoderFilter == (ENUM_ENCODER)-1) {
-                printTStderr(StringFormat(_T("--encoder-filter-typeの指定が間違っています: %s\n"), arg.c_str()));
+            if (conf.encoderFilter == ENCODER_INVALID) {
+                THROWF(ArgumentException, "--encoder-filter-typeの指定が間違っています: %" PRITSTR "", arg);
             }
         } else if (key == _T("-ef") || key == _T("--encoder-filter")) {
             conf.encoderFilterPath = pathNormalize(getParam(argc, argv, i++));
@@ -355,13 +385,13 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
             conf.sarInContainerOnly = true;
         } else if (key == _T("--enc-parallel")) {
             const auto arg = getParam(argc, argv, i++);
-            int parallel = std::stoi(arg);
+            int parallel = parseIntOption(key, arg);
             if (parallel < 1) {
                 THROWF(ArgumentException, "--enc-parallelには1以上の値を指定してください");
             }
             conf.encoderParallel = parallel;
         } else if (key == _T("--min-output-duration")) {
-            conf.minOutputDuration = std::stoi(getParam(argc, argv, i++));
+            conf.minOutputDuration = parseIntOption(key, getParam(argc, argv, i++));
         } else if (key == _T("--sar")) {
             const auto arg = getParam(argc, argv, i++);
             int ret = sscanfT(arg.c_str(), _T("%d:%d"), &conf.userSAR.first, &conf.userSAR.second);
@@ -371,8 +401,8 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
         } else if (key == _T("-aet") || key == _T("--audio-encoder-type")) {
             tstring arg = getParam(argc, argv, i++);
             conf.audioEncoder = audioEncoderFtomString(arg);
-            if (conf.audioEncoder == (ENUM_AUDIO_ENCODER)-1) {
-                printTStderr(StringFormat(_T("--audio-encoder-typeの指定が間違っています: %s\n"), arg.c_str()));
+            if (conf.audioEncoder == AUDIO_ENCODER_INVALID) {
+                THROWF(ArgumentException, "--audio-encoder-typeの指定が間違っています: %" PRITSTR "", arg);
             }
         } else if (key == _T("--audio-format-change")) {
             const tstring arg = getParam(argc, argv, i++);
@@ -390,7 +420,7 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
         } else if (key == _T("-aeo") || key == _T("--audio-encoder-option")) {
             conf.audioEncoderOptions = getParam(argc, argv, i++);
         } else if (key == _T("-ab") || key == _T("--audio-bitrate")) {
-            conf.audioBitrateInKbps = std::stoi(getParam(argc, argv, i++));
+            conf.audioBitrateInKbps = parseIntOption(key, getParam(argc, argv, i++));
         } else if (key == _T("-b") || key == _T("--bitrate")) {
             const auto arg = getParam(argc, argv, i++);
             int ret = sscanfT(arg.c_str(), _T("%lf:%lf:%lf:%lf"),
@@ -414,6 +444,11 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
             if (ret == 0) {
                 THROWF(ArgumentException, "--cm-quality-offsetの指定が間違っています");
             }
+        } else if (key == _T("--cm-cut-offset")) {
+            conf.cmCutOffsetFrames = parseIntOption(key, getParam(argc, argv, i++));
+            if (conf.cmCutOffsetFrames <= 0) {
+                THROWF(ArgumentException, "--cm-cut-offsetには正のフレーム数を指定してください");
+            }
         } else if (key == _T("--2pass")) {
             conf.twoPass = true;
         } else if (key == _T("--splitsub")) {
@@ -436,7 +471,7 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
         } else if (key == _T("--tsreplace-remove-typed")) {
             conf.tsreplaceRemoveTypeD = true;
         } else if (key == _T("--tsreplace-startup-preroll")) {
-            conf.tsreplaceStartupPreroll = std::stoi(getParam(argc, argv, i++));
+            conf.tsreplaceStartupPreroll = parseIntOption(key, getParam(argc, argv, i++));
         } else if (key == _T("--mux-ts-temp")) {
             conf.muxTsTemp = true;
         } else if (key == _T("--use-mkv-when-sub-exists")) {
@@ -471,33 +506,33 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
             conf.postFilterScriptPath = pathNormalize(getParam(argc, argv, i++));
         } else if (key == _T("-s") || key == _T("--serviceid") || key == _T("--serivceid")) { // --serivceid は旧来の綴り誤りで互換のために残す
             tstring sidstr = getParam(argc, argv, i++);
-            if (sidstr.size() > 2 && sidstr.substr(0, 2) == _T("0x")) {
+            if (sidstr.size() > 2 && (sidstr.substr(0, 2) == _T("0x") || sidstr.substr(0, 2) == _T("0X"))) {
                 // 16進
-                conf.serviceId = std::stoi(sidstr.substr(2), NULL, 16);;
+                conf.serviceId = parseIntOption(key, sidstr.substr(2), 16);
             } else {
                 // 10進
-                conf.serviceId = std::stoi(sidstr);
+                conf.serviceId = parseIntOption(key, sidstr);
             }
         } else if (key == _T("--mpeg2decoder")) {
             tstring arg = getParam(argc, argv, i++);
             conf.decoderSetting.mpeg2 = decoderFromString(arg);
-            if (conf.decoderSetting.mpeg2 == (DECODER_TYPE)-1) {
-                printTStderr(StringFormat(_T("--mpeg2decoderの指定が間違っています: %s\n"), arg.c_str()));
+            if (conf.decoderSetting.mpeg2 == DECODER_INVALID) {
+                THROWF(ArgumentException, "--mpeg2decoderの指定が間違っています: %" PRITSTR "", arg);
             }
         } else if (key == _T("--h264decoder")) {
             tstring arg = getParam(argc, argv, i++);
             conf.decoderSetting.h264 = decoderFromString(arg);
-            if (conf.decoderSetting.h264 == (DECODER_TYPE)-1) {
-                printTStderr(StringFormat(_T("--h264decoderの指定が間違っています: %s\n"), arg.c_str()));
+            if (conf.decoderSetting.h264 == DECODER_INVALID) {
+                THROWF(ArgumentException, "--h264decoderの指定が間違っています: %" PRITSTR "", arg);
             }
         } else if (key == _T("--hevcdecoder")) {
             tstring arg = getParam(argc, argv, i++);
             conf.decoderSetting.hevc = decoderFromString(arg);
-            if (conf.decoderSetting.hevc == (DECODER_TYPE)-1) {
-                printTStderr(StringFormat(_T("--hevcdecoderの指定が間違っています: %s\n"), arg.c_str()));
+            if (conf.decoderSetting.hevc == DECODER_INVALID) {
+                THROWF(ArgumentException, "--hevcdecoderの指定が間違っています: %" PRITSTR "", arg);
             }
         } else if (key == _T("-eb") || key == _T("--encode-buffer")) {
-            conf.numEncodeBufferFrames = std::stoi(getParam(argc, argv, i++));
+            conf.numEncodeBufferFrames = parseIntOption(key, getParam(argc, argv, i++));
         } else if (key == _T("--ignore-no-logo")) {
             conf.ignoreNoLogo = true;
         } else if (key == _T("--ignore-no-drcsmap")) {
@@ -509,31 +544,31 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
         } else if (key == _T("--loose-logo-detection")) {
             conf.looseLogoDetection = true;
         } else if (key == _T("--max-fade-length")) {
-            conf.maxFadeLength = std::stoi(getParam(argc, argv, i++));
+            conf.maxFadeLength = parseIntOption(key, getParam(argc, argv, i++));
         } else if (key == _T("--no-delogo")) {
             conf.noDelogo = true;
         } else if (key == _T("--parallel-logo-analysis")) {
             const auto arg = getParam(argc, argv, i++);
             conf.parallelLogoAnalysis = true;
-            conf.numParallelLogoAnalysis = (arg == _T("auto")) ? 0 : std::stoi(arg);
+            conf.numParallelLogoAnalysis = (arg == _T("auto")) ? 0 : parseIntOption(key, arg);
         } else if (key == _T("--direct-logo-analysis")) {
-            conf.directLogoAnalysis = std::stoi(getParam(argc, argv, i++)) != 0;
+            conf.directLogoAnalysis = parseIntOption(key, getParam(argc, argv, i++)) != 0;
         } else if (key == _T("--auto-logo-detect")) {
-            conf.autoLogoDetect = std::stoi(getParam(argc, argv, i++));
+            conf.autoLogoDetect = parseIntOption(key, getParam(argc, argv, i++));
         } else if (key == _T("--auto-logo-detect-search-frames")) {
-            conf.autoLogoDetectSearchFrames = std::stoi(getParam(argc, argv, i++));
+            conf.autoLogoDetectSearchFrames = parseIntOption(key, getParam(argc, argv, i++));
         } else if (key == _T("--auto-logo-detect-div-x")) {
-            conf.autoLogoDetectDivX = std::stoi(getParam(argc, argv, i++));
+            conf.autoLogoDetectDivX = parseIntOption(key, getParam(argc, argv, i++));
         } else if (key == _T("--auto-logo-detect-div-y")) {
-            conf.autoLogoDetectDivY = std::stoi(getParam(argc, argv, i++));
+            conf.autoLogoDetectDivY = parseIntOption(key, getParam(argc, argv, i++));
         } else if (key == _T("--auto-logo-detect-block-size")) {
-            conf.autoLogoDetectBlockSize = std::stoi(getParam(argc, argv, i++));
+            conf.autoLogoDetectBlockSize = parseIntOption(key, getParam(argc, argv, i++));
         } else if (key == _T("--auto-logo-detect-threshold")) {
-            conf.autoLogoDetectThreshold = std::stoi(getParam(argc, argv, i++));
+            conf.autoLogoDetectThreshold = parseIntOption(key, getParam(argc, argv, i++));
         } else if (key == _T("--auto-logo-detect-margin-x")) {
-            conf.autoLogoDetectMarginX = std::stoi(getParam(argc, argv, i++));
+            conf.autoLogoDetectMarginX = parseIntOption(key, getParam(argc, argv, i++));
         } else if (key == _T("--auto-logo-detect-margin-y")) {
-            conf.autoLogoDetectMarginY = std::stoi(getParam(argc, argv, i++));
+            conf.autoLogoDetectMarginY = parseIntOption(key, getParam(argc, argv, i++));
         } else if (key == _T("--timefactor")) {
             const auto arg = getParam(argc, argv, i++);
             int ret = sscanfT(arg.c_str(), _T("%lf"), &conf.x265TimeFactor);
@@ -603,9 +638,9 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
         } else if (key == _T("--nicojklog")) {
             conf.useNicoJKLog = true;
         } else if (key == _T("-om") || key == _T("--cmoutmask")) {
-            conf.cmoutmask = std::stol(getParam(argc, argv, i++));
+            conf.cmoutmask = parseIntOption(key, getParam(argc, argv, i++));
         } else if (key == _T("--nicojkmask")) {
-            conf.nicojkmask = std::stol(getParam(argc, argv, i++));
+            conf.nicojkmask = parseIntOption(key, getParam(argc, argv, i++));
         } else if (key == _T("--dump")) {
             conf.dumpStreamInfo = true;
         } else if (key == _T("--systemavsplugin")) {
@@ -635,7 +670,7 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
                 THROWF(ArgumentException, "--affinityの指定が間違っています");
             }
         } else if (key == _T("--max-frames")) {
-            conf.maxframes = std::stoi(getParam(argc, argv, i++));
+            conf.maxframes = parseIntOption(key, getParam(argc, argv, i++));
         } else if (key == _T("--pmt-cut")) {
             const auto arg = getParam(argc, argv, i++);
             int ret = sscanfT(arg.c_str(), _T("%lf:%lf"),
@@ -804,6 +839,77 @@ static std::unique_ptr<ConfigWrapper> parseArgs(AMTContext& ctx, int argc, const
     }
 
     return std::unique_ptr<ConfigWrapper>(new ConfigWrapper(ctx, conf));
+}
+
+// ネイティブ単体テスト用: parseArgsの結果を「キー=値」の改行区切りテキストにして返す。
+// 実行ファイル位置やPATH探索に依存する既定値は含めず、引数で明示した値と固定の既定値だけを出す。
+// 作業ディレクトリはgetTmpDirが一時ディレクトリの作成を要するため含めない。
+// 成功時0、Amatsukaze例外 (引数の拒否。数値や種別の不正を含む) 時1、想定外の例外時2、
+// 引数不正時-1、出力バッファ不足時-2 (outputLengthに終端を除く必要文字数) を返す。
+extern "C" AMATSUKAZE_API int ParseCommandLineForTest(int argc, const tchar* const* argv,
+    tchar* output, size_t outputCapacity, size_t* outputLength) {
+    constexpr int RESULT_REJECTED = 1;
+    constexpr int RESULT_OTHER_EXCEPTION = 2;
+    constexpr int RESULT_INVALID = -1;
+    constexpr int RESULT_BUFFER_TOO_SMALL = -2;
+    if (argv == nullptr || argc < 1 || outputLength == nullptr) return RESULT_INVALID;
+    *outputLength = 0;
+    try {
+        AMTContext ctx;
+        const auto setting = parseArgs(ctx, argc, const_cast<const tchar**>(argv));
+        tstring text;
+        auto add = [&](const tchar* key, const tstring& value) { text += tstring(key) + _T("=") + value + _T("\n"); };
+        auto addInt = [&](const tchar* key, long long value) { add(key, StringFormat(_T("%lld"), value)); };
+        auto join = [](const std::vector<tstring>& list) {
+            tstring joined;
+            for (const auto& item : list) joined += (joined.empty() ? _T("") : _T("|")) + item;
+            return joined;
+        };
+        add(_T("mode"), setting->getMode());
+        add(_T("mode_args"), setting->getModeArgs());
+        add(_T("src"), setting->getSrcFilePath());
+        add(_T("src_original"), setting->getSrcFileOriginalPath());
+        add(_T("out_base"), setting->getOutFileBaseWithoutPrefix());
+        add(_T("json"), setting->getOutInfoJsonPath());
+        add(_T("filter"), setting->getFilterScriptPath());
+        add(_T("post_filter"), setting->getPostFilterScriptPath());
+        addInt(_T("encoder"), setting->getEncoder());
+        add(_T("encoder_path"), setting->getEncoderPath());
+        add(_T("encoder_options"), setting->getEncoderOptions());
+        addInt(_T("encoder_filter"), setting->getEncoderFilter());
+        add(_T("muxer_path"), setting->getMuxerPath());
+        add(_T("timelineeditor_path"), setting->getTimelineEditorPath());
+        add(_T("mp4box_path"), setting->getMp4BoxPath());
+        add(_T("mkvmerge_path"), setting->getMkvMergePath());
+        addInt(_T("format"), setting->getFormat());
+        addInt(_T("service_id"), setting->getServiceId());
+        addInt(_T("dump"), setting->isDumpStreamInfo());
+        addInt(_T("no_remove_tmp"), setting->isNoRemoveTmp());
+        addInt(_T("chapter"), setting->isChapterEnabled());
+        addInt(_T("subtitles"), setting->isSubtitlesEnabled());
+        addInt(_T("two_pass"), setting->isTwoPass());
+        addInt(_T("audio_format_change"), setting->getAudioFormatChangeMode());
+        addInt(_T("enc_parallel"), setting->getEncoderParallel());
+        addInt(_T("min_output_duration"), setting->getMinOutputDuration());
+        addInt(_T("cm_cut_offset_frames"), setting->getCmCutOffsetFrames());
+        addInt(_T("audio_bitrate"), setting->getAudioBitrateInKbps());
+        addInt(_T("max_frames"), setting->getMaxFrames());
+        addInt(_T("nicojk_mask"), setting->getNicoJKMask());
+        addInt(_T("print_prefix"), setting->getPrintPrefix());
+        addInt(_T("sar_x"), setting->getUserSAR().first);
+        addInt(_T("sar_y"), setting->getUserSAR().second);
+        add(_T("logo"), join(setting->getLogoPath()));
+        add(_T("erase_logo"), join(setting->getEraseLogoPath()));
+        *outputLength = text.size();
+        if (output == nullptr || outputCapacity < text.size() + 1) return RESULT_BUFFER_TOO_SMALL;
+        std::copy(text.begin(), text.end(), output);
+        output[text.size()] = 0;
+        return 0;
+    } catch (const Exception&) {
+        return RESULT_REJECTED;
+    } catch (const std::exception&) {
+        return RESULT_OTHER_EXCEPTION;
+    }
 }
 
 static std::mutex g_log_mutex;

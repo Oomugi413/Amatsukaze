@@ -78,8 +78,22 @@ enum AdtsParserForTestResult {
 extern "C" AMATSUKAZE_API int ParseAdtsPacketsForTest(const AudioPesForTest* packets, size_t packetCount,
     int* packetResults, AudioFrameInfoForTest* output, size_t outputCapacity, size_t* outputCount);
 
+// ネイティブ単体テストからデュアルモノ分離を呼び出すためのC ABI。
+// デュアルモノのADTSフレーム1つをrepeat回続けて入力し、主音声 (出力0) と副音声 (出力1) に出た
+// ADTSフレーム列をそれぞれ連結して返す。frameCount0/1にはそれぞれに出たフレーム数を返す。
+// 成功時0、引数不正または分離失敗時-1、出力バッファ不足時-2 (length0/length1に必要バイト数) を返す。
+extern "C" AMATSUKAZE_API int SplitDualMonoAdtsForTest(const uint8_t* frame, size_t frameLength, int repeat,
+    uint8_t* output0, size_t capacity0, size_t* length0, int* frameCount0,
+    uint8_t* output1, size_t capacity1, size_t* length1, int* frameCount1);
+
 struct NeAACDecFrameInfo;
 typedef void *NeAACDecHandle;
+
+// 非同期デコード中の診断は呼び出し元で順番に反映する。
+struct AudioDecodeDiagnostics {
+    std::vector<tstring> warnings;
+    int errors = 0;
+};
 
 class AdtsParser : public AMTObject {
 public:
@@ -87,10 +101,14 @@ public:
     ~AdtsParser();
 
     virtual void reset();
+    void setDiagnostics(AudioDecodeDiagnostics* diagnostics) { diagnostics_ = diagnostics; }
 
     virtual bool inputFrame(MemoryChunk frame__, std::vector<AudioFrameData>& info, int64_t PTS);
 
 private:
+    AudioDecodeDiagnostics* diagnostics_ = nullptr;
+    void warn(const tchar* message);
+    void decodeError();
     NeAACDecHandle hAacDec;
     AdtsHeader header;
     std::map<int64_t, AUDIO_CHANNELS> channelsMap;

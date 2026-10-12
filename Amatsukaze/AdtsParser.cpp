@@ -79,6 +79,16 @@ AdtsParser::AdtsParser(AMTContext&ctx)
     , decoderSamplingFrequencyIndex_(-1) {
     createChannelsMap();
 }
+void AdtsParser::warn(const tchar* message) {
+    if (diagnostics_) diagnostics_->warnings.emplace_back(message);
+    else ctx.warn(message);
+}
+
+void AdtsParser::decodeError() {
+    if (diagnostics_) ++diagnostics_->errors;
+    else ctx.incrementCounter(AMT_ERR_DECODE_AUDIO);
+}
+
 AdtsParser::~AdtsParser() {
     closeDecoder();
 }
@@ -163,8 +173,8 @@ AdtsParser::~AdtsParser() {
                     }
 
                     if (frameInfo.error != 0 || numChannels != 2) {
-                        ctx.incrementCounter(AMT_ERR_DECODE_AUDIO);
-                        ctx.warn(_T("音声フレームを正しくデコードできませんでした"));
+                        decodeError();
+                        warn(_T("音声フレームを正しくデコードできませんでした"));
                     } else {
                         decodedBuffer.add(MemoryChunk((uint8_t*)samples, frameInfo.samples * 2));
 
@@ -306,7 +316,7 @@ bool AdtsParser::resetDecoder(MemoryChunk data) {
     unsigned long samplerate;
     unsigned char channels;
     if (NeAACDecInit(hAacDec, data.data, (int)data.length, &samplerate, &channels)) {
-        ctx.warn(_T("NeAACDecInitに失敗"));
+        warn(_T("NeAACDecInitに失敗"));
         return false;
     }
     return true;
@@ -342,7 +352,8 @@ int64_t AdtsParser::channelCanonical(int numElem, const uint8_t* elems) {
         numElem = 20;
     }
     for (int i = 0; i < numElem; i++) {
-        canonical = (canonical << 3) | elems[i];
+        // 負値の左シフトは未定義動作なので、符号なしでシフトする (結果のビット列は従来と同じ)
+        canonical = (int64_t)(((uint64_t)canonical << 3) | elems[i]);
     }
     return canonical;
 }
@@ -508,4 +519,51 @@ bool DualMonoSplitter::resetDecoder(MemoryChunk data) {
         return false;
     }
     return true;
+}
+
+namespace {
+class RecordingDualMonoSplitter : public DualMonoSplitter {
+public:
+    RecordingDualMonoSplitter(AMTContext& ctx) : DualMonoSplitter(ctx) {}
+    std::vector<uint8_t> data[2];
+    int frames[2] = { 0, 0 };
+    void OnOutFrame(int index, MemoryChunk mc) override {
+        data[index].insert(data[index].end(), mc.data, mc.data + mc.length);
+        frames[index]++;
+    }
+};
+}
+
+extern "C" int SplitDualMonoAdtsForTest(const uint8_t* frame, size_t frameLength, int repeat,
+    uint8_t* output0, size_t capacity0, size_t* length0, int* frameCount0,
+    uint8_t* output1, size_t capacity1, size_t* length1, int* frameCount1) {
+    constexpr int RESULT_INVALID = -1;
+    constexpr int RESULT_BUFFER_TOO_SMALL = -2;
+    if (frame == nullptr || frameLength == 0 || repeat <= 0 || length0 == nullptr || length1 == nullptr ||
+        frameCount0 == nullptr || frameCount1 == nullptr) {
+        return RESULT_INVALID;
+    }
+    *length0 = *length1 = 0;
+    *frameCount0 = *frameCount1 = 0;
+    try {
+        AMTContext ctx;
+        RecordingDualMonoSplitter splitter(ctx);
+        std::vector<uint8_t> input(frame, frame + frameLength);
+        for (int i = 0; i < repeat; i++) {
+            splitter.inputPacket(MemoryChunk(input.data(), input.size()));
+        }
+        *length0 = splitter.data[0].size();
+        *length1 = splitter.data[1].size();
+        *frameCount0 = splitter.frames[0];
+        *frameCount1 = splitter.frames[1];
+        if ((*length0 > 0 && (output0 == nullptr || capacity0 < *length0)) ||
+            (*length1 > 0 && (output1 == nullptr || capacity1 < *length1))) {
+            return RESULT_BUFFER_TOO_SMALL;
+        }
+        std::copy(splitter.data[0].begin(), splitter.data[0].end(), output0);
+        std::copy(splitter.data[1].begin(), splitter.data[1].end(), output1);
+        return 0;
+    } catch (...) {
+        return RESULT_INVALID;
+    }
 }

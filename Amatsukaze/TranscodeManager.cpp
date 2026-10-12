@@ -896,10 +896,37 @@ AMTSplitter::AMTSplitter(AMTContext& ctx, const ConfigWrapper& setting)
     , srcFileSize_(0) {
     psWriter.setHandler(&writeHandler);
     setServiceSelectionRetryEnabled(true);
+    if (setting.getMode() == _T("cm") && GetProcessorCount() > 1) {
+        audioPipeline_.reset(new AudioPesPipeline(ctx,
+            [this](int audioIdx, int64_t clock, const std::vector<AudioFrameData>& frames, PESPacket packet) {
+                auto& format = asyncAudioFormats_[audioIdx];
+                if (frames[0].format != format) {
+                    format = frames[0].format;
+                    onAudioFormatChanged(audioIdx, format);
+                }
+                onAudioPesPacket(audioIdx, clock, frames, packet);
+            }));
+    }
+}
+
+AMTSplitter::~AMTSplitter() {
+    // 他のメンバーが破棄される前に、未反映イベントを捨ててワーカーを回収する。
+    audioPipeline_.reset();
+}
+
+void AMTSplitter::drainAudio() {
+    if (audioPipeline_) audioPipeline_->drain();
+}
+
+bool AMTSplitter::onAudioPesReady(int audioIdx, int64_t clock, PESPacket packet) {
+    if (!audioPipeline_) return false;
+    audioPipeline_->submit(audioIdx, clock, packet);
+    return true;
 }
 
 StreamReformInfo AMTSplitter::split() {
     readAll();
+    drainAudio();
 
     // for debug
     printInteraceCount();
@@ -1117,6 +1144,20 @@ void AMTSplitter::printInteraceCount() {
     int64_t clock,
     const std::vector<VideoFrameInfo>& frames,
     PESPacket packet) {
+    if (audioPipeline_ && audioPipeline_->hasPending()) {
+        auto data = std::make_shared<std::vector<uint8_t>>(packet.data, packet.data + packet.length);
+        auto ownedFrames = std::make_shared<std::vector<VideoFrameInfo>>(frames);
+        audioPipeline_->defer([this, clock, data, ownedFrames]() {
+            PESPacket ownedPacket(MemoryChunk(data->data(), data->size()));
+            ownedPacket.parse();
+            commitVideoPes(clock, *ownedFrames, ownedPacket);
+        }, data->size() + frames.size() * sizeof(VideoFrameInfo));
+        return;
+    }
+    commitVideoPes(clock, frames, packet);
+}
+
+void AMTSplitter::commitVideoPes(int64_t clock, const std::vector<VideoFrameInfo>& frames, PESPacket packet) {
     for (const VideoFrameInfo& frame : frames) {
         videoFrameList_.push_back(frame);
         videoFrameList_.back().fileOffset = writeHandler.getTotalSize();
@@ -1125,6 +1166,7 @@ void AMTSplitter::printInteraceCount() {
 }
 
 /* virtual */ void AMTSplitter::onVideoFormatChanged(VideoFormat fmt) {
+    drainAudio();
     ctx.info(_T("[映像フォーマット変更]"));
 
     StringBuilder sb;
@@ -1197,6 +1239,7 @@ void AMTSplitter::printInteraceCount() {
     int64_t clock,
     std::vector<CaptionItem>& captions,
     PESPacket packet) {
+    drainAudio();
     for (auto& caption : captions) {
         captionTextList_.emplace_back(std::move(caption));
     }
@@ -1204,6 +1247,7 @@ void AMTSplitter::printInteraceCount() {
 
 // 管理データを含め、描画用デコーダに必要な全字幕PESを保持する。
 void AMTSplitter::onRawCaptionPesPacket(int64_t PTS, MemoryChunk payload) {
+    drainAudio();
     CaptionPesItem item;
     item.PTS = PTS;
     item.data.assign(payload.data, payload.data + payload.length);
@@ -1211,6 +1255,7 @@ void AMTSplitter::onRawCaptionPesPacket(int64_t PTS, MemoryChunk payload) {
 }
 
 /* virtual */ DRCSOutInfo AMTSplitter::getDRCSOutPath(int64_t PTS, const std::string& md5) {
+    drainAudio();
     DRCSOutInfo info;
     info.elapsed = (videoFrameList_.size() > 0) ? (double)(PTS - videoFrameList_[0].PTS) : -1.0;
     info.filename = setting_.getDRCSOutPath(md5);
@@ -1220,6 +1265,7 @@ void AMTSplitter::onRawCaptionPesPacket(int64_t PTS, MemoryChunk payload) {
 // TsPacketSelectorHandler仮想関数 //
 
 /* virtual */ void AMTSplitter::onPidTableChanged(const PMTESInfo video, const std::vector<PMTESInfo>& audio, const PMTESInfo caption) {
+    drainAudio();
     // ベースクラスの処理
     TsSplitter::onPidTableChanged(video, audio, caption);
 
@@ -1235,6 +1281,7 @@ void AMTSplitter::onRawCaptionPesPacket(int64_t PTS, MemoryChunk payload) {
 }
 
 /* virtual */ void AMTSplitter::onTime(int64_t clock, JSTTime time) {
+    drainAudio();
     timeList_.push_back(std::make_pair(clock, time));
 }
 
@@ -1789,13 +1836,19 @@ void DoBadThing() {
             noDrcsMapCount, captionsParsed);
     }
 
+    int cmCutOffsetFrames = setting.getCmCutOffsetFrames();
+    if (cmCutOffsetFrames > 0 && !setting.getTrimAVSPath().empty()) {
+        ctx.info(_T("trim.avsからカット点を読み込むため、CMカット点の自動オフセットを無効にしました"));
+        cmCutOffsetFrames = 0;
+    }
+
     if (isNoEncode) {
         if (setting.isCopyTrimAVSEnabled()) {
             copyCutInfoForCMOnly(ctx, setting, reformInfo, cmanalyze, numVideoFiles);
         }
         if (setting.isOutputChapterEnabled()) {
             // CM解析のみでも、チャプター出力に使う出力キーと保持フレーム列を確定する。
-            reformInfo.genAudio(setting.getCMTypes());
+            reformInfo.genAudio(setting.getCMTypes(), cmCutOffsetFrames);
             ctx.info(_T("[チャプター生成]"));
             for (const auto& key : reformInfo.getOutFileKeys()) {
                 const auto& fileIn = reformInfo.getEncodeFile(key);
@@ -1813,7 +1866,7 @@ void DoBadThing() {
         return; // CM解析のみならここで終了
     }
 
-    auto audioDiffInfo = reformInfo.genAudio(setting.getCMTypes());
+    auto audioDiffInfo = reformInfo.genAudio(setting.getCMTypes(), cmCutOffsetFrames);
     audioDiffInfo.printAudioPtsDiff(ctx);
 
     const auto& allKeys = reformInfo.getOutFileKeys();

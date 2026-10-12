@@ -12,6 +12,26 @@
 #include "TranscodeManager.h"
 #include "LogoScan.h"
 
+// ネイティブ単体テストからコマンドライン引数の解析結果を取得するためのC ABI (定義はAmatsukazeCLI.hpp)。
+// 結果は「キー=値」の改行区切りテキスト。成功時0、引数の拒否時1、想定外の例外時2、
+// 引数不正時-1、出力バッファ不足時-2 (outputLengthに終端を除く必要文字数) を返す。
+extern "C" AMATSUKAZE_API int ParseCommandLineForTest(int argc, const tchar* const* argv,
+    tchar* output, size_t outputCapacity, size_t* outputLength);
+
+// ネイティブ単体テスト用: PsStreamWriterでMPEG-PSを書き出し、PsStreamVerifierで検証した結果を返す。
+// 各入力は1つのPESパケット (映像はstream_id 0xE0、音声は0xC0) としてペイロードから組み立てる。
+// DTSが負の場合はPTSのみのPESにする。出力の末尾にはMPEG_program_end_code (00 00 01 B9) を付ける。
+struct PsWriterInputForTest {
+    int isVideo;
+    int64_t PTS;
+    int64_t DTS;
+    const uint8_t* payload;
+    size_t payloadLength;
+};
+// 成功時0、PsStreamVerifierの拒否時1、引数不正・その他の失敗時-1、出力バッファ不足時-2 (outputLengthに必要バイト数) を返す。
+extern "C" AMATSUKAZE_API int WritePsStreamForTest(const PsWriterInputForTest* inputs, size_t inputCount,
+    uint8_t* output, size_t outputCapacity, size_t* outputLength);
+
 namespace test {
 
 int PrintCRCTable(AMTContext& ctx, const ConfigWrapper& setting);
@@ -71,3 +91,9 @@ int ResourceTest(AMTContext& ctx, const ConfigWrapper& setting);
 
 } // namespace test
 
+
+// 合成した30fps映像に実際のCMカット処理を適用し、各入力フレームの出力分割番号を返す。
+// 非保持フレームは-1。成功時0、引数不正または処理失敗時-1。
+extern "C" AMATSUKAZE_API int ApplyCMCutOffsetForTest(int frameCount,
+    const EncoderZone* zones, size_t zoneCount, const int* divisions, size_t divisionCount,
+    int cmType, int offsetFrames, int* frameDivisions, size_t outputCapacity);
