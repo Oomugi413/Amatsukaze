@@ -27,6 +27,7 @@ public:
         , fileSize_(file_.size())
         , buffers_(bufferCount)
         , currentBuffer_(NO_BUFFER)
+        , currentOffset_(0)
         , finished_(false)
         , stop_(false) {
         if (bufferSize == 0 || bufferCount < 2) {
@@ -51,12 +52,17 @@ public:
         }
     }
 
-    MemoryChunk read() {
+    MemoryChunk read(size_t maxLength) {
+        if (maxLength == 0) {
+            THROW(ArgumentException, "読み込みサイズの指定が不正です");
+        }
         std::unique_lock<std::mutex> lock(mutex_);
         if (currentBuffer_ != NO_BUFFER) {
-            freeBuffers_.push_back(currentBuffer_);
-            currentBuffer_ = NO_BUFFER;
-            canRead_.notify_one();
+            auto& current = buffers_[currentBuffer_];
+            if (currentOffset_ < current.length) {
+                return getCurrentChunk(maxLength);
+            }
+            releaseCurrentBuffer();
         }
         canConsume_.wait(lock, [this]() {
             return !readyBuffers_.empty() || finished_ || error_;
@@ -64,8 +70,8 @@ public:
         if (!readyBuffers_.empty()) {
             currentBuffer_ = readyBuffers_.front();
             readyBuffers_.pop_front();
-            auto& buffer = buffers_[currentBuffer_];
-            return MemoryChunk(buffer.data.data(), buffer.length);
+            currentOffset_ = 0;
+            return getCurrentChunk(maxLength);
         }
         if (error_) {
             std::rethrow_exception(error_);
@@ -91,6 +97,7 @@ private:
     std::deque<size_t> freeBuffers_;
     std::deque<size_t> readyBuffers_;
     size_t currentBuffer_;
+    size_t currentOffset_;
     bool finished_;
     bool stop_;
     std::exception_ptr error_;
@@ -98,6 +105,22 @@ private:
     std::condition_variable canRead_;
     std::condition_variable canConsume_;
     std::thread thread_;
+
+    MemoryChunk getCurrentChunk(size_t maxLength) {
+        auto& buffer = buffers_[currentBuffer_];
+        const size_t remaining = buffer.length - currentOffset_;
+        const size_t length = (remaining < maxLength) ? remaining : maxLength;
+        MemoryChunk chunk(buffer.data.data() + currentOffset_, length);
+        currentOffset_ += length;
+        return chunk;
+    }
+
+    void releaseCurrentBuffer() {
+        freeBuffers_.push_back(currentBuffer_);
+        currentBuffer_ = NO_BUFFER;
+        currentOffset_ = 0;
+        canRead_.notify_one();
+    }
 
     void run() {
         try {
@@ -143,7 +166,11 @@ ReadAheadFile::ReadAheadFile(const tstring& path, size_t bufferSize, size_t buff
 ReadAheadFile::~ReadAheadFile() = default;
 
 MemoryChunk ReadAheadFile::read() {
-    return impl_->read();
+    return impl_->read(static_cast<size_t>(-1));
+}
+
+MemoryChunk ReadAheadFile::read(size_t maxLength) {
+    return impl_->read(maxLength);
 }
 
 int64_t ReadAheadFile::size() const {

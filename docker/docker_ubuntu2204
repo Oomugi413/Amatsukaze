@@ -1,4 +1,4 @@
-ARG GHCR_OWNER=rigaya
+ARG GHCR_OWNER=oomugi413
 FROM ghcr.io/${GHCR_OWNER}/amatsukaze-builder:ubuntu2204
 
 ARG DEBIAN_FRONTEND=noninteractive \

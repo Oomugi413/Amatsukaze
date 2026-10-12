@@ -213,6 +213,13 @@ public:
     // 0以下で指定無効
     void setServiceId(int sid);
 
+    // 最初のPATに指定サービスがない場合、別位置での確認後までエラーを保留する
+    void setServiceSelectionRetryEnabled(bool enable);
+
+    bool needsServiceSelectionRetry() const;
+
+    void completeServiceSelectionRetry();
+
     int getActualServiceId();
 
     void inputTsData(MemoryChunk data);
@@ -295,6 +302,9 @@ protected:
     bool warnedInvalidAudioIndex;
     int preferedServiceId;
     int selectedServiceId;
+    bool serviceSelectionRetryEnabled;
+    bool serviceSelectionRetryRequested;
+    bool serviceSelectionRetryCompleted;
 
     int64_t numTotalPackets;
     int64_t numScramblePackets;

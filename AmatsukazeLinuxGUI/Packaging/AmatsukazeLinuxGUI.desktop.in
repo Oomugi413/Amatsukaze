@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Amatsukaze Linux GUI
+Name[ja]=Amatsukaze Linux GUI
+Comment=AmatsukazeServerへタスクを追加します
+Comment[ja]=AmatsukazeServerへタスクを追加します
+Exec=@EXEC@
+Icon=amatsukaze-linux-gui
+Terminal=false
+StartupNotify=true
+StartupWMClass=jp.amatsukaze.LinuxGUI
+Categories=AudioVideo;Video;
+Keywords=Amatsukaze;TS;MPEG-TS;
