@@ -46,8 +46,6 @@ namespace Amatsukaze.Server.Rest
             new IntOptionView { Value = 2, Label = "2/3倍" },
             new IntOptionView { Value = 0, Label = "等倍" }
         };
-        private const int MaxAutoPortScan = 100;
-
         private class MakeScriptGenerateRequestInternal
         {
             public MakeScriptData MakeScriptData { get; set; }
@@ -79,8 +77,7 @@ namespace Amatsukaze.Server.Rest
             {
                 return 0;
             }
-            var envPort = Environment.GetEnvironmentVariable("AMT_REST_PORT");
-            if (!string.IsNullOrEmpty(envPort) && int.TryParse(envPort, out var parsed) && parsed > 0)
+            if (TryGetExplicitRestPort(out var parsed))
             {
                 return parsed;
             }
@@ -91,16 +88,38 @@ namespace Amatsukaze.Server.Rest
             return 0;
         }
 
+        // AMT_REST_PORT が有効なとき、保存済みポートよりこちらを優先する。
+        public static bool TryGetExplicitRestPort(out int port)
+        {
+            port = 0;
+            var envPort = Environment.GetEnvironmentVariable("AMT_REST_PORT");
+            if (string.IsNullOrEmpty(envPort))
+            {
+                return false;
+            }
+            if (!int.TryParse(envPort, NumberStyles.Integer, CultureInfo.InvariantCulture, out port) || port <= 0)
+            {
+                port = 0;
+                return false;
+            }
+            return true;
+        }
+
         public RestApiHost(EncodeServer server, RestStateStore state, int port)
         {
             this.server = server;
             this.state = state;
             this.requestedPort = port;
-            this.boundPort = port;
             logoAnalyze = new LogoAnalyzeService(server, state);
             logoPreview = new LogoPreviewService(state);
             trimAdjust = new TrimAdjustService(server, state);
         }
+
+        // スタンドアロンでは true。サーバー/CLIは指定ポートで失敗したらエラーにする。
+        internal bool AutoSelectPort { get; set; }
+
+        // スタンドアロンで前回待てたポート。使えなくなったら破棄して選び直す。
+        internal int PreferredPort { get; set; }
 
         public int Port => boundPort;
 
@@ -111,119 +130,130 @@ namespace Amatsukaze.Server.Rest
                 return;
             }
 
-            var startPort = ResolveStartPort();
-            if (startPort <= 0)
+            var serverPort = server.ServerPortForRest;
+            if (AutoSelectPort)
+            {
+                // 探索の前に除外範囲を読む。サーバー/CLIは指定ポートで失敗したときだけ読む。
+                var ranges = await QueryExcludedRangesAsync().ConfigureAwait(false);
+                await StartAutoAsync(serverPort, ranges, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+            await StartExactAsync(serverPort, cancellationToken).ConfigureAwait(false);
+        }
+
+        private static async Task<IReadOnlyList<PortRange>> QueryExcludedRangesAsync()
+        {
+            return await Task.Run(() =>
+            {
+                if (!RestPortSelector.TryQueryWindowsTcp(out var queried, out var error))
+                {
+                    Util.AddLog("[REST] Windowsの除外ポート範囲を取得できませんでした。" + error, null);
+                    return (IReadOnlyList<PortRange>)Array.Empty<PortRange>();
+                }
+                return queried;
+            }).ConfigureAwait(false);
+        }
+
+        // サーバー/CLI。指定ポート以外へは動かさない。除外範囲なら候補ポートを案内して失敗する。
+        private async Task StartExactAsync(int serverPort, CancellationToken cancellationToken)
+        {
+            var error = await TryListenAsync(requestedPort, cancellationToken).ConfigureAwait(false);
+            if (error == null)
             {
                 return;
             }
+            var ranges = await QueryExcludedRangesAsync().ConfigureAwait(false);
+            var reason = RestPortSelector.ClassifyBindFailure(error);
+            var message = RestPortSelector.BuildUnavailableMessage(
+                requestedPort, serverPort, reason, ranges, RestPortSelector.ProbeTcpPort);
+            throw new IOException(message, error);
+        }
 
-            Exception lastBindError = null;
-            for (var offset = 0; offset < MaxAutoPortScan; offset++)
+        // スタンドアロン。保存ポート → 除外範囲を飛ばす → 使用中と10013は次のポート、の順で決めて待ち受ける。
+        private async Task StartAutoAsync(int serverPort, IReadOnlyList<PortRange> ranges, CancellationToken cancellationToken)
+        {
+            var preferred = TryGetExplicitRestPort(out _) ? 0 : PreferredPort;
+            var skipped = new HashSet<int>();
+            Exception lastError = null;
+            var loggedDiscard = false;
+            for (var round = 0; round < 8; round++)
             {
-                var candidatePort = startPort + offset;
-                if (candidatePort <= 0 || candidatePort > 65535)
+                var selected = RestPortSelector.FindAutoPort(
+                    requestedPort,
+                    serverPort,
+                    preferred,
+                    ranges,
+                    port => skipped.Contains(port) ? PortBindResult.InUse : RestPortSelector.ProbeTcpPort(port),
+                    out var discarded);
+                if (discarded && !loggedDiscard)
+                {
+                    loggedDiscard = true;
+                    Util.AddLog($"[REST] 保存されていたポート {PreferredPort} は使用できないため破棄し、空きポートを再探索します。", null);
+                }
+                preferred = 0;
+                if (selected <= 0)
                 {
                     break;
                 }
-                if (!IsPortAvailable(candidatePort))
+                lastError = await TryListenAsync(selected, cancellationToken).ConfigureAwait(false);
+                if (lastError == null)
                 {
-                    continue;
-                }
-
-                var app = BuildWebApp(candidatePort);
-                try
-                {
-                    host = app;
-                    await host.StartAsync(cancellationToken).ConfigureAwait(false);
-                    boundPort = candidatePort;
-                    await state.RequestInitialSync(server).ConfigureAwait(false);
-                    return;
-                }
-                catch (Exception ex) when (IsAddressInUse(ex))
-                {
-                    lastBindError = ex;
-                    try
+                    if (selected != requestedPort)
                     {
-                        if (app is IAsyncDisposable asyncDisposable)
+                        if (RestPortSelector.TryGetContainingRange(ranges, requestedPort, out var range))
                         {
-                            asyncDisposable.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                            Util.AddLog($"[REST] 開始ポート {requestedPort} は Windows の除外ポート範囲 {range.Start}-{range.End} に含まれるため、{selected} で待ち受けます。", null);
+                        }
+                        else
+                        {
+                            Util.AddLog($"[REST] 開始ポート {requestedPort} の代わりに {selected} で待ち受けます。", null);
                         }
                     }
-                    catch
-                    {
-                    }
-                    host = null;
+                    return;
                 }
+                skipped.Add(selected);
+                Util.AddLog($"[REST] ポート {selected} の待ち受けに失敗したため、次の候補を探します。", lastError);
             }
-
-            if (lastBindError != null)
-            {
-                throw new IOException($"REST APIの空きポートが見つかりませんでした。開始ポート={startPort}", lastBindError);
-            }
-            throw new IOException($"REST APIの空きポートが見つかりませんでした。開始ポート={startPort}");
+            throw new IOException($"REST APIの空きポートが見つかりませんでした。開始ポート={requestedPort}", lastError);
         }
 
-        private int ResolveStartPort()
+        // 失敗がポート競合または10013ならその例外を返す。待ち受けできたときは null。
+        private async Task<Exception> TryListenAsync(int port, CancellationToken cancellationToken)
         {
-            if (requestedPort <= 0)
-            {
-                return 0;
-            }
-            if (requestedPort > 65535)
-            {
-                return 65535;
-            }
-            return requestedPort;
-        }
-
-        private static bool IsAddressInUse(Exception ex)
-        {
-            for (var current = ex; current != null; current = current.InnerException)
-            {
-                if (current is SocketException socketEx &&
-                    socketEx.SocketErrorCode == SocketError.AddressAlreadyInUse)
-                {
-                    return true;
-                }
-                if (current.GetType().Name.IndexOf("AddressInUse", StringComparison.OrdinalIgnoreCase) >= 0)
-                {
-                    return true;
-                }
-                if (!string.IsNullOrEmpty(current.Message) &&
-                    current.Message.IndexOf("address already in use", StringComparison.OrdinalIgnoreCase) >= 0)
-                {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        private static bool IsPortAvailable(int port)
-        {
-            if (port <= 0 || port > 65535)
-            {
-                return false;
-            }
-            TcpListener listener = null;
+            var app = BuildWebApp(port);
             try
             {
-                listener = new TcpListener(IPAddress.Loopback, port);
-                listener.Start();
-                return true;
+                host = app;
+                await host.StartAsync(cancellationToken).ConfigureAwait(false);
+                boundPort = port;
+                await state.RequestInitialSync(server).ConfigureAwait(false);
+                return null;
+            }
+            catch (Exception ex) when (RestPortSelector.IsRetryableBindFailure(ex))
+            {
+                await DisposeHostQuietly(app).ConfigureAwait(false);
+                host = null;
+                return ex;
             }
             catch
             {
-                return false;
+                await DisposeHostQuietly(app).ConfigureAwait(false);
+                host = null;
+                throw;
             }
-            finally
+        }
+
+        private static async Task DisposeHostQuietly(WebApplication app)
+        {
+            try
             {
-                try
+                if (app is IAsyncDisposable asyncDisposable)
                 {
-                    listener?.Stop();
+                    await asyncDisposable.DisposeAsync().ConfigureAwait(false);
                 }
-                catch
-                {
-                }
+            }
+            catch
+            {
             }
         }
 
@@ -238,6 +268,9 @@ namespace Amatsukaze.Server.Rest
 
         private WebApplication BuildWebApp(int port)
         {
+            var accessPolicy = RestAccessPolicy.Parse(
+                Environment.GetEnvironmentVariable("AMT_REST_ADD_ALLOW"),
+                message => Util.AddLog(message, null));
             var baseDir = AppContext.BaseDirectory;
             var webRoot = Path.Combine(baseDir, "wwwroot");
             var builder = WebApplication.CreateBuilder(new WebApplicationOptions
@@ -281,7 +314,7 @@ namespace Amatsukaze.Server.Rest
                             if (uri.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase))
                                 return true;
                             if (IPAddress.TryParse(uri.Host, out var originAddress))
-                                return IsAllowedRemote(originAddress);
+                                return accessPolicy.IsAllowed(originAddress);
                             return origin.StartsWith("http://127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
                                    origin.StartsWith("https://127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
                                    origin.StartsWith("http://localhost", StringComparison.OrdinalIgnoreCase) ||
@@ -299,7 +332,7 @@ namespace Amatsukaze.Server.Rest
             app.Use(async (context, next) =>
             {
                 var remote = context.Connection.RemoteIpAddress;
-                if (remote != null && !IsAllowedRemote(remote))
+                if (remote != null && !accessPolicy.IsAllowed(remote))
                 {
                     context.Response.StatusCode = StatusCodes.Status403Forbidden;
                     return;
@@ -350,6 +383,24 @@ namespace Amatsukaze.Server.Rest
                 {
                     host = null;
                 }
+            }
+        }
+
+        internal static IResult BuildTrimAudioResult(HttpContext context, Func<byte[]> getAudioWav)
+        {
+            context.Response.Headers.CacheControl = "no-store";
+            try
+            {
+                var wav = getAudioWav();
+                return wav == null || wav.Length == 0 ? Results.NoContent()
+                    : Results.File(wav, "audio/wav", enableRangeProcessing: true);
+            }
+            catch (ArgumentException ex) { return Results.BadRequest(new { message = ex.Message }); }
+            catch (ObjectDisposedException) { return Results.NotFound(); }
+            catch (IOException ex)
+            {
+                Util.AddLog("[TrimAdjust] 音声の読み込みに失敗しました", ex);
+                return Results.Problem("音声の読み込みに失敗しました");
             }
         }
 
@@ -1933,6 +1984,17 @@ namespace Amatsukaze.Server.Rest
                 return Results.File(jpegBytes, "image/jpeg");
             });
 
+            app.MapGet("/api/trim/sessions/{sessionId}/audio", (HttpContext context, string sessionId) =>
+            {
+                if (!TrimAdjustService.AudioPlaybackEnabled) return Results.NotFound();
+                if (!int.TryParse(context.Request.Query["start"], out var start)
+                    || !int.TryParse(context.Request.Query["end"], out var end))
+                    return Results.BadRequest(new { message = "開始・終了フレームを整数で指定してください" });
+                var session = trimAdjust.GetSession(sessionId);
+                if (session == null) return Results.NotFound();
+                return BuildTrimAudioResult(context, () => session.GetAudioWav(start, end));
+            });
+
             app.MapGet("/api/trim/sessions/{sessionId}/cmseg", (HttpContext context, string sessionId) =>
             {
                 if (!CmSegAnnotationStore.IsEnabled) return Results.NotFound();
@@ -2030,49 +2092,6 @@ namespace Amatsukaze.Server.Rest
                 }
                 return Results.Ok(new { });
             });
-        }
-
-        private static bool IsAllowedRemote(IPAddress address)
-        {
-            if (IPAddress.IsLoopback(address))
-            {
-                return true;
-            }
-
-            if (address.IsIPv4MappedToIPv6)
-            {
-                address = address.MapToIPv4();
-            }
-
-            if (address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-            {
-                var bytes = address.GetAddressBytes();
-                if (bytes[0] == 10)
-                {
-                    return true;
-                }
-                if (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31)
-                {
-                    return true;
-                }
-                if (bytes[0] == 192 && bytes[1] == 168)
-                {
-                    return true;
-                }
-                return false;
-            }
-
-            if (address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6)
-            {
-                if (address.IsIPv6LinkLocal || address.IsIPv6SiteLocal)
-                {
-                    return true;
-                }
-                var bytes = address.GetAddressBytes();
-                return (bytes[0] & 0xFE) == 0xFC; // Unique local (fc00::/7)
-            }
-
-            return false;
         }
 
         private static IResult BuildMaybeGzippedJsonResult(HttpRequest request, object payload)
@@ -2202,6 +2221,7 @@ namespace Amatsukaze.Server.Rest
 
         private static bool TryBuildMakeScript(MakeScriptGenerateRequestInternal request, int serverPort, out string script, out string error)
         {
+            if (request?.MakeScriptData != null) ServerSupport.SetDefaultLaunchUserForScript(request.MakeScriptData);
             return MakeScriptBuilder.TryBuild(
                 request?.MakeScriptData,
                 request?.TargetHost,

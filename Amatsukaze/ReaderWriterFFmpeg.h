@@ -15,6 +15,7 @@
 #include <memory>
 #include <cstdint>
 
+#include "rgy_util.h"
 #include "StreamUtils.h"
 #include "ProcessThread.h"
 
@@ -24,8 +25,12 @@
 // libffmpeg
 #pragma warning(push)
 #pragma warning(disable:4819) //C4819: ファイルは、現在のコード ページ (932) で表示できない文字を含んでいます。データの損失を防ぐために、ファイルを Unicode 形式で保存してください。
+RGY_DISABLE_WARNING_PUSH
+RGY_DISABLE_WARNING_STR("-Wattributes")
 extern "C" {
+#include <libavutil/mem.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/error.h>
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #if !(defined(_WIN32) && defined(AMATSUKAZE2DLL))
@@ -37,6 +42,7 @@ extern "C" {
 #include <libavutil/opt.h>
 #endif
 }
+RGY_DISABLE_WARNING_POP
 #pragma warning(pop)
 #pragma comment(lib, "avutil.lib")
 #pragma comment(lib, "avcodec.lib")
@@ -47,6 +53,10 @@ extern "C" {
 #if ENABLE_FFMPEG_FILTER
 #pragma comment(lib, "avfilter.lib")
 #endif
+
+template<typename T, T* Talloc(), void Tunref(T*), void Tfree(T**)>
+class RGYPoolAV;
+using RGYPoolAVFrame = RGYPoolAV<AVFrame, av_frame_alloc, av_frame_unref, av_frame_free>;
 
 namespace av {
 
@@ -59,6 +69,8 @@ AVStream* GetVideoStream(AVFormatContext* ctx, int serviceid);
 class Frame {
 public:
     Frame();
+    // プールは、このフレームとコピー先のフレームより長く保持すること。
+    explicit Frame(RGYPoolAVFrame* pool);
     Frame(const Frame& src);
     ~Frame();
     AVFrame* operator()();
@@ -66,6 +78,7 @@ public:
     Frame& operator=(const Frame& src);
 private:
     AVFrame* frame_;
+    RGYPoolAVFrame* pool_;
 };
 
 class CodecContext : NonCopyable {
@@ -83,6 +96,7 @@ private:
 class InputContext : NonCopyable {
 public:
     InputContext(const tstring& src, const char* format = nullptr);
+    InputContext(const tstring& src, const char* format, uint32_t pathCodePage);
     ~InputContext();
     AVFormatContext* operator()();
 private:

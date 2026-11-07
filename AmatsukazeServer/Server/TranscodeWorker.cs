@@ -501,6 +501,7 @@ namespace Amatsukaze.Server
                     return "エンコード（テスト）";
                 case ProcMode.DrcsCheck:
                     return "DRCSチェック";
+                case ProcMode.TrimAdjust:
                 case ProcMode.CMCheck:
                     return "CM解析";
                 default:
@@ -515,7 +516,7 @@ namespace Amatsukaze.Server
             {
                 return null;
             }
-            if (mode == ProcMode.CMCheck)
+            if ((mode == ProcMode.CMCheck || mode == ProcMode.TrimAdjust))
             {
                 return enableCMLogFile ? dstPath + "-cm.log" : null;
             }
@@ -770,11 +771,11 @@ namespace Amatsukaze.Server
             {
                 if(item.IsCheck)
                 {
-                    return MakeCheckLogItem(item.Mode, false, item, item.Profile.Name, "入力ファイルが見つかりません", now, now);
+                    return MakeCheckLogItem(item.Mode, false, item, item.Profile.Name, "入力ファイルが見つかりません" + ServerSupport.GetServiceContextPathHint(item.SrcPath), now, now);
                 }
                 else
                 {
-                    return FailLogItem(item, item.Profile.Name, "入力ファイルが見つかりません", now, now);
+                    return FailLogItem(item, item.Profile.Name, "入力ファイルが見つかりません" + ServerSupport.GetServiceContextPathHint(item.SrcPath), now, now);
                 }
             }
 
@@ -843,6 +844,10 @@ namespace Amatsukaze.Server
                     .ToArray();
                 if (logofiles.Length == 0)
                 {
+                    if (item.IsCheck)
+                    {
+                        return MakeCheckLogItem(item.Mode, false, item, item.Profile.Name, "ロゴ設定がありません", now, now);
+                    }
                     return FailLogItem(item, item.Profile.Name, "ロゴ設定がありません", now, now);
                 }
                 ignoreNoLogo = !logofiles.All(path => path != LogoSetting.NO_LOGO);
@@ -1186,7 +1191,8 @@ namespace Amatsukaze.Server
                         // その他
                         return MakeCheckLogItem(item.Mode, false, item, item.Profile.Name,
                             "Amatsukaze.exeはコード" +
-                            ServerSupport.ExitCodeString(exitCode) + "で終了しました。", start, finish);
+                            ServerSupport.ExitCodeString(exitCode) + "で終了しました。" +
+                            ServerSupport.GetServiceContextPathHint(item.SrcPath, item.DstPath, workPath), start, finish);
                     }
                 }
                 else
@@ -1270,7 +1276,8 @@ namespace Amatsukaze.Server
                         // その他
                         return FailLogItem(item, item.Profile.Name,
                             "Amatsukaze.exeはコード" + 
-                            ServerSupport.ExitCodeString(exitCode) + "で終了しました。", start, finish);
+                            ServerSupport.ExitCodeString(exitCode) + "で終了しました。" +
+                            ServerSupport.GetServiceContextPathHint(item.SrcPath, item.DstPath, workPath), start, finish);
                     }
                 }
             }
@@ -1341,6 +1348,17 @@ namespace Amatsukaze.Server
             return null;
         }
 
+        // 移動先を作れなくてもエンコード処理を継続する
+        internal static void PrepareInputMoveDirectories(bool isBatch, bool disableMove, string succeededDir, string failedDir, Action<string, Exception> warn)
+        {
+            if (!isBatch || disableMove) return;
+            foreach (var dir in new[] { succeededDir, failedDir })
+            {
+                try { Directory.CreateDirectory(dir); }
+                catch (Exception e) { warn(dir, e); }
+            }
+        }
+
         public async Task<bool> RunItem(QueueItem workerItem, bool forceStart)
         {
             try
@@ -1360,11 +1378,8 @@ namespace Amatsukaze.Server
                 var succeededDir = Path.Combine(srcDir, ServerSupport.SUCCESS_DIR);
                 var failedDir = Path.Combine(srcDir, ServerSupport.FAIL_DIR);
 
-                if (item.IsBatch)
-                {
-                    Directory.CreateDirectory(succeededDir);
-                    Directory.CreateDirectory(failedDir);
-                }
+                PrepareInputMoveDirectories(item.IsBatch, item.Profile?.DisableMoveInputFile ?? true,
+                    succeededDir, failedDir, (dir, e) => Util.AddLog(Id, "入力ファイルの移動先フォルダを作成できないため、移動は行いません: " + dir, e));
 
                 if (item.IsCheck == false)
                 {
@@ -1571,9 +1586,12 @@ namespace Amatsukaze.Server
             }
             catch (Exception e)
             {
-                await server.FatalError(Id, "エンコード中にエラー", e);
+                string hint = e is IOException || e is UnauthorizedAccessException
+                    ? ServerSupport.GetServiceContextPathHint(item?.SrcPath, item?.DstPath, item?.GetEffectiveWorkPath(server.AppData_.setting)) : null;
+                await server.FatalError(Id, "エンコード中にエラー" + hint, e);
                 if(item != null)
                 {
+                    item.FailReason = e.Message + hint;
                     item.State = QueueState.Failed;
                     await server.NotifyQueueItemUpdate(item);
                     await server.RequestState(StateChangeEvent.EncodeFailed);

@@ -10,6 +10,9 @@
 #include "rgy_util.h"
 #include "rgy_thread_affinity.h"
 #include <thread>
+#include <condition_variable>
+#include <mutex>
+#include <exception>
 #include "AdtsParser.h"
 #include "PacketCache.h"
 #include "AudioTrackBuilder.h"
@@ -557,7 +560,7 @@ static bool tryLoadResume(
             reformInfo->clearCaptionItems();
         }
         reformInfo->prepare(setting.isSplitSub(), setting.isEncodeAudio(), setting.getFormat() == FORMAT_TSREPLACE,
-            setting.getAudioFormatChangeMode(), setting.getAudioFilePath());
+            setting.getAudioFormatChangeMode(), setting.getAudioFilePath(), setting.isIgnoreVideoDisplayChanges());
         ctx.info(_T("[一時ファイル再利用] ストリーム情報を読み込みました"));
         if (!validateResumeFiles(setting, *reformInfo, info, reason)) {
             ctx.warnF(_T("[一時ファイル再利用] %s。通常処理へ戻ります"), reason.c_str());
@@ -742,7 +745,8 @@ static tstring createWhisperWaveInput(AMTContext& ctx,
     }
 
     const tstring wavPath = setting.getTmpWhisperWavPath(key, entry.localIndex);
-    std::unique_ptr<FILE, decltype(&fclose)> fp(_tfopen(wavPath.c_str(), _T("wb")), &fclose);
+    auto closeFile = [](FILE* file) { fclose(file); };
+    std::unique_ptr<FILE, decltype(closeFile)> fp(_tfopen(wavPath.c_str(), _T("wb")), closeFile);
     if (!fp) {
         ctx.warnF(_T("Whisper入力wav作成: ファイルを開けません (%s)"), wavPath.c_str());
         return tstring();
@@ -833,49 +837,102 @@ class TsReadExPipe {
 
 public:
     TsReadExPipe(AMTContext& ctx, const ConfigWrapper& setting)
-        : output_(new File(setting.getTmpTsReadExDumpPath(), _T("wb")))
-        , process_()
-        , writeEnabled_(true) {
+        : output_(new File(setting.getTmpTsReadExDumpPath(), _T("wb"))) {
         ctx.info(_T("[tsreadex 解析]"));
         const tstring args = StringFormat(
             _T("\"%s\" -n -1 -r - -"), setting.getTsReadExPath().c_str());
         ctx.infoF(_T("tsreadex コマンド: %s"), args.c_str());
         process_.reset(new TraceProcess(args, output_.get()));
+        try {
+            worker_ = std::thread([this]() { run(); });
+        } catch (...) {
+            // 構築失敗時も起動済みプロセスと出力回収スレッドを先に終了する。
+            process_->join();
+            throw;
+        }
     }
 
     ~TsReadExPipe() {
-        // EventBaseSubProcess::join()は2回呼ぶとclose済みパイプを操作してしまうため、
-        // 明示的にjoin()済みの場合はここでは何もしない。
-        if (process_ && !joined_) {
-            try {
-                process_->join();
-            } catch (...) {
-            }
+        try {
+            join();
+        } catch (...) {
         }
     }
 
     void write(MemoryChunk mc) {
-        if (!writeEnabled_) {
-            return;
-        }
-        try {
-            process_->write(mc);
-        } catch (const RuntimeException&) {
-            // tsreadexが早期終了してもTS解析は最後まで継続する。
-            writeEnabled_ = false;
-        }
+        std::unique_lock<std::mutex> lock(mutex_);
+        space_.wait(lock, [this]() { return pending_ < BUFFER_COUNT || failure_; });
+        if (failure_) std::rethrow_exception(failure_);
+        // 先読み領域は次のreadで再利用されるため、上限付きリングへコピーする。
+        auto& buffer = buffers_[tail_];
+        buffer.assign(mc.data, mc.data + mc.length);
+        tail_ = (tail_ + 1) % BUFFER_COUNT;
+        pending_++;
+        lock.unlock();
+        ready_.notify_one();
     }
 
     int join() {
-        joined_ = true;
-        return process_->join();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            finished_ = true;
+        }
+        ready_.notify_one();
+        if (worker_.joinable()) worker_.join();
+        // processのjoinは一度だけ実行し、デストラクタからの再呼出しも許す。
+        if (!joined_) {
+            joined_ = true;
+            exitCode_ = process_->join();
+        }
+        if (failure_) std::rethrow_exception(failure_);
+        return exitCode_;
     }
 
 private:
+    void run() {
+        try {
+            bool writeEnabled = true;
+            while (true) {
+                std::unique_lock<std::mutex> lock(mutex_);
+                ready_.wait(lock, [this]() { return pending_ != 0 || finished_; });
+                if (pending_ == 0) return;
+                auto& buffer = buffers_[head_];
+                lock.unlock();
+                if (writeEnabled) {
+                    try {
+                        process_->write(MemoryChunk(buffer.data(), buffer.size()));
+                    } catch (const RuntimeException&) {
+                        // 早期終了時は従来どおりTS解析を継続し、joinの終了コードで判定する。
+                        writeEnabled = false;
+                    }
+                }
+                lock.lock();
+                head_ = (head_ + 1) % BUFFER_COUNT;
+                pending_--;
+                lock.unlock();
+                space_.notify_one();
+            }
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                failure_ = std::current_exception();
+            }
+            space_.notify_one();
+        }
+    }
+
+    static constexpr size_t BUFFER_COUNT = 4;
     std::unique_ptr<File> output_;
     std::unique_ptr<TraceProcess> process_;
-    bool writeEnabled_;
+    std::array<std::vector<uint8_t>, BUFFER_COUNT> buffers_;
+    std::mutex mutex_;
+    std::condition_variable ready_, space_;
+    size_t head_ = 0, tail_ = 0, pending_ = 0;
+    bool finished_ = false;
     bool joined_ = false;
+    int exitCode_ = 0;
+    std::exception_ptr failure_;
+    std::thread worker_;
 };
 
 } // namespace
@@ -898,13 +955,13 @@ AMTSplitter::AMTSplitter(AMTContext& ctx, const ConfigWrapper& setting)
     setServiceSelectionRetryEnabled(true);
     if (setting.getMode() == _T("cm") && GetProcessorCount() > 1) {
         audioPipeline_.reset(new AudioPesPipeline(ctx,
-            [this](int audioIdx, int64_t clock, const std::vector<AudioFrameData>& frames, PESPacket packet) {
+            [this](int audioIdx, int64_t clock, const std::vector<AudioFrameData>& frames, PESPacket packet, const AudioComponentInfo& component) {
                 auto& format = asyncAudioFormats_[audioIdx];
                 if (frames[0].format != format) {
                     format = frames[0].format;
                     onAudioFormatChanged(audioIdx, format);
                 }
-                onAudioPesPacket(audioIdx, clock, frames, packet);
+                onAudioPesPacket(audioIdx, clock, frames, packet, component);
             }));
     }
 }
@@ -918,9 +975,9 @@ void AMTSplitter::drainAudio() {
     if (audioPipeline_) audioPipeline_->drain();
 }
 
-bool AMTSplitter::onAudioPesReady(int audioIdx, int64_t clock, PESPacket packet) {
+bool AMTSplitter::onAudioPesReady(int audioIdx, int64_t clock, PESPacket packet, const AudioComponentInfo& component) {
     if (!audioPipeline_) return false;
-    audioPipeline_->submit(audioIdx, clock, packet);
+    audioPipeline_->submit(audioIdx, clock, packet, component);
     return true;
 }
 
@@ -1202,10 +1259,11 @@ void AMTSplitter::commitVideoPes(int64_t clock, const std::vector<VideoFrameInfo
     int audioIdx,
     int64_t clock,
     const std::vector<AudioFrameData>& frames,
-    PESPacket packet) {
+    PESPacket packet, const AudioComponentInfo& component) {
     for (const AudioFrameData& frame : frames) {
         FileAudioFrameInfo info = frame;
         info.audioIdx = audioIdx;
+        info.component = component;
         info.codedDataSize = frame.codedDataSize;
         info.waveDataSize = frame.decodedDataSize;
         info.fileOffset = audioFileSize_;
@@ -1687,7 +1745,7 @@ void DoBadThing() {
 
     if (!isReusingTmp) {
         reformInfo.prepare(setting.isSplitSub(), setting.isEncodeAudio(), setting.getFormat() == FORMAT_TSREPLACE,
-            setting.getAudioFormatChangeMode(), setting.getAudioFilePath());
+            setting.getAudioFormatChangeMode(), setting.getAudioFilePath(), setting.isIgnoreVideoDisplayChanges());
     }
     if (setting.isMpeg2PartialEnabled()) {
         if (reformInfo.getVideoStreamFormat() != VS_MPEG2) {
@@ -1733,13 +1791,21 @@ void DoBadThing() {
         auto& fmt = reformInfo.getFormat(EncodeFileKey(videoFileIndex, 0));
         auto amtsPath = setting.getTmpAMTSourcePath(videoFileIndex);
         ctx.infoF(_T("ソースファイル読み込み用データ保存[%d/%d]: %s"), videoFileIndex + 1, numVideoFiles, amtsPath.c_str());
+        const auto& filterAudioFrames = reformInfo.getFilterSourceAudioFrames(videoFileIndex);
+        const auto& sourceAudioFrames = reformInfo.getAudioFrameList();
+        std::vector<uint8_t> primaryAudioFrames;
+        primaryAudioFrames.reserve(filterAudioFrames.size());
+        for (const auto& frame : filterAudioFrames) {
+            primaryAudioFrames.push_back(frame.frameIndex >= 0
+                && sourceAudioFrames[frame.frameIndex].format.channels == AUDIO_2LANG ? 1 : 0);
+        }
         av::SaveAMTSource(amtsPath,
             setting.getIntVideoFilePath(videoFileIndex),
             setting.getWaveFilePath(),
             fmt.videoFormat, fmt.audioFormat[0],
             reformInfo.getFilterSourceFrames(videoFileIndex),
-            reformInfo.getFilterSourceAudioFrames(videoFileIndex),
-            setting.getDecoderSetting());
+            filterAudioFrames,
+            setting.getDecoderSetting(), primaryAudioFrames);
         ctx.infoF(_T("ソースファイル読み込み用データ保存完了[%d/%d]"), videoFileIndex + 1, numVideoFiles);
     }
 
@@ -1847,8 +1913,8 @@ void DoBadThing() {
             copyCutInfoForCMOnly(ctx, setting, reformInfo, cmanalyze, numVideoFiles);
         }
         if (setting.isOutputChapterEnabled()) {
-            // CM解析のみでも、チャプター出力に使う出力キーと保持フレーム列を確定する。
-            reformInfo.genAudio(setting.getCMTypes(), cmCutOffsetFrames);
+            // 入力TS用のチャプターなので、CMを含む全フレームを補正なしで保持する。
+            reformInfo.genAudio({ CMTYPE_BOTH }, 0);
             ctx.info(_T("[チャプター生成]"));
             for (const auto& key : reformInfo.getOutFileKeys()) {
                 const auto& fileIn = reformInfo.getEncodeFile(key);
@@ -1857,8 +1923,12 @@ void DoBadThing() {
                     chapterMakers[key.video]->exec(key);
                     const auto path = setting.getTmpChapterPath(key);
                     if (File::exists(path)) {
-                        const auto dstchapter = setting.getOutChapterPath(fileIn.outKey, fileIn.keyMax, setting.getFormat(), eoInfo.format);
-                        File::copy(path, dstchapter);
+                        // CM解析のみでは-o(出力先)は使わず、入力ファイル名からチャプターの出力先を組み立てる
+                        const auto dstchapter = setting.getCMOnlyChapterPath(fileIn.outKey, fileIn.keyMax);
+                        if (!rgy_file_copy(path, dstchapter, true)) {
+                            THROWF(IOException, "チャプターファイルの出力に失敗しました: %s", dstchapter.c_str());
+                        }
+                        ctx.infoF(_T("[CM解析のみ] チャプターを出力: %s"), dstchapter.c_str());
                     }
                 }
             }
@@ -2668,7 +2738,7 @@ void DrcsSearchSplitter::readAll() {
     int audioIdx,
     int64_t clock,
     const std::vector<AudioFrameData>& frames,
-    PESPacket packet) {}
+    PESPacket packet, const AudioComponentInfo& component) {}
 
 /* virtual */ void DrcsSearchSplitter::onAudioFormatChanged(int audioIdx, AudioFormat fmt) {}
 
@@ -2731,7 +2801,7 @@ bool SubtitleDetectorSplitter::getHasSubtitle() const {
     int audioIdx,
     int64_t clock,
     const std::vector<AudioFrameData>& frames,
-    PESPacket packet) {}
+    PESPacket packet, const AudioComponentInfo& component) {}
 
 /* virtual */ void SubtitleDetectorSplitter::onAudioFormatChanged(int audioIdx, AudioFormat fmt) {}
 
@@ -2790,7 +2860,7 @@ void AudioDetectorSplitter::readAll(int maxframes) {
     int audioIdx,
     int64_t clock,
     const std::vector<AudioFrameData>& frames,
-    PESPacket packet) {}
+    PESPacket packet, const AudioComponentInfo& component) {}
 
 /* virtual */ void AudioDetectorSplitter::onAudioFormatChanged(int audioIdx, AudioFormat fmt) {
     _ftprintf(stdout, _T("インデックス: %d チャンネル: %s サンプルレート: %d\n"),

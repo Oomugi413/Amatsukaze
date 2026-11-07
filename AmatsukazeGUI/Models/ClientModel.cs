@@ -38,6 +38,9 @@ namespace Amatsukaze.Models
             public string ServerIP;
             [DataMember]
             public int ServerPort;
+            // スタンドアロンで前回待てたWebUIポート。使えなくなったらサーバー側で破棄される。
+            [DataMember]
+            public int RestApiPort;
             [DataMember]
             public byte[] windowPlacement;
             [DataMember]
@@ -51,7 +54,11 @@ namespace Amatsukaze.Models
         private ClientData appData;
         public IEncodeServer Server { get; private set; }
         public Task CommTask { get; private set; }
-        private FileStream lockFile;
+        private ServerLock lockFile;
+
+        // 起動引数の接続先は保存済み設定から分離する。
+        private string temporaryServerIP;
+        private int temporaryServerPort;
         private ServerInfo serverInfo = new ServerInfo();
         private State state = new State();
 
@@ -112,12 +119,12 @@ namespace Amatsukaze.Models
 
         public string ServerIP
         {
-            get { return appData.ServerIP; }
+            get { return temporaryServerIP ?? appData.ServerIP; }
         }
 
         public int ServerPort
         {
-            get { return appData.ServerPort; }
+            get { return temporaryServerIP != null ? temporaryServerPort : appData.ServerPort; }
         }
 
         public int RestApiPort
@@ -216,6 +223,8 @@ namespace Amatsukaze.Models
                 ApplyFontSize();
             }
         }
+        public bool IsServerWindows => serverInfo.Platform == PlatformID.Win32NT.ToString();
+
         public bool IsServerLinux
         {
             get { return serverInfo.Platform == PlatformID.Unix.ToString(); }
@@ -837,6 +846,11 @@ namespace Amatsukaze.Models
             AddQueueConsole = new SimpleDisplayConsole(Setting);
 
             LoadAppData();
+            if (App.Option.LaunchType == LaunchType.Client && !string.IsNullOrEmpty(App.Option.ServerIP))
+            {
+                temporaryServerIP = App.Option.ServerIP;
+                temporaryServerPort = App.Option.ServerPort;
+            }
             ApplyTheme();
             ApplyFontSize();
             requestLogoThread = RequestLogoThread();
@@ -946,7 +960,7 @@ namespace Amatsukaze.Models
 
                     if(lockFile != null)
                     {
-                        lockFile.Close();
+                        lockFile.Dispose();
                         lockFile = null;
                     }
                 }
@@ -1153,15 +1167,36 @@ namespace Amatsukaze.Models
         {
             var serverPort = appData?.ServerPort > 0 ? appData.ServerPort : ServerSupport.DEFAULT_PORT;
             var server = new EncodeServer(serverPort, new ClientAdapter(this), null);
-            await server.Init();
-            return server;
+            server.PreferredRestPort = appData?.RestApiPort ?? 0;
+            try
+            {
+                await server.Init();
+                SaveRestPortIfChanged(server);
+                return server;
+            }
+            catch
+            {
+                server.Dispose();
+                throw;
+            }
+        }
+
+        private void SaveRestPortIfChanged(EncodeServer server)
+        {
+            var actual = server.ActualRestApiPort;
+            if (actual <= 0 || appData == null || appData.RestApiPort == actual)
+            {
+                return;
+            }
+            appData.RestApiPort = actual;
+            SaveAppData();
         }
 
         public async Task Start()
         {
             if (App.Option.LaunchType == LaunchType.Standalone)
             {
-                lockFile = ServerSupport.GetLock();
+                lockFile = ServerSupport.GetLock(ServerInstanceKind.Standalone, ServerPort);
                 Server = new ServerAdapter(await MakeEncodeServer());
                 await Server.RefreshRequest();
             }
@@ -1175,6 +1210,7 @@ namespace Amatsukaze.Models
 
         public void SetServerAddress(string serverIp, int port)
         {
+            temporaryServerIP = null;
             appData.ServerIP = serverIp;
             appData.ServerPort = port;
             if (Server is ServerConnection)
@@ -1210,7 +1246,7 @@ namespace Amatsukaze.Models
         {
             if (firstAsked)
             {
-                (Server as ServerConnection).SetServerAddress(appData.ServerIP, appData.ServerPort);
+                (Server as ServerConnection).SetServerAddress(ServerIP, ServerPort);
                 firstAsked = false;
             }
             else
@@ -1785,7 +1821,9 @@ namespace Amatsukaze.Models
                 serverInfo = data.ServerInfo;
                 RaisePropertyChanged("ServerHostName");
                 RaisePropertyChanged("ServerVersion");
+                RaisePropertyChanged(nameof(RestApiPort));
                 RaisePropertyChanged("IsServerLinux");
+                RaisePropertyChanged(nameof(IsServerWindows));
                 RaisePropertyChanged("FinishActionList");
                 RaisePropertyChanged(nameof(ServerCpuCoreCount));
                 _Setting.IsServerLinux = IsServerLinux;
@@ -2091,6 +2129,7 @@ namespace Amatsukaze.Models
                 profile.WhisperOption = data.Profile.WhisperOption;
                 profile.WhisperParallel = data.Profile.WhisperParallel;
                 profile.IgnoreNoDrcsMap = data.Profile.IgnoreNoDrcsMap;
+                profile.IgnoreVideoDisplayChanges = data.Profile.IgnoreVideoDisplayChanges;
                 profile.AudioFormatChangeMode = data.Profile.AudioFormatChangeMode;
                 profile.LooseLogoDetection = data.Profile.LooseLogoDetection;
                 profile.IgnoreNoLogo = data.Profile.IgnoreNoLogo;

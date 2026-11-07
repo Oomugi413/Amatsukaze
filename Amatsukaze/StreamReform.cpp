@@ -19,7 +19,7 @@
 namespace {
 
 constexpr uint32_t STREAM_REFORM_MAGIC = 0x49524d41;
-constexpr uint32_t STREAM_REFORM_VERSION = 2;
+constexpr uint32_t STREAM_REFORM_VERSION = 3;
 constexpr int AAC_LC_PROFILE = 1;
 constexpr int MAX_DUP_GAP_FRAMES = 5;
 constexpr double AUDIO_SYNC_MARGIN_FRAMES = 0.75;
@@ -277,8 +277,9 @@ StreamReformInfo::StreamReformInfo(
 // 1. コンストラクト直後に呼ぶ
 // splitSub: メイン以外のフォーマットを結合しない
 void StreamReformInfo::prepare(bool splitSub, bool isEncodeAudio, bool isTsreplace,
-    AUDIO_FORMAT_CHANGE_MODE audioMode, const tstring& audioPath) {
+    AUDIO_FORMAT_CHANGE_MODE audioMode, const tstring& audioPath, bool ignoreVideoDisplayChanges) {
     const auto prepareStart = std::chrono::steady_clock::now();
+    ignoreVideoDisplayChanges_ = ignoreVideoDisplayChanges;
     audioMode_ = isEncodeAudio || isTsreplace ? AFC_SPLIT : audioMode;
     const bool measureAudioCheck = audioMode_ != AFC_SPLIT;
     double audioCheckSeconds = 0;
@@ -766,7 +767,7 @@ void StreamReformInfo::reformMain(bool splitSub) {
     double curMin = INFINITY;
     double curMax = 0;
     dataPTS_.resize(videoFrameList_.size());
-    for (int i = (int)videoFrameList_.size() - 1; i >= 0; --i) {
+    for (int i = (int)videoFrameList_.size() - 1; i >= 0; i--) {
         curMin = std::min(curMin, modifiedPTS_[i]);
         curMax = std::max(curMax, modifiedPTS_[i]);
         dataPTS_[i] = curMin;
@@ -776,7 +777,7 @@ void StreamReformInfo::reformMain(bool splitSub) {
     // 言語ごとに終了時刻を管理する
     captionDuration_.resize(captionItemList_.size());
     std::vector<double> curEnd;
-    for (int i = (int)captionItemList_.size() - 1; i >= 0; --i) {
+    for (int i = (int)captionItemList_.size() - 1; i >= 0; i--) {
         double modPTS = modifiedCaptionPTS_[i] + (captionItemList_[i].waitTime * (MPEG_CLOCK_HZ / 1000));
         int langIndex = captionItemList_[i].langIndex;
         // 負値(未設定・破損キャッシュ等)は0として扱う (下位境界の防御)
@@ -986,6 +987,35 @@ void StreamReformInfo::reformMain(bool splitSub) {
         frameFormatId_[i] = sectionFileList[frameSectionId[i]];
     }
 
+    if (ignoreVideoDisplayChanges_) {
+        // 結合する入力フレームを表示領域とSARの組み合わせごとに数える。
+        // 同数なら先に現れた組み合わせを採用する。CMカット前の入力全体で決める。
+        using DisplayInfo = std::array<int, 4>;
+        std::vector<std::vector<std::pair<DisplayInfo, int>>> counts(format_.size());
+        for (int i = 0; i < int(videoFrameList_.size()); i++) {
+            const auto& src = videoFrameList_[i].format;
+            const DisplayInfo display = { src.displayWidth, src.displayHeight, src.sarWidth, src.sarHeight };
+            auto& list = counts[fileFormatId_[frameFormatId_[i]]];
+            auto found = std::find_if(list.begin(), list.end(), [&](const auto& item) {
+                return item.first == display;
+            });
+            if (found == list.end()) list.push_back({ display, 1 });
+            else ++found->second;
+        }
+        for (int i = 0; i < int(format_.size()); i++) {
+            const auto& list = counts[i];
+            if (list.empty()) continue;
+            const auto& display = std::max_element(list.begin(), list.end(), [](const auto& a, const auto& b) {
+                return a.second < b.second;
+            })->first;
+            auto& dst = format_[i].videoFormat;
+            dst.displayWidth = display[0];
+            dst.displayHeight = display[1];
+            dst.sarWidth = display[2];
+            dst.sarHeight = display[3];
+        }
+    }
+
     // フィルタ用入力フレームリスト生成
     ctx.info(_T("フィルタ用入力フレームリスト生成"));
     filterFrameList_ = std::vector<std::vector<FilterSourceFrame>>(numVideoFile_);
@@ -1151,17 +1181,17 @@ void StreamReformInfo::calcSizeAndTime(const std::vector<CMType>& cmtypes, int c
         }
         int tail = (int)frameList.size();
         while (tail > head && frameList[tail - 1].cmType == CMTYPE_CM) {
-            --tail;
+            tail--;
         }
         const int numFrames = (int)frameList.size();
         // CMに隣接する境界だけを内側へ移動し、ソース先頭と末尾は保持する。
         int firstMainEnd = head;
         while (firstMainEnd < tail && frameList[firstMainEnd].cmType == CMTYPE_NONCM) {
-            ++firstMainEnd;
+            firstMainEnd++;
         }
         int lastMainStart = tail;
         while (lastMainStart > head && frameList[lastMainStart - 1].cmType == CMTYPE_NONCM) {
-            --lastMainStart;
+            lastMainStart--;
         }
         // 短い前後本編が消失しても、内部CMへ補正を広げない。
         if (head > 0) {
@@ -1176,12 +1206,12 @@ void StreamReformInfo::calcSizeAndTime(const std::vector<CMType>& cmtypes, int c
         keepFrames.assign(numFrames, false);
         for (int start = 0; start < numFrames;) {
             if (frameList[start].cmType != CMTYPE_NONCM) {
-                ++start;
+                start++;
                 continue;
             }
             int end = start + 1;
             while (end < numFrames && frameList[end].cmType == CMTYPE_NONCM) {
-                ++end;
+                end++;
             }
             int keepStart = start;
             int keepEnd = end;
@@ -1309,7 +1339,15 @@ void StreamReformInfo::registerOrGetFormat(OutVideoFormat& format) {
 }
 
 bool StreamReformInfo::isEquealFormat(const OutVideoFormat& a, const OutVideoFormat& b) {
-    if (a.videoFormat != b.videoFormat) return false;
+    auto videoFormat = b.videoFormat;
+    if (ignoreVideoDisplayChanges_) {
+        // 表示領域とSARだけを比較から除外する。採用する値は結合後のフレーム数で決める。
+        videoFormat.displayWidth = a.videoFormat.displayWidth;
+        videoFormat.displayHeight = a.videoFormat.displayHeight;
+        videoFormat.sarWidth = a.videoFormat.sarWidth;
+        videoFormat.sarHeight = a.videoFormat.sarHeight;
+    }
+    if (a.videoFormat != videoFormat) return false;
     if (isEncodeAudio_ || isTsreplace_ || audioMode_ != AFC_SPLIT) return true;
     if (a.audioFormat.size() != b.audioFormat.size()) return false;
     for (int i = 0; i < (int)a.audioFormat.size(); i++) {

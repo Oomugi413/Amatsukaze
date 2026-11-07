@@ -53,3 +53,100 @@ if host_machine.system() == 'linux'
     timeout : 60,
   )
 endif
+
+preview_color_tests = executable('PreviewColorTests',
+  'PreviewColorTests.cpp',
+  '../../Amatsukaze/PreviewColor.cpp',
+  objects : preview_color_avx2_objects,
+  dependencies : common_dep,
+  install : false,
+)
+test('PreviewColorTests', preview_color_tests,
+  suite : 'native',
+  timeout : 30,
+)
+
+trim_adjust_audio_tests = executable('TrimAdjustAudioTests',
+  'TrimAdjustAudioTests.cpp',
+  install : false,
+)
+test('TrimAdjustAudioTests', trim_adjust_audio_tests,
+  suite : 'native',
+  timeout : 30,
+)
+
+logo_gop_decoder_tests = executable('LogoGopDecoderTests',
+  'LogoGopDecoderTests.cpp',
+  dependencies : ffmpeg_dep + [dependency('threads')],
+  install : false,
+)
+test('LogoGopDecoderTests', logo_gop_decoder_tests,
+  suite : 'native',
+  timeout : 60,
+)
+
+av_frame_pool_tests = executable('AVFramePoolTests',
+  'AVFramePoolTests.cpp',
+  dependencies : ffmpeg_dep + [common_dep, dependency('threads')],
+  install : false,
+)
+test('AVFramePoolTests', av_frame_pool_tests,
+  suite : 'native',
+  timeout : 30,
+)
+
+logo_decode_fallback_tests = executable('LogoDecodeFallbackTests',
+  'LogoDecodeFallbackTests.cpp',
+  dependencies : [amatsukaze_dep] + amatsukaze_deps,
+  cpp_args : host_machine.system() == 'windows' ? ['-DAMATSUKAZE_IMPORTS'] : [],
+  install : false,
+)
+test('LogoDecodeFallbackTests', logo_decode_fallback_tests,
+  suite : 'native',
+  timeout : 120,
+)
+
+# ロゴ枠検出の左側弱輪郭救済の判定方針 (ヘッダーのみの純粋関数) を単体で確認する。
+logo_scan_weak_side_rescue_policy_tests = executable('LogoScanWeakSideRescuePolicyTests',
+  'LogoScanWeakSideRescuePolicyTests.cpp',
+  include_directories : include_directories('../../Amatsukaze'),
+  install : false,
+)
+test('LogoScanWeakSideRescuePolicyTests', logo_scan_weak_side_rescue_policy_tests,
+  suite : 'native',
+  timeout : 30,
+)
+
+# ロゴ生成の品質判定 (no_logo) の境界を確認する。
+logo_scan_quality_tests = executable('LogoScanQualityTests',
+  'LogoScanQualityTests.cpp',
+  include_directories : [include_directories('../../Amatsukaze'), amatsukaze_include_dirs],
+  dependencies : amatsukaze_deps,
+  install : false,
+)
+test('LogoScanQualityTests', logo_scan_quality_tests,
+  suite : 'native',
+  timeout : 30,
+)
+
+# 行単位のロゴ枠統合と細線除去の純粋関数を確認する。
+logo_scan_row_group_policy_tests = executable('LogoScanRowGroupPolicyTests',
+  'LogoScanRowGroupPolicyTests.cpp',
+  include_directories : include_directories('../../Amatsukaze'),
+  install : false,
+)
+test('LogoScanRowGroupPolicyTests', logo_scan_row_group_policy_tests,
+  suite : 'native',
+  timeout : 30,
+)
+
+# 縁の出現率から塊を選ぶフォールバックの純粋関数を確認する。
+logo_scan_edge_area_policy_tests = executable('LogoScanEdgeAreaPolicyTests',
+  'LogoScanEdgeAreaPolicyTests.cpp',
+  include_directories : include_directories('../../Amatsukaze'),
+  install : false,
+)
+test('LogoScanEdgeAreaPolicyTests', logo_scan_edge_area_policy_tests,
+  suite : 'native',
+  timeout : 30,
+)

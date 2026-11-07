@@ -26,6 +26,7 @@ struct AudioPesPipeline::Impl {
     struct Job {
         int audioIdx;
         int64_t clock;
+        AudioComponentInfo component;
         std::vector<uint8_t> packet;
         std::promise<Result> result;
     };
@@ -108,7 +109,7 @@ struct AudioPesPipeline::Impl {
         }
     }
     void commit(const Job& job, Result& result) {
-        for (int i = 0; i < result.diagnostics.errors; ++i) ctx.incrementCounter(AMT_ERR_DECODE_AUDIO);
+        for (int i = 0; i < result.diagnostics.errors; i++) ctx.incrementCounter(AMT_ERR_DECODE_AUDIO);
         for (const auto& warning : result.diagnostics.warnings) ctx.warn(warning);
         if (result.frames.empty()) return;
         std::vector<AudioFrameData> frames;
@@ -120,7 +121,7 @@ struct AudioPesPipeline::Impl {
         }
         PESPacket packet(MemoryChunk(const_cast<uint8_t*>(job.packet.data()), job.packet.size()));
         packet.parse();
-        callback(job.audioIdx, job.clock, frames, packet);
+        callback(job.audioIdx, job.clock, frames, packet, job.component);
     }
     void pop() {
         auto event = std::move(events.front());
@@ -140,7 +141,7 @@ AudioPesPipeline::AudioPesPipeline(AMTContext& ctx, Callback callback, bool asyn
     : impl_(new Impl(ctx, std::move(callback), asynchronous)) {}
 AudioPesPipeline::~AudioPesPipeline() = default;
 
-void AudioPesPipeline::submit(int audioIdx, int64_t clock, PESPacket packet) {
+void AudioPesPipeline::submit(int audioIdx, int64_t clock, PESPacket packet, const AudioComponentInfo& component) {
     if (clock == -1) {
         drain();
         impl_->ctx.error(_T("Audio PES Packet にクロック情報がありません"));
@@ -155,6 +156,7 @@ void AudioPesPipeline::submit(int audioIdx, int64_t clock, PESPacket packet) {
     auto job = std::make_shared<Impl::Job>();
     job->audioIdx = audioIdx;
     job->clock = clock;
+    job->component = component;
     job->packet.assign(packet.data, packet.data + packet.length);
     if (!impl_->asynchronous) {
         auto result = impl_->decode(*job);
@@ -206,7 +208,7 @@ std::vector<uint8_t> MakePipelineTestPes(const std::vector<uint8_t>& payload, in
 
 extern "C" AMATSUKAZE_API int VerifyAudioPesPipelineForTest(const AudioPesForTest* packets, size_t packetCount) {
     if (packets == nullptr || packetCount == 0) return -5;
-    for (size_t i = 0; i < packetCount; ++i) {
+    for (size_t i = 0; i < packetCount; i++) {
         if (packets[i].data == nullptr || packets[i].length == 0) return -5;
     }
     try {
@@ -215,7 +217,12 @@ extern "C" AMATSUKAZE_API int VerifyAudioPesPipelineForTest(const AudioPesForTes
             ctx.setTimePrefix(false);
             std::vector<int64_t> metadata;
             std::vector<uint8_t> bytes;
-            AudioPesPipeline pipeline(ctx, [&](int index, int64_t clock, const std::vector<AudioFrameData>& frames, PESPacket packet) {
+            AudioPesPipeline pipeline(ctx, [&](int index, int64_t clock, const std::vector<AudioFrameData>& frames, PESPacket packet, const AudioComponentInfo& component) {
+                const int sequence = static_cast<int>(clock / 270000);
+                if (!component.valid || component.language != sequence + 1
+                    || component.mainComponent != ((sequence % 2) == 0)) {
+                    throw std::runtime_error("音声コンポーネント情報の保持結果が一致しません");
+                }
                 metadata.insert(metadata.end(), { index, clock, packet.PTS, (int64_t)frames.size() });
                 for (const auto& frame : frames) {
                     metadata.insert(metadata.end(), { frame.PTS, frame.numSamples, frame.format.channels,
@@ -226,13 +233,18 @@ extern "C" AMATSUKAZE_API int VerifyAudioPesPipelineForTest(const AudioPesForTes
                 }
             }, asynchronous);
             // 入力を直後に上書きし、複数トラック・PES跨ぎ・形式変更・多数イベントを混在させる。
-            for (int i = 0; i < 180; ++i) {
+            for (int i = 0; i < 180; i++) {
                 const auto& input = packets[i % packetCount];
                 std::vector<uint8_t> payload(input.data, input.data + input.length);
                 auto data = MakePipelineTestPes(payload, input.PTS + i * 4000);
                 PESPacket packet(MemoryChunk(data.data(), data.size()));
                 packet.parse();
-                pipeline.submit((i / 5) % 2, i * 270000, packet);
+                AudioComponentInfo component;
+                component.valid = true;
+                component.language = i + 1;
+                component.mainComponent = (i % 2) == 0;
+                pipeline.submit((i / 5) % 2, i * 270000, packet, component);
+                component = {}; // 呼出元が更新してもジョブ内の情報を維持する
                 std::fill(data.begin(), data.end(), 0);
                 const int marker = i;
                 pipeline.defer([&, marker]() { metadata.insert(metadata.end(), { -2, marker }); }, 1024);
@@ -249,17 +261,17 @@ extern "C" AMATSUKAZE_API int VerifyAudioPesPipelineForTest(const AudioPesForTes
         PESPacket packet(MemoryChunk(data.data(), data.size()));
         packet.parse();
         {
-            AudioPesPipeline pipeline(ctx, [&](int, int64_t, const std::vector<AudioFrameData>&, PESPacket) { ++committed; });
+            AudioPesPipeline pipeline(ctx, [&](int, int64_t, const std::vector<AudioFrameData>&, PESPacket, const AudioComponentInfo&) { committed++; });
             pipeline.submit(0, 0, packet);
-            pipeline.defer([&]() { ++committed; });
+            pipeline.defer([&]() { committed++; });
         }
         if (committed != 0) return -2;
         try {
-            AudioPesPipeline pipeline(ctx, [&](int, int64_t, const std::vector<AudioFrameData>&, PESPacket) {
+            AudioPesPipeline pipeline(ctx, [&](int, int64_t, const std::vector<AudioFrameData>&, PESPacket, const AudioComponentInfo&) {
                 throw std::runtime_error("反映時の例外");
             });
-            for (int i = 0; i < 4; ++i) pipeline.submit(0, 0, packet);
-            pipeline.defer([&]() { ++committed; });
+            for (int i = 0; i < 4; i++) pipeline.submit(0, 0, packet);
+            pipeline.defer([&]() { committed++; });
             pipeline.drain();
             return -3;
         } catch (const std::runtime_error&) {
@@ -729,11 +741,14 @@ TsSplitter::SpVideoFrameParser::SpVideoFrameParser(AMTContext&ctx, TsSplitter& t
 }
 TsSplitter::SpAudioFrameParser::SpAudioFrameParser(AMTContext&ctx, TsSplitter& this_, int audioIdx)
     : AudioFrameParser(ctx), this_(this_), audioIdx(audioIdx) {}
+void TsSplitter::SpAudioFrameParser::onPesPacketStarted() {
+    component = this_.tsPacketSelector.getAudioComponentInfo(audioIdx);
+}
 /* virtual */ void TsSplitter::SpAudioFrameParser::onPesPacket(int64_t clock, PESPacket packet) {
-    if (!this_.onAudioPesReady(audioIdx, clock, packet)) AudioFrameParser::onPesPacket(clock, packet);
+    if (!this_.onAudioPesReady(audioIdx, clock, packet, component)) AudioFrameParser::onPesPacket(clock, packet);
 }
 /* virtual */ void TsSplitter::SpAudioFrameParser::onAudioPesPacket(int64_t clock, const std::vector<AudioFrameData>& frames, PESPacket packet) {
-    this_.onAudioPesPacket(audioIdx, clock, frames, packet);
+    this_.onAudioPesPacket(audioIdx, clock, frames, packet, component);
 }
 
 /* virtual */ void TsSplitter::SpAudioFrameParser::onAudioFormatChanged(AudioFormat fmt) {

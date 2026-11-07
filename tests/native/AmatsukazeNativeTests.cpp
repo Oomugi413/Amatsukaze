@@ -1,6 +1,10 @@
 ﻿// Amatsukaze の公開ネイティブ単体テスト実行器
 #include "AMTLogo.h"
 #include "LogoScan.h"
+#include "LogoScanPartition.h"
+#include "LogoResidualWeight.h"
+#include "LogoRoiCache.h"
+#include "LogoTemporalHistogram.h"
 #include "AdtsParser.h"
 #include "AmatsukazeTestImpl.h"
 #include "AudioTrackBuilder.h"
@@ -11,7 +15,12 @@
 #include "EncoderOptionParser.h"
 #include "FilteredSource.h"
 #include "Mpeg2TsParser.h"
+#include "Muxer.h"
 #include "StreamReform.h"
+#include "cpu_info.h"
+#if !(defined(_WIN32) || defined(_WIN64))
+#include <sched.h>
+#endif
 #include "StreamUtils.h"
 #include "TsInfo.h"
 #include "TsSplitter.h"
@@ -30,6 +39,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -2984,6 +2994,181 @@ bool TestTsSelector(tstring& diagnostic) {
     return ExpectTsEvents(events, expected, _T("ゴミ付き分割入力"), diagnostic);
 }
 
+// EITの現在番組に音声コンポーネント記述子を埋め込み、CRCを付ける。
+std::vector<uint8_t> MakeAudioEit(int serviceId, int tsid, int version,
+    const std::vector<uint8_t>& descriptors, int sectionNumber = 0, int tableId = 0x4E) {
+    std::vector<uint8_t> body = {
+        (uint8_t)(tsid >> 8), (uint8_t)tsid, 0x00, 0x01, 0x01, 0x4E,
+        0x00, 0x01,                           // event_id
+        0xEF, 0x86, 0x12, 0x00, 0x00,         // start_time
+        0x01, 0x00, 0x00,                     // duration
+        (uint8_t)(0x80 | (descriptors.size() >> 8)), (uint8_t)descriptors.size(),
+    };
+    body.insert(body.end(), descriptors.begin(), descriptors.end());
+    auto section = MakeLongSection(tableId, serviceId, version, body);
+    section[6] = (uint8_t)sectionNumber;
+    section[7] = 1;
+    const CRC32 crc;
+    write32(section.data() + section.size() - 4, crc.calc(section.data(), (int)section.size() - 4, 0xFFFFFFFFu));
+    return section;
+}
+
+std::vector<uint8_t> AudioComponent(int tag, bool main, bool dual, const char* language, const char* language2 = nullptr) {
+    std::vector<uint8_t> descriptor = {
+        0xC4, (uint8_t)(language2 ? 12 : 9), 0xF2, (uint8_t)(dual ? 0x02 : 0x03), (uint8_t)tag,
+        0x0F, 0xFF, (uint8_t)(0x0F | (main ? 0x40 : 0) | (language2 ? 0x80 : 0)),
+        (uint8_t)language[0], (uint8_t)language[1], (uint8_t)language[2],
+    };
+    if (language2) descriptor.insert(descriptor.end(), language2, language2 + 3);
+    return descriptor;
+}
+
+bool TestTsAudioComponent(tstring& diagnostic) {
+    constexpr int TSID = 0x7FE0;
+    constexpr int SID = 0x0400;
+    constexpr int OTHER_SID = 0x0401;
+    constexpr int PMT_PID = 0x01F0;
+    constexpr int VIDEO_PID = 0x0111;
+    constexpr int AUDIO_MAIN_PID = 0x0112;
+    constexpr int AUDIO_SUB_PID = 0x0113;
+    constexpr int EIT_PID = 0x0012;
+    constexpr int LANGUAGE_JPN = 0x6A706E;
+    constexpr int LANGUAGE_ENG = 0x656E67;
+    constexpr int FLAG_VALID = 1;
+    constexpr int FLAG_MAIN = 2;
+    constexpr int FLAG_DUAL = 4;
+    constexpr int FLAG_MULTI = 8;
+    const std::vector<uint8_t> payload(16, 0xAB);
+    const auto descriptors = Concat({ AudioComponent(0x10, true, false, "jpn"), AudioComponent(0x11, false, false, "eng") });
+    const std::vector<PmtStream> streams = {
+        { 0x02, VIDEO_PID, StreamIdentifier(0x00) },
+        { 0x0F, AUDIO_SUB_PID, StreamIdentifier(0x11) },
+        { 0x0F, AUDIO_MAIN_PID, StreamIdentifier(0x10) },
+    };
+    TsStreamBuilder ts;
+    std::vector<TsSelectorEventForTest> expected;
+    std::map<int, int> counters;
+    auto audio = [&](int pid, int index, int flags, int language, int language2 = 0) {
+        expected.push_back(TsEvent(TS_SELECTOR_EVENT_AUDIO_PACKET, pid, index, ts.packetCount(),
+            { 1, counters[pid]++ & 0xF, flags, language, language2 }));
+        ts.addPayload(pid, payload);
+    };
+    ts.addSection(0x0000, MakePat(TSID, { { SID, PMT_PID }, { OTHER_SID, PMT_PID + 1 } }));
+    // PMTより前にEITが来ても、後からcomponent_tagで音声に対応付ける。
+    ts.addSection(EIT_PID, MakeAudioEit(SID, TSID, 0, descriptors));
+    ts.addSection(PMT_PID, MakePmt(SID, 0, VIDEO_PID, streams));
+    ts.addPayload(VIDEO_PID, payload);
+    audio(AUDIO_SUB_PID, 0, FLAG_VALID, LANGUAGE_ENG);
+    audio(AUDIO_MAIN_PID, 1, FLAG_VALID | FLAG_MAIN, LANGUAGE_JPN);
+
+    const auto conflicting = AudioComponent(0x10, false, false, "eng");
+    // 別サービス、別TS、次番組、自TS以外のEITでは現在の対応付けを上書きしない。
+    ts.addSection(EIT_PID, MakeAudioEit(OTHER_SID, TSID, 1, conflicting));
+    audio(AUDIO_MAIN_PID, 1, FLAG_VALID | FLAG_MAIN, LANGUAGE_JPN);
+    ts.addSection(EIT_PID, MakeAudioEit(SID, TSID + 1, 1, conflicting));
+    audio(AUDIO_MAIN_PID, 1, FLAG_VALID | FLAG_MAIN, LANGUAGE_JPN);
+    ts.addSection(EIT_PID, MakeAudioEit(SID, TSID, 1, conflicting, 1));
+    audio(AUDIO_MAIN_PID, 1, FLAG_VALID | FLAG_MAIN, LANGUAGE_JPN);
+    ts.addSection(EIT_PID, MakeAudioEit(SID, TSID, 1, conflicting, 0, 0x4F));
+    audio(AUDIO_MAIN_PID, 1, FLAG_VALID | FLAG_MAIN, LANGUAGE_JPN);
+
+    // 現在番組の更新は直後の音声へ反映し、二か国語の両言語と主音声フラグを保持する。
+    const auto dual = AudioComponent(0x10, true, true, "jpn", "eng");
+    ts.addSection(EIT_PID, MakeAudioEit(SID, TSID, 2, dual));
+    audio(AUDIO_MAIN_PID, 1, FLAG_VALID | FLAG_MAIN | FLAG_DUAL | FLAG_MULTI, LANGUAGE_JPN, LANGUAGE_ENG);
+    audio(AUDIO_SUB_PID, 0, 0, 0);
+    // PMTの順序が変わっても、インデックスではなくタグで最新情報を選ぶ。
+    ts.addSection(PMT_PID, MakePmt(SID, 1, VIDEO_PID, { streams[0], streams[2], streams[1] }));
+    audio(AUDIO_MAIN_PID, 0, FLAG_VALID | FLAG_MAIN | FLAG_DUAL | FLAG_MULTI, LANGUAGE_JPN, LANGUAGE_ENG);
+    audio(AUDIO_SUB_PID, 1, 0, 0);
+
+    // 最小長不足と、第2言語フラグに対して長さ不足の記述子を採用しない。
+    auto shortDescriptor = AudioComponent(0x10, true, false, "jpn");
+    shortDescriptor.resize(shortDescriptor.size() - 1);
+    shortDescriptor[1]--;
+    auto shortMultilingual = dual;
+    shortMultilingual.resize(shortMultilingual.size() - 3);
+    shortMultilingual[1] -= 3;
+    ts.addSection(EIT_PID, MakeAudioEit(SID, TSID, 3, Concat({ shortDescriptor, shortMultilingual })));
+    audio(AUDIO_MAIN_PID, 0, 0, 0);
+    // 不正な更新の後でも正常な記述子を取得できる。
+    ts.addSection(EIT_PID, MakeAudioEit(SID, TSID, 4, descriptors));
+    audio(AUDIO_MAIN_PID, 0, FLAG_VALID | FLAG_MAIN, LANGUAGE_JPN);
+    audio(AUDIO_SUB_PID, 1, FLAG_VALID, LANGUAGE_ENG);
+    for (int i = 0; i < 8; i++) ts.addPayload(0x1FFF, std::vector<uint8_t>(TS_PAYLOAD_SIZE, 0xFF));
+
+    for (const size_t chunkSize : { ts.bytes.size(), size_t(97) }) {
+        std::vector<TsSelectorEventForTest> events;
+        if (!ParseTs(ts.bytes, chunkSize, 0, events, diagnostic)) return false;
+        events.erase(std::remove_if(events.begin(), events.end(), [](const TsSelectorEventForTest& event) {
+            return event.type != TS_SELECTOR_EVENT_AUDIO_PACKET;
+        }), events.end());
+        if (!ExpectTsEvents(events, expected, _T("音声コンポーネントの対応付け"), diagnostic)) return false;
+    }
+    return true;
+}
+
+bool TestAudioTrackMetadata(tstring& diagnostic) {
+    constexpr int LANGUAGE_JPN = 0x6A706E;
+    constexpr int LANGUAGE_ENG = 0x656E67;
+    const AudioComponentInfo japanese = { true, true, false, false, LANGUAGE_JPN, 0 };
+    const AudioComponentInfo english = { true, false, false, false, LANGUAGE_ENG, 0 };
+    const AudioComponentInfo bilingual = { true, true, true, true, LANGUAGE_JPN, LANGUAGE_ENG };
+    const AudioComponentInfo reversed = { true, false, true, true, LANGUAGE_ENG, LANGUAGE_JPN };
+    const AudioComponentInfo sameLanguage = { true, true, true, false, LANGUAGE_JPN, 0 };
+    const AudioComponentInfo explicitSameLanguage = { true, true, true, true, LANGUAGE_JPN, LANGUAGE_JPN };
+    const AudioComponentInfo invalidLanguage = { true, true, false, false, 0x4A504E, 0 };
+    const AudioComponentInfo unsafeLanguage = { true, true, false, false, 0x22613A, 0 };
+    const AudioComponentInfo unknownLanguage = { true, true, false, false, 0x716161, 0 };
+    const AudioComponentInfo invalidSecond = { true, true, true, true, LANGUAGE_JPN, 0 };
+    const AudioComponentInfo invalidFirst = { true, true, true, true, 0, LANGUAGE_ENG };
+    const AudioComponentInfo invalidBoth = { true, true, true, true, 0, 0 };
+    struct Case {
+        const TCHAR* label;
+        std::vector<AudioComponentInfo> components;
+        int logical;
+        const TCHAR* name;
+        const char* language;
+    };
+    const Case cases[] = {
+        { _T("情報なし"), {}, 0, _T(""), "" },
+        { _T("無効情報"), { {} }, 0, _T(""), "" },
+        { _T("主音声"), { japanese }, 0, _T("主音声（日本語）"), "jpn" },
+        { _T("副音声"), { english }, 0, _T("副音声（英語）"), "eng" },
+        { _T("本編の多数派"), { english, japanese, japanese }, 0, _T("主音声（日本語）"), "jpn" },
+        { _T("後半の多数派"), { japanese, english, english }, 0, _T("副音声（英語）"), "eng" },
+        { _T("無効情報を除外"), { {}, {}, {}, japanese }, 0, _T("主音声（日本語）"), "jpn" },
+        { _T("二か国語の第1音声"), { bilingual }, 0, _T("主音声（日本語）"), "jpn" },
+        { _T("二か国語の第2音声"), { bilingual }, 1, _T("副音声（英語）"), "eng" },
+        { _T("第1音声が副音声"), { reversed }, 0, _T("副音声（英語）"), "eng" },
+        { _T("第2音声が主音声"), { reversed }, 1, _T("主音声（日本語）"), "jpn" },
+        { _T("二か国語を混合"), { bilingual }, -1, _T("二重音声（日本語／英語）"), "mul" },
+        { _T("同一言語の第2音声"), { sameLanguage }, 1, _T("副音声（日本語）"), "jpn" },
+        { _T("同一言語を混合"), { sameLanguage }, -1, _T("二重音声（日本語）"), "jpn" },
+        { _T("同一言語を明示"), { explicitSameLanguage }, -1, _T("二重音声（日本語）"), "jpn" },
+        { _T("大文字コードを拒否"), { invalidLanguage }, 0, _T("主音声"), "" },
+        { _T("引数区切り文字を拒否"), { unsafeLanguage }, 0, _T("主音声"), "" },
+        { _T("未登録言語"), { unknownLanguage }, 0, _T("主音声（qaa）"), "qaa" },
+        { _T("不正な第2言語を選択"), { invalidSecond }, 1, _T("副音声"), "" },
+        { _T("不正な第2言語を混合"), { invalidSecond }, -1, _T("二重音声（日本語／言語不明）"), "mul" },
+        { _T("不正な第1言語を混合"), { invalidFirst }, -1, _T("二重音声（言語不明／英語）"), "mul" },
+        { _T("両言語不正を混合"), { invalidBoth }, -1, _T("二重音声（言語不明）"), "" },
+    };
+    for (const auto& testCase : cases) {
+        char name[256] = {};
+        char language[16] = {};
+        const int status = GetAudioTrackMetadataForTest(testCase.components.data(), testCase.components.size(), testCase.logical,
+            name, sizeof(name), language, sizeof(language));
+        const auto expectedName = tchar_to_string(testCase.name, CP_UTF8);
+        if (status != 0 || expectedName != name || std::string(testCase.language) != language) {
+            diagnostic = strsprintf(_T("音声名の生成: %s: 結果=%d, 名前=%s, 言語=%s"), testCase.label, status,
+                char_to_tstring(name, CP_UTF8).c_str(), char_to_tstring(language, CP_UTF8).c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
 bool DecodeArib(const std::vector<uint8_t>& data, std::wstring& decoded) {
     size_t length = 0;
     int status = DecodeAribStringForTest(data.data(), data.size(), nullptr, 0, &length);
@@ -3058,6 +3243,7 @@ struct LogoHeaderStorage {
 };
 
 // 少数・多数のマスク、暗部・明部、飽和、正負の相関を旧走査とbit単位で比較する。
+// 8座標バッチの境界と端数、符号付きゼロも含める。
 bool TestLogoCorrelationFusion(tstring& diagnostic) {
     constexpr int width = 48, height = 40, scaleCount = 32;
     std::vector<std::pair<int, int>> coordinates;
@@ -3076,7 +3262,7 @@ bool TestLogoCorrelationFusion(tstring& diagnostic) {
         scale.scale2 = (random() % 1001) / 1000.0f;
     }
     for (float maxv : { 255.0f, 1023.0f }) {
-        for (int pattern = 0; pattern < 7; pattern++) {
+        for (int pattern = 0; pattern < 8; pattern++) {
             for (size_t i = 0; i < work.size(); i++) {
                 switch (pattern) {
                 case 0: work[i] = 0.0f; break;
@@ -3085,10 +3271,12 @@ bool TestLogoCorrelationFusion(tstring& diagnostic) {
                 case 3: work[i] = maxv * 1.1f; break;
                 case 4: work[i] = (i & 1) ? maxv : 0.0f; break;
                 case 5: work[i] = (random() % 1001) * (maxv / 1000.0f); break;
-                default: work[i] = ((int)(random() % 1401) - 200) * (maxv / 1000.0f); break;
+                case 6: work[i] = ((int)(random() % 1401) - 200) * (maxv / 1000.0f); break;
+                default: work[i] = -0.0f; break;
                 }
             }
-            for (size_t count : { size_t(0), size_t(1), size_t(7), size_t(31), coordinates.size() }) {
+            for (size_t count : { size_t(0), size_t(1), size_t(7), size_t(8), size_t(9), size_t(15),
+                size_t(16), size_t(17), size_t(31), size_t(32), size_t(33), coordinates.size() }) {
                 float reference = 0, fused = 0;
                 if (!CompareLogoCorrelationForTest(kernels.data(), work.data(), width, coordinates.data(),
                     count, scales.data(), scaleCount, maxv, &reference, &fused)) return true;
@@ -3096,6 +3284,561 @@ bool TestLogoCorrelationFusion(tstring& diagnostic) {
                     diagnostic = strsprintf(_T("相関走査bit不一致: maxv=%.0f, pattern=%d, count=%d, 旧=%.9g, 新=%.9g"),
                         maxv, pattern, (int)count, reference, fused);
                     return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// 共有ヘッダを使わずに記述した従来式と、画素固定パラメータをbit単位で照合する。
+bool TestLogoResidualWeightParams(tstring& diagnostic) {
+    const auto referenceTrust = [](double consistency) {
+        return std::max(0.0, std::min(1.0, (consistency - 0.20) / 1.20));
+    };
+    const auto referenceSigma = [](double stdDiff, double trust) {
+        const double sigmaBase = std::max(6.0 / 255.0, stdDiff);
+        const double sigmaShrink = 1.0 + 1.65 * trust;
+        return std::max(4.0 / 255.0, sigmaBase / sigmaShrink);
+    };
+    const auto sameBits = [](double a, double b) { return std::memcmp(&a, &b, sizeof(double)) == 0; };
+    const auto verify = [&](double consistency, double stdDiff) {
+        const double trust = referenceTrust(consistency);
+        const bool enabled = trust > 1e-4;
+        const auto prepared = logo::PrepareLogoResidualWeight(consistency, stdDiff);
+        if (!sameBits(logo::CalcResidualReweightTrust(consistency), trust) || prepared.enabled != enabled ||
+            !sameBits(prepared.sigma, enabled ? referenceSigma(stdDiff, trust) : 1.0)) {
+            diagnostic = _T("残差重みの有効判定またはsigmaのbit不一致");
+            return false;
+        }
+        return true;
+    };
+    const double inf = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const auto around = [&](double value) {
+        return std::vector<double>({ std::nextafter(value, -inf), value, std::nextafter(value, inf) });
+    };
+    std::vector<double> consistencies = { -inf, -std::numeric_limits<double>::max(), -1.0, -0.0, 0.0,
+        std::numeric_limits<double>::denorm_min(), 1.0, std::numeric_limits<double>::max(), inf, nan, -nan };
+    for (double threshold : { 0.20, 0.20 + 1.20 * 1e-4, 1.40 }) {
+        const auto values = around(threshold);
+        consistencies.insert(consistencies.end(), values.begin(), values.end());
+    }
+    std::vector<double> stdDiffs = { -inf, -std::numeric_limits<double>::max(), -1.0, -0.0, 0.0,
+        std::numeric_limits<double>::denorm_min(), 0.1, 1.0, std::numeric_limits<double>::max(), inf, nan, -nan };
+    for (double threshold : { 4.0 / 255.0, 6.0 / 255.0, (4.0 / 255.0) * 2.65 }) {
+        const auto values = around(threshold);
+        stdDiffs.insert(stdDiffs.end(), values.begin(), values.end());
+    }
+    for (double consistency : consistencies) {
+        for (double stdDiff : stdDiffs) if (!verify(consistency, stdDiff)) return false;
+    }
+    // NaN・無限大を含む信頼度を直接渡した場合も、従来のmaxの引数順を保つ。
+    for (double trust : { -inf, -1.0, -0.0, 0.0, 1e-4, 1.0, inf, nan }) {
+        for (double stdDiff : stdDiffs) {
+            if (!Expect(sameBits(logo::CalcResidualReweightSigma(stdDiff, trust), referenceSigma(stdDiff, trust)),
+                _T("残差重みsigmaの特殊値が従来式と一致しない"), diagnostic)) return false;
+        }
+    }
+    if (!Expect(logo::PrepareLogoResidualWeight(nan, 0.1).enabled &&
+        logo::PrepareLogoResidualWeight(inf, 0.1).enabled && !logo::PrepareLogoResidualWeight(-inf, 0.1).enabled,
+        _T("NaNまたは無限大で従来のtrust閾値判定を維持できない"), diagnostic)) return false;
+    uint64_t state = 0x6a09e667f3bcc909ULL;
+    const auto randomBits = [&]() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        return state;
+    };
+    for (int i = 0; i < 20000; i++) {
+        // 生の浮動小数点bit列と、実入力に近い有限値を交互に調べる。
+        double consistency, stdDiff;
+        const uint64_t consistencyBits = randomBits(), stdDiffBits = randomBits();
+        if ((i & 1) == 0) {
+            std::memcpy(&consistency, &consistencyBits, sizeof(double));
+            std::memcpy(&stdDiff, &stdDiffBits, sizeof(double));
+        } else {
+            consistency = static_cast<double>(consistencyBits % 2000001) / 1000000.0 - 0.25;
+            stdDiff = static_cast<double>(stdDiffBits % 1000001) / 1000000.0;
+        }
+        if (!verify(consistency, stdDiff)) return false;
+    }
+    return true;
+}
+
+// 省略条件をサンプルごとの従来式と照合し、非加重統計への復帰がbit一致することを確認する。
+bool TestLogoResidualSkip(tstring& diagnostic) {
+    for (bool valid : { false, true }) {
+        for (bool gaussian : { false, true }) {
+            for (bool lowBg : { false, true }) {
+                logo::LogoResidualWeightParams params;
+                params.enabled = gaussian;
+                params.sigma = 0.05;
+                const bool needed = logo::NeedsLogoResidualReweight(valid, params, lowBg);
+                double rawF = 0.0, rawB = 0.0, weightedF = 0.0, weightedB = 0.0, sumWeight = 0.0;
+                bool changedWeight = false;
+                int count = 0;
+                for (int fg = 0; fg < 256; fg += 7) {
+                    for (int bg = 0; bg < 256; bg += 11) {
+                        const double f = fg * (1.0f / 255.0f), b = bg * (1.0f / 255.0f);
+                        double weight = 1.0;
+                        if (valid) {
+                            const double residual = b - (0.75 * f + 0.03);
+                            if (gaussian) {
+                                const double normalized = residual / params.sigma;
+                                weight = std::max(1e-4, std::exp(-0.5 * normalized * normalized));
+                            }
+                            if (lowBg) {
+                                const double gain = std::max(0.0, std::min(1.0, (0.25 - b) / 0.12));
+                                const double side = std::max(0.0, std::min(1.0, (residual + 0.005) / 0.045));
+                                weight = std::min(weight, std::max(0.05, 1.0 - 1.35 * gain * side));
+                            }
+                            weight = std::max(1e-4, weight);
+                        }
+                        changedWeight |= weight != 1.0;
+                        if (!needed && weight != 1.0) {
+                            diagnostic = _T("重みが変化するサンプルを再走査から除外した");
+                            return false;
+                        }
+                        rawF += f; rawB += b;
+                        weightedF += weight * f; weightedB += weight * b;
+                        sumWeight += weight; count++;
+                    }
+                }
+                if (needed && !changedWeight) {
+                    diagnostic = _T("補正が必要な組合せを検査できていない");
+                    return false;
+                }
+                if (!needed && (sumWeight != count || std::memcmp(&rawF, &weightedF, sizeof(double))
+                    || std::memcmp(&rawB, &weightedB, sizeof(double)))) {
+                    diagnostic = _T("省略画素の加重和と保持した非加重和がbit一致しない");
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// SIMD部分は従来のFMA、端数と境界は従来のスカラー演算を独立に再現する。
+bool TestLogoBilateral(tstring& diagnostic) {
+    if (!HasLogoBackgroundAVX2ForTest()) {
+        _ftprintf(stdout, _T("AVX2非対応のためBilateral比較を省略\n"));
+        return true;
+    }
+    std::mt19937 random(1025);
+    for (int width : { 1, 2, 3, 4, 5, 11, 12, 13, 19, 20, 21, 27, 28, 29, 31, 32, 33, 84, 287, 288, 289 }) {
+        for (int height : { 1, 2, 3, 5, 16, 37 }) {
+            const int pitch = width + 7;
+            std::vector<uint8_t> input(pitch * height + 1), actual(width * height + 32), expected(actual.size());
+            float spatial[25], range[256];
+            for (int k = 0; k < 25; k++) {
+                spatial[k] = std::exp(-float((k / 5 - 2) * (k / 5 - 2) + (k % 5 - 2) * (k % 5 - 2)) / 8.0f);
+            }
+            for (int pattern = 0; pattern < 6; pattern++) {
+                for (auto& pixel : input) pixel = pattern == 0 ? 0 : pattern == 1 ? 255 : random() & 255;
+                const float sigma = 0.8f + pattern;
+                for (int i = 0; i < 256; i++) range[i] = std::exp(-float(i * i) / (2.0f * sigma * sigma));
+                for (int y0 = 0; y0 < height; y0 += std::max(1, height / 3)) {
+                    const int y1 = std::min(height, y0 + std::max(1, height / 2));
+                    std::fill(actual.begin(), actual.end(), 0xA5);
+                    std::fill(expected.begin(), expected.end(), 0xA5);
+                    if (!ApplyLogoBilateralAVX2ForTest(actual.data() + 16, input.data() + 1, pitch,
+                        width, height, spatial, range, y0, y1)) {
+                        diagnostic = _T("BilateralのSIMD実行に失敗した");
+                        return false;
+                    }
+                    const int vectorEnd = 2 + std::max(0, width - 4) / 8 * 8;
+                    for (int y = y0; y < y1; y++) {
+                        for (int x = 0; x < width; x++) {
+                            const int center = input[1 + y * pitch + x];
+                            float sumW = 0.0f, sumV = 0.0f;
+                            int k = 0;
+                            const bool vectorPixel = x >= 2 && x < vectorEnd;
+                            for (int dy = -2; dy <= 2; dy++) {
+                                const int sy = (std::clamp)(y + dy, 0, height - 1);
+                                for (int dx = -2; dx <= 2; dx++, k++) {
+                                    const int sx = (std::clamp)(x + dx, 0, width - 1);
+                                    const int value = input[1 + sy * pitch + sx];
+                                    const float weight = spatial[k] * range[std::abs(value - center)];
+                                    sumW += weight;
+                                    if (vectorPixel) sumV = std::fma(weight, (float)value, sumV);
+                                    else { const float product = weight * value; sumV += product; }
+                                }
+                            }
+                            const float value = vectorPixel || sumW > 1e-8f ? sumV / sumW : (float)center;
+                            expected[16 + y * width + x] = (uint8_t)(std::clamp)((int)(value + 0.5f), 0, 255);
+                        }
+                    }
+                    if (actual != expected) {
+                        diagnostic = strsprintf(_T("Bilateralの参照または番兵が不一致: 幅=%d 高さ=%d 模様=%d 行=%d..%d"), width, height, pattern, y0, y1);
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// 行ピッチと番兵を含めて従来の整数式を独立に評価し、変換結果を全バイト比較する。
+bool TestLogoRoiCacheCopy(tstring& diagnostic) {
+    const auto verify = [&](auto pixel, int bitDepth, int width, int height, int padding, bool reverse = false) {
+        using Pixel = decltype(pixel);
+        const int rowPitch = width + padding;
+        const int pitch = reverse ? -rowPitch : rowPitch;
+        std::vector<Pixel> source((size_t)rowPitch * height + 3);
+        for (size_t i = 0; i < source.size(); i++) source[i] = (Pixel)i;
+        std::vector<uint8_t> expected((size_t)width * height + 32, 0xA5), actual(expected);
+        const Pixel* src = source.data() + 1 + (reverse && height > 0 ? (size_t)(height - 1) * rowPitch : 0);
+        const uint64_t maxv = std::max<uint64_t>(1, (uint64_t(1) << bitDepth) - 1);
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                const uint64_t value = src[(std::ptrdiff_t)y * pitch + x];
+                const uint64_t scaled = (value * 255 + maxv / 2) / maxv;
+                expected[16 + (size_t)y * width + x] = (uint8_t)std::min<uint64_t>(255, scaled);
+            }
+        }
+        logo::CopyLogoRoiToCache(actual.data() + 16, src, pitch, width, height, bitDepth);
+        if (actual != expected) {
+            diagnostic = strsprintf(_T("ROI保存の変換または番兵が不一致: 型=%d bit=%d 幅=%d 高さ=%d 余白=%d"),
+                (int)sizeof(Pixel), bitDepth, width, height, padding);
+            return false;
+        }
+        return true;
+    };
+    for (int width : { 0, 1, 7, 16, 31, 32, 33, 84, 256, 288, 289 }) {
+        for (int height : { 0, 1, 3, 17 }) {
+            for (int padding : { 0, 3, 31 }) {
+                for (int bitDepth : { 7, 8 }) {
+                    if (!verify(uint8_t(0), bitDepth, width, height, padding)
+                        || !verify(uint8_t(0), bitDepth, width, height, padding, true)) return false;
+                }
+                for (int bitDepth : { 8, 9, 10, 12, 16 }) {
+                    if (!verify(uint16_t(0), bitDepth, width, height, padding)
+                        || !verify(uint16_t(0), bitDepth, width, height, padding, true)) return false;
+                }
+            }
+        }
+    }
+    // 8bit全256値と、16bit型の全65536値を各変換深度で検査する。
+    if (!verify(uint8_t(0), 8, 256, 1, 0)) return false;
+    for (int bitDepth : { 8, 9, 10, 12, 16 }) {
+        if (!verify(uint16_t(0), bitDepth, 256, 256, 0)) return false;
+    }
+    return true;
+}
+
+// 元画像の行ピッチを保った直接参照と、従来の16bit中間バッファ経由が完全一致することを確認する。
+bool TestLogoDirectLumaDeint(tstring& diagnostic) {
+    const auto verify = [&](auto pixel, int bitDepth, int width, int height, int padding, bool reverse) {
+        using Pixel = decltype(pixel);
+        constexpr int srcX = 3, srcY = 2, guard = 16;
+        constexpr float sentinel = -1234.5f;
+        const int rowPitch = srcX + width + padding;
+        const int rows = srcY + height + 2;
+        const int pitch = reverse ? -rowPitch : rowPitch;
+        const int maxv = (1 << bitDepth) - 1;
+        std::vector<Pixel> source((size_t)rowPitch * rows + 1);
+        uint32_t state = 0x9e3779b9;
+        for (auto& value : source) {
+            state = state * 1664525u + 1013904223u;
+            value = (Pixel)((state >> 8) & maxv);
+        }
+        const Pixel* frame = source.data() + 1 + (reverse ? (size_t)(rows - 1) * rowPitch : 0);
+        const Pixel* src = frame + srcY * pitch + srcX;
+        std::vector<uint16_t> staged((size_t)width * height);
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                staged[(size_t)y * width + x] = src[(std::ptrdiff_t)y * pitch + x];
+            }
+        }
+        std::vector<float> expected((size_t)width * height + guard * 2, sentinel), actual(expected);
+        logo::DeintY(expected.data() + guard, staged.data(), width, width, height);
+        logo::DeintY(actual.data() + guard, src, pitch, width, height);
+        if (actual != expected) {
+            diagnostic = strsprintf(_T("直接輝度のインタレ解除または番兵が不一致: bit=%d 幅=%d 高さ=%d 余白=%d 逆順=%d"),
+                bitDepth, width, height, padding, (int)reverse);
+            return false;
+        }
+        return true;
+    };
+    for (int width : { 1, 2, 7, 16, 31, 32, 33, 127, 288 }) {
+        for (int height : { 1, 2, 3, 17, 64 }) {
+            for (int padding : { 0, 3, 31 }) {
+                for (bool reverse : { false, true }) {
+                    if (!verify(uint8_t(0), 8, width, height, padding, reverse)) return false;
+                    for (int bitDepth : { 10, 12 }) {
+                        if (!verify(uint16_t(0), bitDepth, width, height, padding, reverse)) return false;
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool TestLogoTemporalHistogram(tstring& diagnostic) {
+    if (!Expect(logo::LogoTemporalHistogramIndex(1, 19, 0) == 1
+        && logo::LogoTemporalHistogramIndex(0, 19, 1) == 16
+        && logo::LogoTemporalHistogramIndex(15, 19, 255) == 4095
+        && logo::LogoTemporalHistogramIndex(16, 19, 0) == 4096
+        && logo::LogoTemporalHistogramIndex(16, 19, 1) == 4099
+        && logo::LogoTemporalHistogramIndex(18, 19, 255) == 4863,
+        _T("時間ヒストグラムの16laneと末尾3laneの配置が不正"), diagnostic)) return false;
+    uint64_t state = 0xbb67ae8584caa73bULL;
+    const auto randomBits = [&]() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        return state;
+    };
+    for (int width : { 0, 1, 16, 31, 32, 33, 37, 49, 65 }) {
+        for (int height : { 0, 1, 31, 32, 33, 37, 49 }) {
+            for (int margin : { 0, 1, 16 }) {
+                const int innerWidth = std::max(0, width - margin * 2);
+                const int innerHeight = std::max(0, height - margin * 2);
+                const size_t pixels = static_cast<size_t>(innerWidth) * innerHeight;
+                std::vector<uint16_t> reference(static_cast<size_t>(width) * height * 256, 0);
+                std::vector<uint16_t> blocked(pixels * 256, 0);
+                const auto visited = std::make_unique<uint8_t[]>(blocked.size());
+                // 参照側は座標走査から連番を作り、共有ヘルパーの式を使わない。
+                int nextInner = 0;
+                for (int off = -1; off <= width * height; off++) {
+                    const int x = width > 0 && off >= 0 ? off % width : -1;
+                    const int y = width > 0 && off >= 0 ? off / width : -1;
+                    const bool inside = x >= margin && x < width - margin
+                        && y >= margin && y < height - margin;
+                    const int expected = inside ? nextInner++ : -1;
+                    const int actual = logo::LogoTemporalInnerPixelIndex(width, height, margin, off);
+                    const int actualXY = logo::LogoTemporalInnerPixelIndex(width, height, margin, x, y);
+                    if (!Expect(actual == expected && actualXY == expected,
+                        _T("時間ヒストグラムの画素番号または座標からの内側連番が不一致"), diagnostic)) return false;
+                    if (!inside) continue;
+                    for (int bin = 0; bin < 256; bin++) {
+                        const size_t index = logo::LogoTemporalHistogramIndex(actual, pixels, bin);
+                        if (!Expect(index < blocked.size() && visited[index] == 0,
+                            _T("時間ヒストグラムの添字が範囲外または重複"), diagnostic)) return false;
+                        visited[index] = 1;
+                        // 空の画素も残し、P5の未観測時の処理を検証する。
+                        const uint16_t count = off % 5 == 0 ? 0 : static_cast<uint16_t>((off * 17 + bin * 13) % 9);
+                        reference[static_cast<size_t>(off) * 256 + bin] = count;
+                        blocked[index] = count;
+                    }
+                }
+                if (!Expect(static_cast<size_t>(nextInner) == pixels
+                    && std::all_of(visited.get(), visited.get() + blocked.size(), [](uint8_t value) { return value == 1; }),
+                    _T("時間ヒストグラムの確保領域に未使用部分がある"), diagnostic)) return false;
+                if (pixels == 0) continue;
+                // 両レイアウトへ独立に飽和加算する。末尾ブロックも乱数更新の対象に含める。
+                for (int sample = 0; sample < 2048; sample++) {
+                    const int off = static_cast<int>(randomBits() % (static_cast<size_t>(width) * height));
+                    const int bin = static_cast<int>(randomBits() % 256);
+                    const int x = off % width, y = off / width;
+                    if (x < margin || x >= width - margin || y < margin || y >= height - margin) continue;
+                    auto& oldCount = reference[static_cast<size_t>(off) * 256 + bin];
+                    if (oldCount < std::numeric_limits<uint16_t>::max()) oldCount++;
+                    const int pixel = logo::LogoTemporalInnerPixelIndex(width, height, margin, off);
+                    auto& newCount = blocked[logo::LogoTemporalHistogramIndex(pixel, pixels, bin)];
+                    newCount = static_cast<uint16_t>(std::min<unsigned>(65535, unsigned(newCount) + 1));
+                }
+                // 内側25画素の末尾9laneで、65535を越える入力を与える。
+                if (width == 37 && height == 37 && margin == 16) {
+                    const int off = (height - margin - 1) * width + width - margin - 1;
+                    const int pixel = logo::LogoTemporalInnerPixelIndex(width, height, margin, off);
+                    for (int sample = 0; sample < 70000; sample++) {
+                        auto& oldCount = reference[static_cast<size_t>(off) * 256 + 255];
+                        if (oldCount < std::numeric_limits<uint16_t>::max()) oldCount++;
+                        auto& newCount = blocked[logo::LogoTemporalHistogramIndex(pixel, pixels, 255)];
+                        newCount = static_cast<uint16_t>(std::min<unsigned>(65535, unsigned(newCount) + 1));
+                    }
+                    if (!Expect(blocked[logo::LogoTemporalHistogramIndex(pixel, pixels, 255)] == 65535,
+                        _T("時間ヒストグラムのuint16飽和加算が不正"), diagnostic)) return false;
+                }
+                for (int y = margin; y < height - margin; y++) {
+                    for (int x = margin; x < width - margin; x++) {
+                        const int off = y * width + x;
+                        const int pixel = logo::LogoTemporalInnerPixelIndex(width, height, margin, off);
+                        int oldTotal = 0, newTotal = 0;
+                        for (int bin = 0; bin < 256; bin++) {
+                            const uint16_t oldCount = reference[static_cast<size_t>(off) * 256 + bin];
+                            const uint16_t newCount = blocked[logo::LogoTemporalHistogramIndex(pixel, pixels, bin)];
+                            if (!Expect(oldCount == newCount, _T("時間ヒストグラムの全bin比較が不一致"), diagnostic)) return false;
+                            oldTotal += oldCount;
+                            newTotal += newCount;
+                        }
+                        // 旧P5は累積加算、新P5は残り順位を減算し、演算実装を共有しない。
+                        float oldP5 = 0.0f, newP5 = 0.0f;
+                        if (oldTotal > 0) {
+                            const int target = std::max(1, static_cast<int>(std::ceil(oldTotal * 0.05f)));
+                            int accum = 0;
+                            for (int bin = 0; bin < 256; bin++) {
+                                accum += reference[static_cast<size_t>(off) * 256 + bin];
+                                if (accum >= target) { oldP5 = bin / 255.0f; break; }
+                            }
+                        }
+                        if (newTotal > 0) {
+                            int remaining = std::max(1, static_cast<int>(std::ceil(newTotal * 0.05f)));
+                            for (int bin = 0; bin < 256; bin++) {
+                                remaining -= blocked[logo::LogoTemporalHistogramIndex(pixel, pixels, bin)];
+                                if (remaining <= 0) { newP5 = static_cast<float>(bin) / 255; break; }
+                            }
+                        }
+                        if (!Expect(std::memcmp(&oldP5, &newP5, sizeof(float)) == 0,
+                            _T("時間ヒストグラムのP5がbit不一致"), diagnostic)) return false;
+                    }
+                }
+            }
+        }
+    }
+    if (!Expect(logo::LogoTemporalInnerPixelIndex(37, 37, -1, 0) == -1
+        && logo::LogoTemporalInnerPixelIndex(37, 37, -1, 0, 0) == -1
+        && logo::LogoTemporalInnerPixelIndex(37, 37, 0, 37, 0) == -1
+        && logo::LogoTemporalInnerPixelIndex(37, 37, 0, 0, 37) == -1
+        && logo::LogoTemporalInnerPixelIndex(37, 37, 0, 0, -1) == -1,
+        _T("時間ヒストグラムの不正な余白または領域外の座標を受理した"), diagnostic)) return false;
+    return true;
+}
+
+bool TestLogoCollectPartition(tstring& diagnostic) {
+    if (!Expect(logo::BuildLogoCollectXBoundaries(288, 16, 32, 2, true) == std::vector<int>({ 16, 128, 272 }),
+        _T("実素材相当の32画素境界が一致しない"), diagnostic)) return false;
+    if (!Expect(logo::BuildLogoCollectXBoundaries(37, 16, 32, 5, true) == std::vector<int>({ 16, 17, 18, 19, 20, 21 }),
+        _T("狭い区間の非整列境界を維持できない"), diagnostic)) return false;
+    if (!Expect(logo::BuildLogoCollectXBoundaries(16, 16, 32, 1, true) == std::vector<int>({ 16, 16 }),
+        _T("空のROI境界が一致しない"), diagnostic)) return false;
+    // 乗算はintの範囲を超えても、返す境界は元の幅に収まる。
+    const auto large = logo::BuildLogoCollectXBoundaries(std::numeric_limits<int>::max(), 16, 32, 3, false);
+    if (!Expect(large[2] == 16 + static_cast<int>((int64_t(std::numeric_limits<int>::max()) - 32) * 2 / 3),
+        _T("大きい幅の分割で整数オーバーフロー"), diagnostic)) return false;
+    for (int width : { 0, 1, 16, 31, 32, 33, 37, 63, 64, 65, 95, 96, 127, 128, 129, 288, 480, 1024 }) {
+        for (int margin : { 0, 1, 16, 32 }) {
+            const int innerWidth = std::max(0, width - margin * 2);
+            const int maxSplits = std::max(1, innerWidth);
+            for (int splits = 1; splits <= maxSplits; splits++) {
+                for (int radius : { 0, 1, 4, 16, 32, 48, 65, 512 }) {
+                    for (bool aligned : { false, true }) {
+                        const auto boundaries = logo::BuildLogoCollectXBoundaries(width, margin, radius, splits, aligned);
+                        if (boundaries.size() != static_cast<size_t>(splits) + 1 || boundaries.front() != margin ||
+                            boundaries.back() != margin + innerWidth) {
+                            diagnostic = _T("分割の個数または外端を維持できない");
+                            return false;
+                        }
+                        std::vector<int> coverage(innerWidth, 0);
+                        for (int tile = 0; tile < splits; tile++) {
+                            if (boundaries[tile] > boundaries[tile + 1] ||
+                                (innerWidth > 0 && boundaries[tile] == boundaries[tile + 1])) {
+                                diagnostic = _T("分割境界の単調性を維持できない");
+                                return false;
+                            }
+                            for (int x = boundaries[tile]; x < boundaries[tile + 1]; x++) {
+                                if (x < margin || x >= margin + innerWidth) {
+                                    diagnostic = _T("収集対象外の画素を分割に含めた");
+                                    return false;
+                                }
+                                coverage[x - margin]++;
+                            }
+                        }
+                        if (!std::all_of(coverage.begin(), coverage.end(), [](int count) { return count == 1; })) {
+                            diagnostic = _T("分割による画素の重複または欠落");
+                            return false;
+                        }
+                        for (int tile = 1; tile < splits; tile++) {
+                            const int original = margin + innerWidth * tile / splits;
+                            if ((!aligned && boundaries[tile] != original) ||
+                                (aligned && boundaries[tile] != original && (boundaries[tile] - std::max(margin, radius)) % 32 != 0)) {
+                                diagnostic = _T("非整列時の互換性または32画素整列が不正");
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// 救済辺の選択順、上下左右境界、閾値ちょうどの判定をスカラー処理とbit比較する。
+bool TestLogoBackgroundRetry(tstring& diagnostic) {
+    if (!HasLogoBackgroundAVX2ForTest()) {
+        _ftprintf(stdout, _T("AVX2非対応のため背景推定SIMD比較を省略\n"));
+        return true;
+    }
+    // 救済での最初の一致、全有効辺の平均、画像外の辺を飛ばす場合を固定値で確認する。
+    for (int scenario = 0; scenario < 3; scenario++) {
+        constexpr int width = 128, height = 96, radius = 4, y = 48;
+        const int x = scenario == 2 ? radius : 32;
+        std::vector<uint8_t> frame(width * height);
+        for (int row = 0; row < height; row++) {
+            for (int col = 0; col < width; col++) frame[col + row * width] = ((row + col) & 1) ? 0 : 255;
+        }
+        for (int col = 0; col < width; col++) {
+            frame[col + (y - radius) * width] = 100;
+            frame[col + (y + radius) * width] = 200;
+            frame[col + (y + radius + 16) * width] = 200;
+        }
+        for (int row = y - radius; row <= y + radius; row++) {
+            if (x - radius - 16 >= 0) frame[x - radius - 16 + row * width] = scenario == 0 ? 100 : 140;
+            frame[x + radius + 16 + row * width] = scenario == 2 ? 120 : 160;
+        }
+        float reference[32] = {}, vectorized[32] = {};
+        uint32_t referenceMask = 0, vectorizedMask = 0;
+        if (!Expect(CompareLogoBackgroundForTest(frame.data(), width, height, x, y, radius, 0,
+            reference, vectorized, &referenceMask, &vectorizedMask) != 0,
+            _T("救済固定値比較の実行失敗"), diagnostic)) return false;
+        const float expected = scenario == 0 ? 100.0f : scenario == 1 ? 150.0f : 140.0f;
+        if (!Expect((referenceMask & 1) && (vectorizedMask & 1) && reference[0] == expected && vectorized[0] == expected,
+            _T("救済辺の選択順または全有効辺平均の不一致"), diagnostic)) return false;
+    }
+    uint32_t randomState = 0x625a9b17;
+    auto random = [&]() { randomState = randomState * 1664525u + 1013904223u; return randomState; };
+    for (int radius : { 1, 4, 8, 16, 32 }) {
+        for (int extraWidth : { 0, 37 }) {
+            const int width = radius * 2 + 32 + extraWidth;
+            constexpr int height = 161;
+            std::vector<uint8_t> frame(width * height);
+            for (int pattern = 0; pattern < 8; pattern++) {
+                for (int y = 0; y < height; y++) {
+                    for (int x = 0; x < width; x++) {
+                        int value = 0;
+                        switch (pattern) {
+                        case 0: value = 100; break;
+                        case 1: value = (x * 7 + y * 11) & 255; break;
+                        case 2: value = random() >> 24; break;
+                        case 3: value = 100 + random() % 13; break;
+                        case 4: value = ((x / 13 + y / 17) & 1) ? 100 : 200; break;
+                        case 5: value = y % 19 == 0 ? 100 : ((x + y) & 1) * 255; break;
+                        case 6: value = x % 23 == 0 ? 100 : ((x + y) & 1) * 255; break;
+                        default: value = ((x / 11 + y / 7) % 3) * 100; break;
+                        }
+                        frame[x + y * width] = (uint8_t)value;
+                    }
+                }
+                for (int x : { radius, width - radius - 32 }) {
+                    for (int y : { 0, radius - 1, radius, radius + 15, radius + 16,
+                        height / 2, height - radius - 17, height - radius - 1, height - 1 }) {
+                        for (int threshold : { 0, 1, 11, 12, 13, 32, 255 }) {
+                            float reference[32] = {}, vectorized[32] = {};
+                            uint32_t referenceMask = 0, vectorizedMask = 0;
+                            if (!Expect(CompareLogoBackgroundForTest(frame.data(), width, height, x, y, radius,
+                                threshold, reference, vectorized, &referenceMask, &vectorizedMask) != 0,
+                                _T("背景推定比較の実行失敗"), diagnostic)) return false;
+                            if (referenceMask != vectorizedMask) {
+                                diagnostic = strsprintf(_T("背景推定マスク不一致: 半径=%d, 幅=%d, 模様=%d, x=%d, y=%d, 閾値=%d"),
+                                    radius, width, pattern, x, y, threshold);
+                                return false;
+                            }
+                            for (int lane = 0; lane < 32; lane++) {
+                                if ((referenceMask & (1u << lane)) &&
+                                    std::memcmp(reference + lane, vectorized + lane, sizeof(float)) != 0) {
+                                    diagnostic = strsprintf(_T("背景推定値bit不一致: 半径=%d, 幅=%d, 模様=%d, x=%d, y=%d, 閾値=%d, lane=%d, 旧=%.9g, 新=%.9g"),
+                                        radius, width, pattern, x, y, threshold, lane, reference[lane], vectorized[lane]);
+                                    return false;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -3253,6 +3996,114 @@ bool TestCaptionPgsCanvasSize(tstring& diagnostic) {
 }
 
 
+#if !(defined(_WIN32) || defined(_WIN64))
+// ProcessThread.cpp がエクスポートするプラグイン向けAPI (ヘッダには宣言が無い)
+struct GROUP_AFFINITY {
+    intptr_t Mask;
+    uint16_t Group;
+    uint16_t Reserved[3];
+};
+extern "C" void* CPUInfo_Create(void* ctx);
+extern "C" void CPUInfo_Delete(void* ptr);
+extern "C" const GROUP_AFFINITY* CPUInfo_GetData(void* ptr, int tag, int* count);
+
+// get_cpu_info() のマスクが 64bit 表現の範囲 (CPU 0-63) と
+// プロセス自身の affinity に収まっていることを検証する。
+bool TestCpuInfoMasks(tstring& diagnostic) {
+    cpu_info_t cpuInfo = {};
+    if (!get_cpu_info(&cpuInfo)) {
+        return Expect(false, _T("get_cpu_info() が失敗しました"), diagnostic);
+    }
+    if (cpuInfo.physical_cores <= 0 || cpuInfo.logical_cores <= 0) {
+        return Expect(false, _T("コア数が不正です"), diagnostic);
+    }
+
+    // 現在のスレッドのアフィニティを取得する
+    cpu_set_t procAffinity;
+    CPU_ZERO(&procAffinity);
+    const bool affinityValid = (sched_getaffinity(0, sizeof(procAffinity), &procAffinity) == 0);
+    if (!affinityValid) {
+        return Expect(false, _T("アフィニティを取得できません"), diagnostic);
+    }
+
+    // 各物理コアのマスクがプロセスの affinity に含まれることを確認
+    for (int i = 0; i < cpuInfo.physical_cores; i++) {
+        const size_t mask = cpuInfo.proc_list[i].mask;
+        if (mask == 0) continue; // affinity に含まれるCPUが無いコアは 0 が正
+        if (!affinityValid) break;
+        bool allInAffinity = true;
+        for (int j = 0; j < 64; j++) {
+            if (mask & ((size_t)1 << j)) {
+                if (!CPU_ISSET(j, &procAffinity)) {
+                    allInAffinity = false;
+                    break;
+                }
+            }
+        }
+        if (!allInAffinity) {
+            return Expect(false, _T("コアマスクにプロセスの affinity 外のCPUが含まれています"), diagnostic);
+        }
+    }
+
+    // 表現できないCPUを含む場合は全構成を空にし、含まない場合は許可CPUを漏れなく出力する
+    {
+        void* cpuInfoApi = CPUInfo_Create(nullptr);
+        if (cpuInfoApi == nullptr) {
+            return Expect(false, _T("CPU構成を作成できません"), diagnostic);
+        }
+        bool hasHighCpu = false;
+        size_t expectedMask = 0;
+        for (int id = 0; id < CPU_SETSIZE; id++) {
+            if (CPU_ISSET(id, &procAffinity)) {
+                if (id < 64) expectedMask |= (size_t)1u << id;
+                else hasHighCpu = true;
+            }
+        }
+        int coreCount = 0;
+        const GROUP_AFFINITY* cores = CPUInfo_GetData(cpuInfoApi, 1 /*PROC_TAG_CORE*/, &coreCount);
+        size_t actualMask = 0;
+        if (cores != nullptr) {
+            for (int i = 0; i < coreCount; i++) actualMask |= (size_t)cores[i].Mask;
+        }
+        bool valid = hasHighCpu ? coreCount == 0 : (cores != nullptr && actualMask == expectedMask);
+        if (hasHighCpu) {
+            for (int tag = 2; tag <= 5; tag++) {
+                int count = 0;
+                CPUInfo_GetData(cpuInfoApi, tag, &count);
+                valid = valid && count == 0;
+            }
+        }
+        CPUInfo_Delete(cpuInfoApi);
+        if (!valid) {
+            return Expect(false, _T("出力されたCPU構成がアフィニティと一致しません"), diagnostic);
+        }
+    }
+
+    // get_core_info(Logical, id): id >= 64 は nullptr、
+    // id < 64 は proc_list 内の情報と一致
+    if (get_core_info(&cpuInfo, RGYCoreType::Logical, 64) != nullptr) {
+        return Expect(false, _T("get_core_info(Logical, 64) は nullptr を返すべきです"), diagnostic);
+    }
+    if (get_core_info(&cpuInfo, RGYCoreType::Logical, -1) != nullptr) {
+        return Expect(false, _T("get_core_info(Logical, -1) は nullptr を返すべきです"), diagnostic);
+    }
+    for (int id = 0; id < 64 && id < cpuInfo.logical_cores; id++) {
+        const processor_info_t* info = get_core_info(&cpuInfo, RGYCoreType::Logical, id);
+        if (affinityValid && !CPU_ISSET(id, &procAffinity)) {
+            // affinity 外のCPUは nullptr が期待される (affinity外のCPUはマスクに含められないため)
+            if (info != nullptr) {
+                return Expect(false, (_T("affinity外のCPU ") + std::to_tstring(id)
+                    + _T(" が get_core_info で返されました")).c_str(), diagnostic);
+            }
+        } else if (info != nullptr && !(info->mask & ((size_t)1 << id))) {
+            return Expect(false, _T("get_core_info が対応するCPUのマスクを持たないコアを返しました"), diagnostic);
+        }
+    }
+    return true;
+}
+#endif //#if !(defined(_WIN32) || defined(_WIN64))
+
+
 struct TestCase {
     const TCHAR* name;
     bool (*run)(tstring& diagnostic);
@@ -3262,6 +4113,9 @@ constexpr TestCase TEST_CASES[] = {
     { _T("caption_text_length"), TestCaptionTextLength },
     { _T("bitrate_zones"), TestBitrateZones },
     { _T("vfr_input_detection"), TestVFRInputDetection },
+#if !(defined(_WIN32) || defined(_WIN64))
+    { _T("cpu_info_masks"), TestCpuInfoMasks },
+#endif
     { _T("crc32"), TestCRC32 },
     { _T("bit_reader"), TestBitReader },
     { _T("auto_buffer"), TestAutoBuffer },
@@ -3296,9 +4150,19 @@ constexpr TestCase TEST_CASES[] = {
     { _T("audio_builder_reject_pce"), TestAudioBuilderRejectPce },
     { _T("audio_builder_merge_convert"), TestAudioBuilderMergeConvert },
     { _T("ts_selector"), TestTsSelector },
+    { _T("ts_audio_component"), TestTsAudioComponent },
+    { _T("audio_track_metadata"), TestAudioTrackMetadata },
     { _T("arib_string"), TestAribString },
     { _T("logo_file"), TestLogoFile },
     { _T("logo_correlation_fusion"), TestLogoCorrelationFusion },
+    { _T("logo_background_retry"), TestLogoBackgroundRetry },
+    { _T("logo_collect_partition"), TestLogoCollectPartition },
+    { _T("logo_residual_weight_params"), TestLogoResidualWeightParams },
+    { _T("logo_residual_skip"), TestLogoResidualSkip },
+    { _T("logo_bilateral"), TestLogoBilateral },
+    { _T("logo_roi_cache_copy"), TestLogoRoiCacheCopy },
+    { _T("logo_direct_luma_deint"), TestLogoDirectLumaDeint },
+    { _T("logo_temporal_histogram"), TestLogoTemporalHistogram },
     { _T("caption_pes_serialization"), TestCaptionPesSerialization },
     { _T("caption_pes_wrap"), TestCaptionPesWrap },
     { _T("caption_interval_mapping"), TestCaptionIntervalMapping },

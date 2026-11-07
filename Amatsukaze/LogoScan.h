@@ -32,6 +32,15 @@ extern "C" AMATSUKAZE_API int CompareLogoCorrelationForTest(const float* kernels
     const float* work, int width, const std::pair<int, int>* coordinates, size_t count,
     const LogoCorrelationScaleLimit* scales, int scaleCount, float maxv, float* reference, float* fused);
 
+// 背景推定のスカラー処理と32画素SIMD処理を同じ入力で比較する。
+extern "C" AMATSUKAZE_API int HasLogoBackgroundAVX2ForTest();
+// 単体テストから、BilateralのAVX2実装を行範囲と番兵付きで直接比較する。
+extern "C" AMATSUKAZE_API int ApplyLogoBilateralAVX2ForTest(uint8_t* dst, const uint8_t* src,
+    int pitch, int width, int height, const float* spatial, const float* rangeWeight, int y0, int y1);
+extern "C" AMATSUKAZE_API int CompareLogoBackgroundForTest(const uint8_t* src,
+    int width, int height, int x, int y, int radius, int threshold,
+    float* reference, float* vectorized, uint32_t* referenceMask, uint32_t* vectorizedMask);
+
 namespace av {
 class AMTSource;
 }
@@ -57,6 +66,8 @@ bool TryEstimateBgEvalSideContiguousU8_AVX2(const uint8_t* ptr, int len, int thr
 void PackBackground32Fixed88_AVX2(const float* bg, uint32_t validMask, uint16_t* out);
 void CalcCorrectedEdges32U8_AVX2(const uint8_t* src, int stride, float invMaxv, float* edges);
 void CalcBgSideStatsVerticalBoundary32U8_AVX2(const uint8_t* src, int stride, int height, int x, int y, int radius, uint16_t* sums, uint8_t* mins, uint8_t* maxs);
+uint32_t CalcBgRetrySideStats32U8_AVX2(const uint8_t* src, int stride, int width, int height,
+    int sx, int sy, int len, bool horizontal, uint16_t* sums, uint8_t* mins, uint8_t* maxs);
 void CalcBgSideStatsBlock32U8_AVX2(const uint8_t* src, int stride, int x, int y, int radius,
     uint16_t* sideSums, uint8_t* sideMins, uint8_t* sideMaxs);
 
@@ -86,6 +97,8 @@ struct LogoQualityMetrics {
     double edgeSideActiveRate[4] = {};
     double renderedYMean = 0.0;
     double renderedYP99 = 0.0;
+    double renderedYSpatialDetail = 0.0;
+    double renderedYSpatialDetailNormalized = 0.0;
     double alphaMean = 0.0;
     double alphaP90 = 0.0;
     double alphaP99 = 0.0;
@@ -94,6 +107,76 @@ struct LogoQualityMetrics {
     double uvResidualActiveMean = 0.0;
     double uvResidualActiveP90 = 0.0;
 };
+
+// 外周のパディングを除いた renderedY の空間的ディテールを測る。
+// activeAreaRate で割ることで、ロゴ矩形の大きさに依存しにくくする。
+inline double CalcRenderedYSpatialDetail(
+    const double* renderedY, const int width, const int height, const double activeAreaRate) {
+    if (renderedY == nullptr || width < 3 || height < 3 || !std::isfinite(activeAreaRate)
+        || activeAreaRate <= 0.0) {
+        return 0.0;
+    }
+
+    double laplacianSum = 0.0;
+    for (int y = 1; y < height - 1; y++) {
+        for (int x = 1; x < width - 1; x++) {
+            const int off = x + y * width;
+            const double center = renderedY[off];
+            const double up = renderedY[off - width];
+            const double down = renderedY[off + width];
+            const double left = renderedY[off - 1];
+            const double right = renderedY[off + 1];
+            if (!std::isfinite(center) || !std::isfinite(up) || !std::isfinite(down)
+                || !std::isfinite(left) || !std::isfinite(right)) {
+                continue;
+            }
+            laplacianSum += std::abs(4.0 * center - up - down - left - right);
+        }
+    }
+
+    const double activePixels = activeAreaRate * width * height;
+    return activePixels > 1.0e-6 ? laplacianSum / activePixels : 0.0;
+}
+
+// renderedY の明るさを p99 で正規化したディテール値を返す。
+inline double NormalizeRenderedYSpatialDetail(const double spatialDetail, const double renderedYP99) {
+    if (!std::isfinite(spatialDetail) || spatialDetail <= 0.0) {
+        return 0.0;
+    }
+    const double scale = std::max(0.05, std::isfinite(renderedYP99) ? renderedYP99 : 0.0);
+    return spatialDetail / scale;
+}
+
+// renderedY の明るさと面積が小さくても、輪郭構造が残る低濃度ロゴは許可する。
+// no_logo 判定はこの関数だけで完結させ、呼び出し側の品質計算状態に依存させない。
+inline bool IsNoLogoSignal(
+    const double activeAreaRate,
+    const double renderedYP99,
+    const double spatialDetail,
+    const double normalizedSpatialDetail) {
+    static constexpr double kNoLogoMaxActiveAreaRate = 0.02;
+    static constexpr double kNoLogoMaxRenderedYP99 = 0.02;
+    static constexpr double kStructuredMinActiveAreaRate = 0.01;
+    static constexpr double kStructuredMinRenderedYP99 = 0.015;
+    static constexpr double kStructuredMinSpatialDetail = 0.10;
+    static constexpr double kStructuredMinNormalizedSpatialDetail = 1.0;
+
+    if (!std::isfinite(activeAreaRate) || !std::isfinite(renderedYP99)
+        || !std::isfinite(spatialDetail) || !std::isfinite(normalizedSpatialDetail)) {
+        return true;
+    }
+    if (!(renderedYP99 < kNoLogoMaxRenderedYP99
+        && activeAreaRate < kNoLogoMaxActiveAreaRate)) {
+        return false;
+    }
+
+    const bool structuredLowOpacitySignal =
+        activeAreaRate > kStructuredMinActiveAreaRate
+        && renderedYP99 > kStructuredMinRenderedYP99
+        && spatialDetail > kStructuredMinSpatialDetail
+        && normalizedSpatialDetail > kStructuredMinNormalizedSpatialDetail;
+    return !structuredLowOpacitySignal;
+}
 
 class LogoDataParam : public LogoData {
     enum {
@@ -359,12 +442,18 @@ public:
     using FirstFrameCallback = std::function<void(AVStream *videoStream, AVFrame* frame)>;
     using FrameCallback = std::function<bool(AVFrame* frame)>;
 
-    SimpleVideoReader(AMTContext& ctx);
+    SimpleVideoReader(AMTContext& ctx, bool enableGopDecode = true);
+    void setGopDecodeEnabled(bool enabled) { gopDecodeEnabled = enabled; }
+    bool isGopDecodeEnabled() const { return gopDecodeEnabled; }
 
     int64_t currentPos;
 
-    void readAll(const tstring& src, int serviceid);
-    void readAll(const tstring& src, int serviceid, const FirstFrameCallback& onFirstFrameCb, const FrameCallback& onFrameCb);
+    // threadLimit > 0 のとき、デコードスレッド数は min(コア数, threadLimit) に収める。
+    void readAll(const tstring& src, int serviceid, int threadLimit = 0);
+    void readAll(const tstring& src, int serviceid, const FirstFrameCallback& onFirstFrameCb, const FrameCallback& onFrameCb, int threadLimit = 0);
+
+private:
+    bool gopDecodeEnabled;
 
 protected:
     virtual void onFirstFrame(AVStream *videoStream, AVFrame* frame);;
@@ -511,6 +600,7 @@ class LogoAnalyzer : AMTObject {
     std::unique_ptr<LogoData> logodata;
     LogoQualityMetrics logoQuality;
     bool validateQuality;
+    bool enableGopDecode;
 
     float progressbase;
 
@@ -719,7 +809,7 @@ class LogoAnalyzer : AMTObject {
 public:
     LogoAnalyzer(AMTContext& ctx, const tchar* srcpath, int serviceid, const tchar* workfile, const tchar* dstpath,
         const tchar* debugpath, int imgx, int imgy, int w, int h, int thy, int numMaxFrames,
-        LOGO_ANALYZE_CB cb, bool validateQuality);
+        LOGO_ANALYZE_CB cb, bool validateQuality, bool enableGopDecode = true);
 
     void ScanLogo();
 };

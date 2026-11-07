@@ -20,6 +20,18 @@ public:
     bool matches(const tstring& path, int id) const { return source == path && service == id; }
     bool hasStarted() const { return started; }
     size_t cachedFrames() const { return positions.size(); }
+    void setThreadLimit(int limit) { threadLimit = limit; }
+    int getThreadLimit() const { return threadLimit; }
+    bool isGopDecodeEnabled() const { return reader.isGopDecodeEnabled(); }
+
+    // 失敗したデコードとROIを破棄し、通常復号で新しい解析を開始できる状態へ戻す。
+    void resetForSequentialDecode() {
+        stop();
+        reader.setGopDecodeEnabled(false);
+        started = cacheEnabled = paused = done = resume = cancelled = false;
+        generation = {};
+        error = nullptr;
+    }
 
     void configure(AVFrame* frame, int x, int y, int width, int height,
         int scaleNum, int scaleDen, int frameCount, uint64_t availableBytes) {
@@ -49,9 +61,9 @@ public:
 
     void detect(const SimpleVideoReader::FirstFrameCallback& first,
         const SimpleVideoReader::FrameCallback& frame,
-        const std::function<void(AVFrame*)>& configureCache) {
+        const std::function<void(AVFrame*)>& configureCache, int threadLimit = 0) {
         started = true;
-        decodeThread = std::thread([this, first, frame, configureCache]() {
+        decodeThread = std::thread([this, first, frame, configureCache, threadLimit]() {
             try {
                 reader.readAll(source, service,
                     [&](AVStream* stream, AVFrame* picture) {
@@ -81,7 +93,7 @@ public:
                             generate = generation;
                         }
                         return generate(picture, 0, 0, reader.currentPos);
-                    });
+                    }, threadLimit);
             } catch (...) {
                 std::lock_guard<std::mutex> lock(mutex);
                 error = std::current_exception();
@@ -142,6 +154,7 @@ public:
     }
 
 private:
+    int threadLimit = 0;
     void disableCache() {
         cacheEnabled = false;
         std::vector<uint8_t>().swap(prefix);

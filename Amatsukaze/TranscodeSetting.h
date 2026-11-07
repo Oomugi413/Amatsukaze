@@ -164,7 +164,8 @@ std::vector<std::pair<tstring, bool>> makeMuxerArgs(
     bool sarInContainerOnly,
     const tstring& encoderName,
     const tstring& encoderOptions,
-    const std::vector<tstring>& audioTrackNames = std::vector<tstring>());
+    const std::vector<tstring>& audioTrackNames = std::vector<tstring>(),
+    const std::vector<tstring>& audioTrackLanguages = std::vector<tstring>());
 
 tstring makeTimelineEditorArgs(
     const tstring& binpath,
@@ -243,6 +244,7 @@ struct Config {
     std::pair<int, int> userSAR;
     ENUM_AUDIO_ENCODER audioEncoder;
     AUDIO_FORMAT_CHANGE_MODE audioFormatChangeMode = AFC_SPLIT;
+    bool ignoreVideoDisplayChanges = false;
     tstring audioEncoderPath;
     tstring audioEncoderOptions;
     tstring muxerPath;
@@ -396,6 +398,8 @@ public:
     bool isEncodeAudio() const;
 
     AUDIO_FORMAT_CHANGE_MODE getAudioFormatChangeMode() const;
+
+    bool isIgnoreVideoDisplayChanges() const;
 
     tstring getAudioEncoderPath() const;
 
@@ -669,6 +673,8 @@ public:
     tstring getOutPSCFilePath(EncodeFileKey key, EncodeFileKey keyMax, ENUM_FORMAT format, VIDEO_STREAM_FORMAT codec) const;
 
     tstring getOutChapterPath(EncodeFileKey key, EncodeFileKey keyMax, ENUM_FORMAT format, VIDEO_STREAM_FORMAT codec) const;
+
+    tstring getCMOnlyChapterPath(EncodeFileKey key, EncodeFileKey keyMax) const;
 
     tstring getOutSummaryPath() const;
 

@@ -262,6 +262,7 @@ namespace Amatsukaze.Models
                     case QueueState.Encoding:
                         switch (Model.Mode)
                         {
+                            case ProcMode.TrimAdjust:
                             case ProcMode.CMCheck:
                                 return "CM解析中→" + (Model.ConsoleId + 1);
                             case ProcMode.DrcsCheck:
@@ -325,20 +326,7 @@ namespace Amatsukaze.Models
         {
             get
             {
-                switch (Model.Mode)
-                {
-                    case ProcMode.AutoBatch:
-                        return "自動追加";
-                    case ProcMode.Batch:
-                        return "通常";
-                    case ProcMode.Test:
-                        return "テスト";
-                    case ProcMode.DrcsCheck:
-                        return "DRCSチェック";
-                    case ProcMode.CMCheck:
-                        return "CM解析";
-                }
-                return "不明モード";
+                return Amatsukaze.Shared.QueueSettingExtensions.GetProcModeDisplay((Amatsukaze.Shared.ProcMode)Model.Mode);
             }
         }
 
@@ -1218,6 +1206,7 @@ namespace Amatsukaze.Models
                 RaisePropertyChanged("AfsPresetIndex");
                 RaisePropertyChanged("KfmModeVisible");
                 RaisePropertyChanged("KfmModeIndex");
+                RaisePropertyChanged("KfmEnableUcf");
                 RaisePropertyChanged("DeintModeVisible");
                 RaisePropertyChanged("DeintModeIndex");
                 RaisePropertyChanged("DeinterlaceAlgorithmToolTip");
@@ -1258,6 +1247,20 @@ namespace Amatsukaze.Models
                 RaisePropertyChanged();
             }
         }
+
+        // vpp-kfm の ucf。既定は off
+        public bool KfmEnableUcf
+        {
+            get { return Data.KfmEnableUcf; }
+            set
+            {
+                if (Data.KfmEnableUcf == value) return;
+                Data.KfmEnableUcf = value;
+                RaisePropertyChanged();
+            }
+        }
+
+        public string KfmUcfToolTip { get { return EncoderFilterHelp.KfmUcf; } }
 
         // nnedi/yadif/bwdifは選択肢が同じnormal/bobなので1つのComboBoxを共用する
         public bool DeintModeVisible
@@ -2891,6 +2894,16 @@ namespace Amatsukaze.Models
             }
         }
         #endregion
+
+        public bool IgnoreVideoDisplayChanges {
+            get { return Data.IgnoreVideoDisplayChanges; }
+            set {
+                if (Data.IgnoreVideoDisplayChanges == value)
+                    return;
+                Data.IgnoreVideoDisplayChanges = value;
+                RaisePropertyChanged();
+            }
+        }
 
         #region AudioFormatChangeMode変更通知プロパティ
         public int AudioFormatChangeMode {
@@ -4870,6 +4883,17 @@ namespace Amatsukaze.Models
     public class DisplayMakeScriptData : NotificationObject
     {
         public MakeScriptData Model { get; set; }
+
+        public string LaunchUser
+        {
+            get { return Model.LaunchUser ?? ""; }
+            set
+            {
+                if (Model.LaunchUser == value) return;
+                Model.LaunchUser = value ?? "";
+                RaisePropertyChanged();
+            }
+        }
 
         #region SelectedProfile変更通知プロパティ
         private object _SelectedProfile;

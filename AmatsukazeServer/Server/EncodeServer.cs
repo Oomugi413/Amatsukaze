@@ -54,9 +54,14 @@ namespace Amatsukaze.Server
 
         internal IUserClient Client { get; private set; }
         public Task ServerTask { get; private set; }
+        // スタンドアロン版でAddTaskから投入を受け付けるためのloopback待ち受け。サーバー版ではnull。
+        private ClientManager standaloneClientManager;
         internal AppData AppData_ { get; private set; }
 
         private readonly int serverPort;
+        // スタンドアロンで前回使えたRESTポート。Initより前に設定する。0は未保存。
+        public int PreferredRestPort { get; set; }
+        public int ActualRestApiPort => restApiHost?.Port ?? 0;
         private MultiUserClient multiClient;
         private RestStateStore restState;
         private RestApiHost restApiHost;
@@ -208,8 +213,26 @@ namespace Amatsukaze.Server
         }
         #endregion
 
+        private static async Task ListenStandalone(ClientManager manager, int port)
+        {
+            try
+            {
+                await manager.Listen(port, IPAddress.Loopback);
+            }
+            catch (Exception e)
+            {
+                // 待ち受けに失敗してもスタンドアロン版の操作は続ける。この場合AddTaskからは投入できない。
+                Util.AddLog($"スタンドアロン版でAddTaskの受付を開始できませんでした。ポート: {port}", e);
+            }
+        }
+
         public ClientManager ClientManager {
             get {
+                // スタンドアロン版のloopback待ち受けはAddTask用なので、サーバー版のクライアント管理としては扱わない。
+                if (standaloneClientManager != null)
+                {
+                    return null;
+                }
                 if (Client is ClientManager manager)
                 {
                     return manager;
@@ -335,13 +358,9 @@ namespace Amatsukaze.Server
                 // スタンドアロン
                 this.Client = client;
 
-                // 終了待機
-                var fs = ServerSupport.CreateStandaloneMailslot();
-                ServerSupport.WaitStandaloneMailslot(fs).ContinueWith(task =>
-                {
-                    // 終了リクエストが来た
-                    client.Finish();
-                });
+                // AddTaskから投入できるよう、このPC内(127.0.0.1)だけで旧プロトコルを待ち受ける。
+                standaloneClientManager = new ClientManager(this);
+                _ = ListenStandalone(standaloneClientManager, port);
             }
             else
             {
@@ -352,6 +371,8 @@ namespace Amatsukaze.Server
             }
 
             multiClient = new MultiUserClient(this.Client);
+            // スタンドアロン版でも受理通知などをAddTaskの接続へ配る。
+            multiClient.Add(standaloneClientManager);
             this.Client = multiClient;
 
             var restPort = RestApiHost.GetEnabledPort(port);
@@ -359,7 +380,11 @@ namespace Amatsukaze.Server
             {
                 restState = new RestStateStore(this);
                 multiClient.Add(restState);
-                restApiHost = new RestApiHost(this, restState, restPort);
+                restApiHost = new RestApiHost(this, restState, restPort)
+                {
+                    // プロセス内クライアントがいるときがスタンドアロン。ポートは自動で空きを選ぶ。
+                    AutoSelectPort = client != null
+                };
             }
 #if PROFILE
             prof.PrintTime("EncodeServer 1");
@@ -631,12 +656,16 @@ namespace Amatsukaze.Server
             {
                 try
                 {
+                    restApiHost.PreferredPort = PreferredRestPort;
                     await restApiHost.StartAsync();
                     Util.AddLog($"[REST] APIサーバを起動しました。port={restApiHost.Port}", null);
                 }
                 catch (Exception ex)
                 {
-                    Util.AddLog($"[REST] APIサーバ起動失敗: {ex.GetType().Name}: {ex.Message}", ex);
+                    // サーバー/CLIは指定ポートで失敗したら起動自体を止める。
+                    // スタンドアロンも空きが一つも無いときは同様に止める。
+                    Util.AddLog($"[REST] APIサーバ起動失敗: {ex.Message}", ex);
+                    throw;
                 }
             }
             // 更新チェックはサーバー初期化の完了後にバックグラウンドで開始する
@@ -657,6 +686,9 @@ namespace Amatsukaze.Server
                     // TODO: マネージ状態を破棄します (マネージ オブジェクト)。
 
                     UpdateManager?.Dispose();
+
+                    // スタンドアロン版の待ち受けを止め、接続中のAddTaskを切断する。
+                    standaloneClientManager?.Finish();
 
                     // キュー状態を保存する
                     try
@@ -1608,6 +1640,7 @@ namespace Amatsukaze.Server
             {
                 AppData_.scriptData = new MakeScriptData();
             }
+            ServerSupport.SetDefaultLaunchUserForScript(AppData_.scriptData);
             if (AppData_.services == null)
             {
                 AppData_.services = new ServiceSetting();
@@ -2032,13 +2065,17 @@ namespace Amatsukaze.Server
             bool ignoreNoLogo, string jlscommand, string jlsopt, string ceopt, string trimavs, string divfile, string resumeDir, string batDir,
             string inHandle, string outHandle, int pid)
         {
-            if (mode != ProcMode.CMCheck && mode != ProcMode.DrcsCheck && profile != null)
+            if ((mode != ProcMode.CMCheck && mode != ProcMode.TrimAdjust) && mode != ProcMode.DrcsCheck && profile != null)
             {
                 CheckDoubleDeinterlace(profile);
             }
             StringBuilder sb = new StringBuilder();
             // CLI省略時はsplitなので、既存プロファイルも含めて常に設定を明示する。
             sb.Append(" --audio-format-change ").Append(profile.GetAudioFormatChangeModeArgument());
+            if (profile?.IgnoreVideoDisplayChanges == true)
+            {
+                sb.Append(" --ignore-video-display-changes");
+            }
 
             bool loadV2 = false;
             if (   streamFormat != VideoStreamFormat.MPEG2
@@ -2048,7 +2085,7 @@ namespace Amatsukaze.Server
                 loadV2 = true;
             }
 
-            if (mode == ProcMode.CMCheck)
+            if ((mode == ProcMode.CMCheck || mode == ProcMode.TrimAdjust))
             {
                 sb.Append(" --mode cm");
             }
@@ -2133,9 +2170,15 @@ namespace Amatsukaze.Server
                     .Append(outputMask);
 
 
-                if (mode == ProcMode.CMCheck)
+                if ((mode == ProcMode.CMCheck || mode == ProcMode.TrimAdjust))
                 {
                     sb.Append(" --chapter");
+                    // CM解析のみでも、プロファイルでチャプター出力が有効ならチャプターファイルを出力する
+                    // カット調整では出力しない。出力先はAmatsukazeCLI側で入力ファイル名から組み立てるため-oは渡さない
+                    if (mode == ProcMode.CMCheck && !profile.DisableChapter && profile.OutputChapter)
+                    {
+                        sb.Append(" --output-chapter");
+                    }
                 }
                 else {
                     double bitrateCM = profile.BitrateCM;
@@ -2384,7 +2427,7 @@ namespace Amatsukaze.Server
                         }
 
                     }
-                } // if (mode != ProcMode.CMCheck)
+                } // if ((mode != ProcMode.CMCheck && mode != ProcMode.TrimAdjust))
 
                 if (!profile.DisableSubs)
                 {
@@ -2530,7 +2573,7 @@ namespace Amatsukaze.Server
                         sb.Append(setting.NumParallelLogoAnalysis);
                     }
                 }
-                if (profile.NoRemoveTmp)
+                if (profile.NoRemoveTmp || mode == ProcMode.TrimAdjust)
                 {
                     sb.Append(" --no-remove-tmp");
                 }
@@ -2724,7 +2767,7 @@ namespace Amatsukaze.Server
             if (!Directory.Exists(workPath))
             {
                 throw new InvalidOperationException(
-                    "一時フォルダパスが無効です: " + workPath);
+                    "一時フォルダパスが無効です: " + workPath + ServerSupport.GetServiceContextPathHint(workPath));
             }
 
             // パスが設定されていたらファイル存在チェック
@@ -3814,6 +3857,7 @@ namespace Amatsukaze.Server
                 }
                 else if(data.MakeScriptData != null)
                 {
+                    ServerSupport.SetDefaultLaunchUserForScript(data.MakeScriptData);
                     AppData_.scriptData = data.MakeScriptData;
                     settingUpdated = true;
                     return Client.OnCommonData(new CommonData() {

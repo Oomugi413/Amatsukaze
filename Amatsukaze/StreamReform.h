@@ -65,6 +65,7 @@ struct FileAudioFrameInfo : public AudioFrameInfo {
     int waveDataSize;
     int64_t fileOffset;
     int64_t waveOffset;
+    AudioComponentInfo component; // 受信時点の音声コンポーネント情報
 
     FileAudioFrameInfo();
 
@@ -212,7 +213,8 @@ public:
     // 1. コンストラクト直後に呼ぶ
     // splitSub: メイン以外のフォーマットを結合しない
     void prepare(bool splitSub, bool isEncodeAudio, bool isTsreplace,
-        AUDIO_FORMAT_CHANGE_MODE audioMode = AFC_SPLIT, const tstring& audioPath = tstring());
+        AUDIO_FORMAT_CHANGE_MODE audioMode = AFC_SPLIT, const tstring& audioPath = tstring(),
+        bool ignoreVideoDisplayChanges = false);
 
     // 字幕処理が無効な場合に、解析済みの字幕情報を破棄する
     void clearCaptionItems();
@@ -358,6 +360,7 @@ private:
     bool isEncodeAudio_;
     bool isTsreplace_;
     AUDIO_FORMAT_CHANGE_MODE audioMode_ = AFC_SPLIT;
+    bool ignoreVideoDisplayChanges_ = false;
     int numMaxAudio_ = 1;
     int audioSampleRate_ = 0;
 

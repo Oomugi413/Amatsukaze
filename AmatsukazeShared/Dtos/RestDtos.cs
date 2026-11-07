@@ -510,6 +510,7 @@ namespace Amatsukaze.Shared
         public bool IsDirect { get; set; }
         public int Priority { get; set; }
         public string? AddQueueBat { get; set; }
+        public string? LaunchUser { get; set; }
     }
 
     public class MakeScriptPreview
@@ -580,6 +581,8 @@ namespace Amatsukaze.Shared
     public class TrimAdjustSessionResponse
     {
         public string? SessionId { get; set; }
+        [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)]
+        public bool AudioPlaybackEnabled { get; set; }
         // 無効時は既存のセッション応答にも項目を追加しない
         [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)]
         public bool CmSegAnnotationEnabled { get; set; }

@@ -478,9 +478,13 @@ static bool hasMp4Subtitles(const std::vector<tstring>& subsTitles) {
     bool sarInContainerOnly,
     const tstring& encoderName,
     const tstring& encoderOptions,
-    const std::vector<tstring>& audioTrackNames) {
+    const std::vector<tstring>& audioTrackNames,
+    const std::vector<tstring>& audioTrackLanguages) {
     if (!audioTrackNames.empty() && audioTrackNames.size() != inAudios.size()) {
         THROW(ArgumentException, "音声トラック名の数が音声ファイル数と一致しません");
+    }
+    if (!audioTrackLanguages.empty() && audioTrackLanguages.size() != inAudios.size()) {
+        THROW(ArgumentException, "音声言語の数が音声ファイル数と一致しません");
     }
     std::vector<std::pair<tstring, bool>> ret;
 
@@ -520,11 +524,14 @@ static bool hasMp4Subtitles(const std::vector<tstring>& subsTitles) {
         }
         sb.append(_T("\""));
         for (int i = 0; i < (int)inAudios.size(); i++) {
-            if (audioTrackNames.empty()) {
-                sb.append(_T(" -add \"%s\"#audio:name=Audio%d"), inAudios[i], i);
-            } else {
-                sb.append(_T(" -add \"%s\"#audio:name=%s"), inAudios[i], audioTrackNames[i]);
+            // 名前に空白があっても分割されないよう、インポート指定全体を引用する。
+            sb.append(_T(" -add \"%s#audio:name=%s"), inAudios[i],
+                audioTrackNames.empty() || audioTrackNames[i].empty()
+                    ? StringFormat(_T("Audio%d"), i) : audioTrackNames[i]);
+            if (!audioTrackLanguages.empty() && !audioTrackLanguages[i].empty()) {
+                sb.append(_T(":lang=%s"), audioTrackLanguages[i]);
             }
+            sb.append(_T("\""));
         }
         if (needChapter && !needTimecode) {
             sb.append(_T(" -chap \"%s\""), chapterpath);
@@ -588,6 +595,13 @@ static bool hasMp4Subtitles(const std::vector<tstring>& subsTitles) {
             sb.append(_T(" -new \"%s\""), outpath);
             ret.push_back(std::make_pair(sb.str(), true));
             sb.clear();
+        } else if (needTimecode && muxerAddEncoderCmd) {
+            // チャプターも字幕もない場合は、タイムコード埋め込み後の出力にタグを付与する
+            const tstring toolVal = tstring(_T("Amatsukaze ")) + encoderName + _T(" ") + encoderOptions;
+            sb.append(_T("\"%s\" -tmp \"%s\" -itags \"tool=%s\" \"%s\""),
+                mp4boxpath, tmpdir, escapeItagsValue(toolVal).c_str(), outpath);
+            ret.push_back(std::make_pair(sb.str(), true));
+            sb.clear();
         }
     } else if (format == FORMAT_MKV) {
 
@@ -623,15 +637,19 @@ static bool hasMp4Subtitles(const std::vector<tstring>& subsTitles) {
         sb.append(_T(" \"%s\""), inVideo);
 
         for (int i = 0; i < (int)inAudios.size(); i++) {
-            if (!audioTrackNames.empty()) {
+            if (!audioTrackNames.empty() && !audioTrackNames[i].empty()) {
                 sb.append(_T(" --track-name \"0:%s\""), audioTrackNames[i]);
+            }
+            if (!audioTrackLanguages.empty() && !audioTrackLanguages[i].empty()) {
+                sb.append(_T(" --language \"0:%s\""), audioTrackLanguages[i]);
             }
             sb.append(_T(" \"%s\""), inAudios[i]);
         }
         for (int i = 0; i < (int)inSubs.size(); i++) {
             if (subsTitles[i] == _T("PGS")) {
                 // PGSを既定にせず、後続言語やWhisperを含む既存のテキスト字幕の優先順位を保つ。
-                sb.append(_T(" --default-track-flag 0:no"));
+                // 同梱のmkvmerge v45でも使える旧名を指定する。v65以降も旧名に対応している。
+                sb.append(_T(" --default-track 0:no"));
             }
             sb.append(_T(" --track-name \"0:%s\" \"%s\""), subsTitles[i], inSubs[i]);
         }
@@ -977,6 +995,10 @@ ENUM_AUDIO_ENCODER ConfigWrapper::getAudioEncoder() const {
 
 bool ConfigWrapper::isEncodeAudio() const {
     return conf.audioEncoder != AUDIO_ENCODER_NONE;
+}
+
+bool ConfigWrapper::isIgnoreVideoDisplayChanges() const {
+    return conf.ignoreVideoDisplayChanges;
 }
 
 AUDIO_FORMAT_CHANGE_MODE ConfigWrapper::getAudioFormatChangeMode() const {
@@ -1671,6 +1693,21 @@ tstring ConfigWrapper::getOutPSCFilePath(EncodeFileKey key, EncodeFileKey keyMax
 tstring ConfigWrapper::getOutChapterPath(EncodeFileKey key, EncodeFileKey keyMax, ENUM_FORMAT format, VIDEO_STREAM_FORMAT codec) const {
     StringBuilderT sb;
     sb.append(_T("%s"), getOutFileBase(key, keyMax, format, codec));
+    sb.append(_T(".chapter.txt"));
+    return sb.str();
+}
+
+// 接尾辞はgetOutFileBaseと同じ規則で付与する
+tstring ConfigWrapper::getCMOnlyChapterPath(EncodeFileKey key, EncodeFileKey keyMax) const {
+    StringBuilderT sb;
+    sb.append(_T("%s"), pathRemoveExtension(conf.srcFilePathOrg));
+    if (key.format > 0) {
+        sb.append(_T("-%d"), key.format);
+    }
+    if (keyMax.div > 1) {
+        sb.append(_T("_div%d"), key.div + 1);
+    }
+    sb.append(_T("%s"), GetCMSuffix(key.cm));
     sb.append(_T(".chapter.txt"));
     return sb.str();
 }

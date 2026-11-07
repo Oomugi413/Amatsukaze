@@ -7,6 +7,8 @@
 */
 
 #include "AMTSource.h"
+#include "TrimAdjustAudio.h"
+#include "RGYPoolAV.h"
 #include <string>
 #include <cstdint>
 
@@ -507,7 +509,11 @@ void AMTSource::OnFrameOutput(Frame& frame, IScriptEnvironment* env) {
         lastDecodeFrame = frameIndex;
     }
 
-    prevFrame = std::unique_ptr<Frame>(new Frame(frame));
+    if (framePool && prevFrame) {
+        *prevFrame = frame;
+    } else {
+        prevFrame = std::unique_ptr<Frame>(new Frame(frame));
+    }
 }
 
 void AMTSource::UpdateAccessed(CacheFrame* frame) {
@@ -541,7 +547,7 @@ int AMTSource::ForceGetFrameIndex(int n) {
 }
 
 void AMTSource::DecodeLoop(int goal, IScriptEnvironment* env) {
-    Frame frame;
+    Frame frame(framePool.get());
     AVPacket packet = AVPacket();
 
     // CUVIDはpic_typeが適切にセットされないのでキーフレームかどうかが分からない
@@ -656,6 +662,7 @@ AMTSource::AMTSource(AMTContext& ctx,
     waveFile(audiopath, _T("rb")),
     seekDistance(10),
     lastDecodeFrame(-1),
+    framePool(),
     prevFrame(),
     nonBQPTable(),
     convertPix(),
@@ -776,6 +783,7 @@ void AMTSource::ScanFramesDirect(int begin, int end,
     ClearFrameCache();
     if (!directScanUsed) {
         directScanUsed = true;
+        framePool = std::make_unique<RGYPoolAVFrame>();
         // 色差付きの参照フレームを引き継がず、直接解析用の設定で開始する。
         ResetDecoder(env);
     }
@@ -850,7 +858,8 @@ void SaveAMTSource(
     const VideoFormat& vfmt, const AudioFormat& afmt,
     const std::vector<FilterSourceFrame>& frames,
     const std::vector<FilterAudioFrame>& audioFrames,
-    const DecoderSetting& decoderSetting) {
+    const DecoderSetting& decoderSetting,
+    const std::vector<uint8_t>& primaryAudioFrames) {
     File file(savepath, _T("wb"));
     file.writeArray(std::vector<tchar>(srcpath.begin(), srcpath.end()));
     file.writeArray(std::vector<tchar>(audiopath.begin(), audiopath.end()));
@@ -859,6 +868,11 @@ void SaveAMTSource(
     file.writeArray(frames);
     file.writeArray(audioFrames);
     file.writeValue(decoderSetting);
+    // 既存読込経路は末尾を無視するため、従来のdat形式との互換性を保つ。
+    if (!primaryAudioFrames.empty()) {
+        file.writeValue<uint32_t>(trimadjust::AUDIO_PRIMARY_METADATA_MAGIC);
+        file.writeArray(primaryAudioFrames);
+    }
 }
 
 static std::unique_ptr<AMTSource> LoadAMTSourceInstance(AMTContext& ctx,

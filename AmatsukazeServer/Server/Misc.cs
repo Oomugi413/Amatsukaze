@@ -36,6 +36,8 @@ namespace Amatsukaze.Server
         public string RootDir;
         public LaunchType LaunchType = LaunchType.Standalone;
         public int ServerPort = ServerSupport.DEFAULT_PORT;
+        public string ServerIP;
+        public bool AutoStart;
 
         // ロゴGUI用
         public string FilePath;
@@ -52,6 +54,14 @@ namespace Amatsukaze.Server
                 {
                     ServerPort = int.Parse(args[i + 1]);
                     i++;
+                }
+                else if (arg == "--ip")
+                {
+                    ServerIP = args[++i];
+                }
+                else if (arg == "--auto-start")
+                {
+                    AutoStart = true;
                 }
                 else if(arg == "-l" || arg == "--launch")
                 {
@@ -477,13 +487,18 @@ namespace Amatsukaze.Server
                 throw new ArgumentException("ProcessGroupKind.Noneです");
             }
             var target = masks[(int)setting];
+            if (target == null || target.Length == 0)
+            {
+                // 空構成では固定しない (Mask=0はSetCPUAffinityで変更なし)
+                return new ProcessGroup { Group = -1, Mask = 0 };
+            }
             return target[pid % target.Length];
         }
     }
 
     public class MultipleInstanceException : Exception { }
 
-    public static class ServerSupport
+    public static partial class ServerSupport
     {
         public static readonly int DEFAULT_PORT = 32768;
         public static readonly string AUTO_PREFIX = "自動選択_";
@@ -535,75 +550,121 @@ namespace Amatsukaze.Server
             return "デフォルト";
         }
 
-        public static FileStream GetLock()
+        // 「一時フォルダ: {path}」行にマッチする正規表現。
+        // エンコードログの書式はAmatsukaze内部仕様だが、ログ出力側を変えるときはこれも同時に修正すること。
+        private static readonly Regex TempDirRegex = new Regex(@"一時フォルダ\s*[:：]\s*(.+)", RegexOptions.Compiled);
+
+        // エンコードログファイルから一時フォルダのパスを抽出する。
+        // 一時フォルダはCLIが実行時に決めるためサーバー側では計算できず、ログが唯一の受け渡し経路である点に注意。
+        // 見当たらない場合や読み込み失敗時はnullを返す。
+        public static string ExtractTempDirFromLog(string logPath)
         {
-            if (!Directory.Exists("data"))
-            {
-                Directory.CreateDirectory("data");
-            }
-            var lockPath = Path.Combine("data", "Server.lock");
-            Util.AddLog($"[GetLock] cwd='{Directory.GetCurrentDirectory()}', lock='{lockPath}', pid={Process.GetCurrentProcess().Id}, proc='{Process.GetCurrentProcess().ProcessName}'", null);
             try
             {
-                return new FileStream(Path.Combine("data", "Server.lock"),
-                    FileMode.Create, FileAccess.ReadWrite, FileShare.None);
+                var bytes = File.ReadAllBytes(logPath);
+                var content = Util.AmatsukazeDefaultEncoding.GetString(bytes);
+                var lines = content.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+
+                string rootedPathFallback = null;
+                foreach (var line in lines)
+                {
+                    var match = TempDirRegex.Match(line);
+                    if (match.Success)
+                    {
+                        var dir = match.Groups[1].Value.Trim().Trim('"');
+                        if (string.IsNullOrEmpty(dir))
+                        {
+                            continue;
+                        }
+                        if (Directory.Exists(dir))
+                        {
+                            return dir;
+                        }
+                        if (Path.IsPathRooted(dir))
+                        {
+                            rootedPathFallback = dir;
+                        }
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(rootedPathFallback))
+                {
+                    return rootedPathFallback;
+                }
             }
-            catch(Exception e)
+            catch
             {
-                Util.AddLog($"[GetLock] lock acquisition failed: {e.Message}", e);
+                // ファイル読み込み失敗は無視
+            }
+            return null;
+        }
+
+        public static ServerLock GetLock(ServerInstanceKind kind = ServerInstanceKind.ServerCLI, int port = 0, string rootDir = null)
+        {
+            if (port == 0) port = DEFAULT_PORT;
+            rootDir = Path.GetFullPath(rootDir ?? Directory.GetCurrentDirectory());
+            string path = Path.Combine(rootDir, "data", "Server.lock");
+            Directory.CreateDirectory(Path.GetDirectoryName(path));
+            FileStream stream;
+            try
+            {
+                stream = new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            }
+            catch (IOException e) when (IsLockConflict(e))
+            {
                 throw new MultipleInstanceException();
             }
-        }
-
-        private static string GetStandaloneMailslotName(string rootDir)
-        {
-            return Path.Combine(@"\\.\mailslot", rootDir.Replace(':', '_'), "Amatsukaze");
-        }
-
-        public static FileStream CreateStandaloneMailslot()
-        {
-            var path = GetStandaloneMailslotName(Directory.GetCurrentDirectory());
-            return SystemUtility.CreateMailslot(path);
-        }
-
-        public static async Task WaitStandaloneMailslot(FileStream fs)
-        {
-            byte[] buf = new byte[1];
-            // CreateMailslotの引数を間違えたりすると
-            // ここがビジーウェイトになってしまうので注意
-            while (await fs.ReadAsync(buf, 0, 1) == 0) ;
-        }
-
-        public static async Task TerminateStandalone(string rootDir)
-        {
-            var path = GetStandaloneMailslotName(rootDir);
-            Util.AddLog($"[TerminateStandalone] mailslot='{path}', exists={SystemUtility.TestMailslot(path)}", null);
-            while (true)
+            catch (Exception e)
             {
-                if (SystemUtility.TestMailslot(path))
+                throw new IOException("サーバーロックを取得できません: " + path + "。" + e.Message, e);
+            }
+            return new ServerLock(stream, rootDir, kind, port);
+        }
+
+        public static UserSessionLaunchResult LaunchLocalServer(int port, string rootDir, string launchUser = null)
+        {
+            rootDir = Path.GetFullPath(rootDir);
+            string guiPath = Path.Combine(AppContext.BaseDirectory, "AmatsukazeGUI.exe");
+            if (OperatingSystem.IsWindows() && !string.IsNullOrEmpty(launchUser))
+            {
+                string sid = LaunchUserIdentity.ResolveSid(launchUser);
+                using var identity = WindowsIdentity.GetCurrent();
+                if (identity.User?.Value != sid || IsNonInteractiveServiceContext(out _))
                 {
-                    Util.AddLog("[TerminateStandalone] Server detected. Waiting 10s...", null);
-                    await Task.Delay(10 * 1000);
-                }
-                else
-                {
-                    Util.AddLog("[TerminateStandalone] No server detected. Proceed.", null);
-                    break;
+                    var result = SystemUtility.LaunchProcessInUserSession(sid, guiPath,
+                        "-l server -p " + port + " --auto-start", rootDir);
+                    Console.WriteLine("[AddTask] 指定起動ユーザー={0}、状態={1}、API={2}、Win32={3}: {4}",
+                        launchUser, result.Status, result.ApiName, result.Win32Error, result.Message);
+                    if (result.Status == UserSessionLaunchStatus.Launched) return result;
+                    result.Dispose();
+                    Console.WriteLine("[AddTask] 警告: 現在のアカウントでの起動へ切り替えます。");
                 }
             }
-        }
-
-        public static void LaunchLocalServer(int port, string rootDir)
-        {
-            var exeDefaultAppendix = Util.IsServerWindows() ? ".exe" : "";
-            var exename = Path.Combine(AppContext.BaseDirectory,
-                (Environment.UserInteractive ? "AmatsukazeGUI" + exeDefaultAppendix : "AmatsukazeServerCLI" + exeDefaultAppendix));
-            var args = "-l server -p " + port;
-            Util.AddLog($"[LaunchLocalServer] UserInteractive={Environment.UserInteractive}, exe='{exename}', args='{args}', workdir='{rootDir}'", null);
-            Process.Start(new ProcessStartInfo(exename, args)
+            else if (!string.IsNullOrEmpty(launchUser))
+            {
+                Console.WriteLine("[AddTask] --launch-userはWindowsでのみ有効なため無視します。");
+            }
+            else if (IsNonInteractiveServiceContext(out _))
+            {
+                Console.WriteLine("[AddTask] 警告: 起動ユーザーの指定がありません。通常ユーザーでバッチを再生成するか--launch-userを指定してください。");
+            }
+            bool useGui = Environment.UserInteractive && !IsNonInteractiveServiceContext(out _);
+            string executable = Path.Combine(AppContext.BaseDirectory,
+                (useGui ? "AmatsukazeGUI" : "AmatsukazeServerCLI") + (OperatingSystem.IsWindows() ? ".exe" : ""));
+            var start = new ProcessStartInfo(executable)
             {
                 WorkingDirectory = rootDir,
-            });
+                UseShellExecute = false
+            };
+            start.ArgumentList.Add("-l");
+            start.ArgumentList.Add("server");
+            start.ArgumentList.Add("-p");
+            start.ArgumentList.Add(port.ToString(CultureInfo.InvariantCulture));
+            start.ArgumentList.Add("-r");
+            start.ArgumentList.Add(rootDir);
+            if (OperatingSystem.IsWindows() && useGui) start.ArgumentList.Add("--auto-start");
+            Console.WriteLine("[AddTask] サーバーを起動します: {0}、ルート={1}、ポート={2}", executable, rootDir, port);
+            return UserSessionLaunchResult.FromProcess(Process.Start(start));
         }
 
         // 実行コンテキスト情報（アカウント・セッション・権限・コードページ）をログ用の1行文字列で返す
@@ -614,6 +675,7 @@ namespace Amatsukaze.Server
             try
             {
                 sb.Append($"アカウント={Environment.UserDomainName}\\{Environment.UserName}");
+                sb.Append($", システム機能={SystemUtility.ImplementationName}");
                 if (OperatingSystem.IsWindows())
                 {
                     // セッションID・対話型はWindowsでのみ意味を持つ（サービス起動の切り分け用）
@@ -669,16 +731,10 @@ namespace Amatsukaze.Server
                     reason = "セッション0（サービス用セッション）で実行されています";
                     return true;
                 }
-                using (var identity = WindowsIdentity.GetCurrent())
+                if (IsServiceAccount())
                 {
-                    var sid = identity.User;
-                    if (sid.IsWellKnown(WellKnownSidType.LocalSystemSid) ||
-                        sid.IsWellKnown(WellKnownSidType.LocalServiceSid) ||
-                        sid.IsWellKnown(WellKnownSidType.NetworkServiceSid))
-                    {
-                        reason = "サービス用アカウント（LocalSystem/LocalService/NetworkService）で実行されています";
-                        return true;
-                    }
+                    reason = "サービス用アカウント（LocalSystem/LocalService/NetworkService）で実行されています";
+                    return true;
                 }
                 if (!Environment.UserInteractive)
                 {
@@ -696,25 +752,18 @@ namespace Amatsukaze.Server
         // サーバ（serverモード）が既に稼働しているかをロックファイルで推定する
         public static bool IsServerProcessRunning(string rootDir)
         {
+            string path = Path.Combine(rootDir ?? "", "data", "Server.lock");
             try
             {
-                var dataDir = Path.Combine(rootDir ?? "", "data");
-                var lockPath = Path.Combine(dataDir, "Server.lock");
-                if (!Directory.Exists(dataDir))
-                {
-                    return false;
-                }
-                // 共有なしで一瞬だけ開ければ未起動（すぐ閉じる）
-                using (var fs = new FileStream(lockPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
-                {
-                    fs.Close();
-                    return false;
-                }
+                using var stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+                return false;
             }
-            catch
+            catch (FileNotFoundException) { return false; }
+            catch (DirectoryNotFoundException) { return false; }
+            catch (IOException e) when (IsLockConflict(e)) { return true; }
+            catch (Exception e)
             {
-                // 共有できなければ誰かが保持している = 稼働中とみなす
-                return true;
+                throw new IOException("サーバーロックの状態を確認できません: " + path + "。" + e.Message, e);
             }
         }
 

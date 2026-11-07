@@ -29,7 +29,42 @@ float CorrelationScore_AVX2(const float* kernels, const float* work, int width,
     __m128 result = _mm_setzero_ps();
     const __m128 scaleCountValue = _mm_set_ss((float)scaleCount);
     const __m128 maxValue = _mm_set_ss(maxv);
-    for (size_t i = 0; i < count; i++) {
+    constexpr size_t coordinatesPerBatch = 8;
+    const __m256 scaleCounts = _mm256_set1_ps((float)scaleCount);
+    const __m256 maxValues = _mm256_set1_ps(maxv);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 minusOne = _mm256_set1_ps(-1.0f);
+    size_t i = 0;
+    for (; i + coordinatesPerBatch <= count; i += coordinatesPerBatch) {
+        alignas(32) float avgs[coordinatesPerBatch], sums[coordinatesPerBatch];
+        alignas(32) int indices[coordinatesPerBatch];
+        alignas(32) float scaleValues[coordinatesPerBatch], scale2Values[coordinatesPerBatch];
+        for (size_t lane = 0; lane < coordinatesPerBatch; lane++) {
+            const size_t coordinate = i + lane;
+            sums[lane] = CalcCorrelation5x5_AVX_AVX2<true, true>(kernels + coordinate * 25,
+                work, coordinates[coordinate].first, coordinates[coordinate].second, width, avgs + lane);
+        }
+        // 座標内の画素縮約は変更せず、独立した8座標の乗算と除算だけをまとめる。
+        const __m256 indexValues = _mm256_div_ps(_mm256_mul_ps(_mm256_load_ps(avgs), scaleCounts), maxValues);
+        const __m256i indicesClamped = _mm256_max_epi32(_mm256_setzero_si256(),
+            _mm256_min_epi32(_mm256_set1_epi32(scaleCount), _mm256_cvttps_epi32(indexValues)));
+        _mm256_store_si256((__m256i*)indices, indicesClamped);
+        for (size_t lane = 0; lane < coordinatesPerBatch; lane++) {
+            const auto& scale = scales[(i + lane) * scaleCount + indices[lane]];
+            scaleValues[lane] = scale.scale;
+            scale2Values[lane] = scale.scale2;
+        }
+        const __m256 scaled = _mm256_mul_ps(_mm256_load_ps(sums), _mm256_load_ps(scaleValues));
+        // std::min(1, NaN)は1を返すので、MINPSでは定数を第2引数に置く。
+        const __m256 normalized = _mm256_max_ps(_mm256_min_ps(scaled, one), minusOne);
+        alignas(32) float scores[coordinatesPerBatch];
+        _mm256_store_ps(scores, _mm256_mul_ps(normalized, _mm256_load_ps(scale2Values)));
+        // 座標間の累積順も従来どおりに保つ。
+        for (size_t lane = 0; lane < coordinatesPerBatch; lane++) {
+            result = _mm_add_ss(result, _mm_load_ss(scores + lane));
+        }
+    }
+    for (; i < count; i++) {
         float avg;
         const float sum = CalcCorrelation5x5_AVX_AVX2<true, true>(kernels + i * 25,
             work, coordinates[i].first, coordinates[i].second, width, &avg);
@@ -360,6 +395,30 @@ void PackBackground32Fixed88_AVX2(const float* bg, uint32_t validMask, uint16_t*
     }
 }
 
+// 救済辺を32画素分まとめて集計し、画像内に辺全体が収まるlaneだけ返す。
+uint32_t CalcBgRetrySideStats32U8_AVX2(const uint8_t* src, int stride, int width, int height,
+    int sx, int sy, int len, bool horizontal, uint16_t* sums, uint8_t* mins, uint8_t* maxs) {
+    const int lastStart = width - (horizontal ? len : 1);
+    if (sy < 0 || sy + (horizontal ? 1 : len) > height) return 0;
+    const int firstLane = std::max(0, -sx);
+    const int lastLane = std::min(31, lastStart - sx);
+    if (firstLane > lastLane) return 0;
+    // 呼び出し元の基準32画素が左右半径を含めて収まるため、32本の安全な辺を確保できる。
+    assert(len > 0 && len <= 65 && lastStart >= 31);
+    // 境界ではロードの起点を内側へ寄せ、対象laneの結果だけ元の位置へ戻す。
+    const int safeX = std::max(0, std::min(sx, lastStart - 31));
+    alignas(32) uint16_t safeSums[32];
+    alignas(32) uint8_t safeMins[32], safeMaxs[32];
+    CalcBgSideStatsBlock32U8_AVX2Impl(src + sy * stride + safeX,
+        horizontal ? 1 : stride, len, safeSums, safeMins, safeMaxs);
+    const int count = lastLane - firstLane + 1;
+    const int offset = sx + firstLane - safeX;
+    memcpy(sums + firstLane, safeSums + offset, count * sizeof(uint16_t));
+    memcpy(mins + firstLane, safeMins + offset, count);
+    memcpy(maxs + firstLane, safeMaxs + offset, count);
+    return (uint32_t)(((uint64_t(1) << count) - 1) << firstLane);
+}
+
 void CalcBgSideStatsBlock32U8_AVX2(const uint8_t* src, int stride, int x, int y, int radius,
     uint16_t* sideSums, uint8_t* sideMins, uint8_t* sideMaxs) {
     constexpr int lanes = 32;
@@ -380,53 +439,72 @@ void CalcBgSideStatsBlock32U8_AVX2(const uint8_t* src, int stride, int x, int y,
     }
 }
 
+// 独立した8画素の組を並べ、近傍内の加算順を保ったまま依存鎖を分離する。
+template<int groups>
+RGY_FORCEINLINE void BilateralFilter5x5U8RangeLUTBlockAVX2(uint8_t* dst, const uint8_t* centerRow,
+    const uint8_t* const* rowPtrs, const int x, const float* spatial, const float* rangeWeight) {
+    constexpr int lanes = 8;
+    __m128i centers[groups];
+    __m256 weightSums[groups], valueSums[groups];
+    for (int group = 0; group < groups; group++) {
+        centers[group] = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(centerRow + x + group * lanes));
+        weightSums[group] = _mm256_setzero_ps();
+        valueSums[group] = _mm256_setzero_ps();
+    }
+    int k = 0;
+    for (int row = 0; row < 5; row++) {
+        // 近傍の全展開でレジスタが不足しないよう、2組の依存鎖を小さなループで進める。
+#if defined(__clang__)
+#pragma clang loop unroll(disable)
+#elif defined(__GNUC__)
+#pragma GCC unroll 1
+#endif
+        for (int dx = -2; dx <= 2; dx++, k++) {
+            const __m256 spatialWeight = _mm256_set1_ps(spatial[k]);
+            for (int group = 0; group < groups; group++) {
+                const __m128i ref8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(rowPtrs[row] + x + group * lanes + dx));
+                const __m128i diff8 = _mm_add_epi8(_mm_subs_epu8(centers[group], ref8), _mm_subs_epu8(ref8, centers[group]));
+                const __m256i diff32 = _mm256_cvtepu8_epi32(diff8);
+                const __m256 weight = _mm256_mul_ps(spatialWeight, _mm256_i32gather_ps(rangeWeight, diff32, sizeof(float)));
+                const __m256 value = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(ref8));
+                weightSums[group] = _mm256_add_ps(weightSums[group], weight);
+                valueSums[group] = _mm256_fmadd_ps(weight, value, valueSums[group]);
+            }
+        }
+    }
+    for (int group = 0; group < groups; group++) {
+        const __m256 value = _mm256_div_ps(valueSums[group], weightSums[group]);
+        // 従来どおり0.5を加えて切り捨て、整数の飽和パックで0..255に収める。
+        const __m256i rounded = _mm256_cvttps_epi32(_mm256_add_ps(value, _mm256_set1_ps(0.5f)));
+        const __m128i words = _mm_packs_epi32(_mm256_castsi256_si128(rounded), _mm256_extracti128_si256(rounded, 1));
+        const __m128i bytes = _mm_packus_epi16(words, words);
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(dst + x + group * lanes), bytes);
+    }
+}
+
 void BilateralFilter5x5U8RangeLUT_AVX2(uint8_t* dst, const uint8_t* srcBase, int srcPitch, int w, int h, const float* spatial, const float* rangeWeight, uint8_t maxv, int y0, int y1) {
     (void)maxv;
     constexpr int radius = 2;
     constexpr int lanes = 8;
-    alignas(32) float outBuf[lanes];
-
+    constexpr int groups = 2;
     for (int y = y0; y < y1; y++) {
         uint8_t* dstRow = dst + y * w;
         const uint8_t* centerRow = srcBase + y * srcPitch;
         const uint8_t* rowPtrs[5];
         for (int dy = -radius; dy <= radius; dy++) {
-            const int yy = std::clamp(y + dy, 0, h - 1);
-            rowPtrs[dy + radius] = srcBase + yy * srcPitch;
+            rowPtrs[dy + radius] = srcBase + std::clamp(y + dy, 0, h - 1) * srcPitch;
         }
-
         int x = 0;
         for (; x < std::min(radius, w); x++) {
             dstRow[x] = BilateralFilter5x5U8RangeLUTScalarPixel(srcBase, srcPitch, w, h, x, y, spatial, rangeWeight);
         }
-
         const int xVecEnd = std::max(radius, w - radius);
-        for (; x + lanes <= xVecEnd; x += lanes) {
-            const __m128i center8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(centerRow + x));
-            const __m256 centerf = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(center8));
-            __m256 wsum = _mm256_setzero_ps();
-            __m256 vsum = _mm256_setzero_ps();
-            int k = 0;
-
-            for (int row = 0; row < 5; row++) {
-                for (int dx = -radius; dx <= radius; dx++, k++) {
-                    const __m128i ref8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(rowPtrs[row] + x + dx));
-                    const __m128i diff8 = _mm_add_epi8(_mm_subs_epu8(center8, ref8), _mm_subs_epu8(ref8, center8));
-                    const __m256i diff32 = _mm256_cvtepu8_epi32(diff8);
-                    const __m256 ww = _mm256_mul_ps(_mm256_set1_ps(spatial[k]), _mm256_i32gather_ps(rangeWeight, diff32, sizeof(float)));
-                    const __m256 refv = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(ref8));
-                    wsum = _mm256_add_ps(wsum, ww);
-                    vsum = _mm256_fmadd_ps(ww, refv, vsum);
-                }
-            }
-
-            const __m256 outv = _mm256_div_ps(vsum, wsum);
-            _mm256_store_ps(outBuf, outv);
-            for (int i = 0; i < lanes; i++) {
-                dstRow[x + i] = (uint8_t)std::clamp((int)(outBuf[i] + 0.5f), 0, 255);
-            }
+        for (; x + groups * lanes <= xVecEnd; x += groups * lanes) {
+            BilateralFilter5x5U8RangeLUTBlockAVX2<groups>(dstRow, centerRow, rowPtrs, x, spatial, rangeWeight);
         }
-
+        for (; x + lanes <= xVecEnd; x += lanes) {
+            BilateralFilter5x5U8RangeLUTBlockAVX2<1>(dstRow, centerRow, rowPtrs, x, spatial, rangeWeight);
+        }
         for (; x < w; x++) {
             dstRow[x] = BilateralFilter5x5U8RangeLUTScalarPixel(srcBase, srcPitch, w, h, x, y, spatial, rangeWeight);
         }

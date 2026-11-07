@@ -28,6 +28,8 @@ namespace Amatsukaze.Server.Rest
         private sealed class DecodeBundleContext : IDisposable
         {
             private readonly object syncRoot = new object();
+            private readonly object audioSyncRoot = new object();
+            private bool disposed;
             private readonly AMTContext ctx;
             private readonly TrimAdjust trimadj;
 
@@ -45,6 +47,7 @@ namespace Amatsukaze.Server.Rest
             {
                 lock (syncRoot)
                 {
+                    if (disposed) throw new ObjectDisposedException(nameof(DecodeBundleContext));
                     var video = trimadj.GetFrameJpeg(frameNumber);
                     if (video == null || video.Length == 0)
                     {
@@ -65,14 +68,32 @@ namespace Amatsukaze.Server.Rest
             {
                 lock (syncRoot)
                 {
+                    if (disposed) throw new ObjectDisposedException(nameof(DecodeBundleContext));
                     return trimadj.GetFrameInfo(frameNumber, out pts, out duration, out keyFrame, out cmType);
+                }
+            }
+
+            public byte[] GetAudioWav(int startFrame, int endFrame)
+            {
+                // 映像デコードとは独立して、ネイティブバッファのコピーまで排他する。
+                lock (audioSyncRoot)
+                {
+                    if (disposed) throw new ObjectDisposedException(nameof(DecodeBundleContext));
+                    var pcm = trimadj.GetAudioPcm(startFrame, endFrame, out var sampleRate, out var channels);
+                    return pcm == null ? null : BuildAudioWav(pcm, sampleRate, channels);
                 }
             }
 
             public void Dispose()
             {
-                trimadj?.Dispose();
-                ctx?.Dispose();
+                lock (syncRoot)
+                lock (audioSyncRoot)
+                {
+                    if (disposed) return;
+                    disposed = true;
+                    trimadj?.Dispose();
+                    ctx?.Dispose();
+                }
             }
         }
 
@@ -164,6 +185,35 @@ namespace Amatsukaze.Server.Rest
             }
             RequestPrefetch(frameNumber);
             return entry.WaveformJpeg;
+        }
+
+        public byte[] GetAudioWav(int startFrame, int endFrame)
+        {
+            Touch();
+            return onDemandContext.GetAudioWav(startFrame, endFrame);
+        }
+
+        internal static byte[] BuildAudioWav(byte[] pcm, int sampleRate, int channels)
+        {
+            if (pcm == null || sampleRate <= 0 || channels != 2 || pcm.Length % (channels * 2) != 0)
+                throw new ArgumentException("音声PCMの形式が不正です");
+            using var ms = new MemoryStream(checked(44 + pcm.Length));
+            using var writer = new BinaryWriter(ms, Encoding.ASCII, leaveOpen: true);
+            writer.Write(Encoding.ASCII.GetBytes("RIFF"));
+            writer.Write(checked(36 + pcm.Length));
+            writer.Write(Encoding.ASCII.GetBytes("WAVEfmt "));
+            writer.Write(16);
+            writer.Write((short)1);
+            writer.Write((short)channels);
+            writer.Write(sampleRate);
+            writer.Write(checked(sampleRate * channels * 2));
+            writer.Write((short)(channels * 2));
+            writer.Write((short)16);
+            writer.Write(Encoding.ASCII.GetBytes("data"));
+            writer.Write(pcm.Length);
+            writer.Write(pcm);
+            writer.Flush();
+            return ms.ToArray();
         }
 
         private static byte[] BuildBundle(CacheEntry entry)
@@ -412,7 +462,7 @@ namespace Amatsukaze.Server.Rest
 
     public class TrimAdjustService : IDisposable
     {
-        private static readonly Regex TempDirRegex = new Regex(@"一時フォルダ\s*[:：]\s*(.+)", RegexOptions.Compiled);
+        public static bool AudioPlaybackEnabled => Environment.GetEnvironmentVariable("AMT_TRIM_AUDIO_PLAYBACK") == "1";
         private static readonly Regex TrimRegex = new Regex(@"Trim\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)", RegexOptions.Compiled);
         // jls0.txt: "開始 終了 秒数 端数フレーム ロゴ秒数 :ラベル"(ラベルなしの旧形式もあり)
         private static readonly Regex JlsLineRegex = new Regex(@"^\s*(\d+)\s+(\d+)\s+(\d+)\s+(-?\d+)\s+(\d+)(?:\s*:(\S*))?", RegexOptions.Compiled);
@@ -456,7 +506,7 @@ namespace Amatsukaze.Server.Rest
                 return false;
             }
 
-            var tempDir = ExtractTempDirFromLog(logPath);
+            var tempDir = ServerSupport.ExtractTempDirFromLog(logPath);
             if (string.IsNullOrEmpty(tempDir))
             {
                 error = "ログファイルから一時フォルダが取得できませんでした";
@@ -525,6 +575,7 @@ namespace Amatsukaze.Server.Rest
                     DivisionPoints = divisionPoints,
                     FramePts = framePts,
                     JlsSegments = jlsSegments,
+                    AudioPlaybackEnabled = AudioPlaybackEnabled,
                     CmSegAnnotationEnabled = session.CmSegAnnotation != null,
                     CmSegAnnotationError = cmSegError
                 };
@@ -579,7 +630,7 @@ namespace Amatsukaze.Server.Rest
             }
 
             // CMCheck済みアイテムのみ対象
-            if (item.Mode != Amatsukaze.Server.ProcMode.CMCheck)
+            if ((item.Mode != Amatsukaze.Server.ProcMode.CMCheck && item.Mode != Amatsukaze.Server.ProcMode.TrimAdjust))
             {
                 error = "CM解析タスク以外は削除できません";
                 return false;
@@ -600,7 +651,7 @@ namespace Amatsukaze.Server.Rest
                 return true;
             }
 
-            var tempDir = ExtractTempDirFromLog(logPath);
+            var tempDir = ServerSupport.ExtractTempDirFromLog(logPath);
             if (string.IsNullOrEmpty(tempDir))
             {
                 // 一時フォルダが特定できなければスキップ（エラーにはしない）
@@ -725,7 +776,7 @@ namespace Amatsukaze.Server.Rest
             {
                 throw new InvalidOperationException("完了していないキューアイテムは再投入できません");
             }
-            if (sourceItem.Mode != Amatsukaze.Server.ProcMode.CMCheck && !sourceItem.IsBatch)
+            if ((sourceItem.Mode != Amatsukaze.Server.ProcMode.CMCheck && sourceItem.Mode != Amatsukaze.Server.ProcMode.TrimAdjust) && !sourceItem.IsBatch)
             {
                 throw new InvalidOperationException("CM解析またはエンコード済みのキューアイテムだけ再投入できます");
             }
@@ -739,7 +790,7 @@ namespace Amatsukaze.Server.Rest
             var logPath = state.ResolveTaskLogPathById(sourceItem.Id);
             if (!string.IsNullOrEmpty(logPath) && File.Exists(logPath))
             {
-                var tempDir = ExtractTempDirFromLog(logPath);
+                var tempDir = ServerSupport.ExtractTempDirFromLog(logPath);
                 if (!string.IsNullOrEmpty(tempDir) && File.Exists(Path.Combine(tempDir, "resume.dat")))
                 {
                     resumeDir = tempDir;
@@ -762,49 +813,6 @@ namespace Amatsukaze.Server.Rest
                 QueueItemId = newItem.Id,
                 ReuseTempDir = !string.IsNullOrEmpty(resumeDir)
             };
-        }
-
-        // ログファイルから「一時フォルダ: {path}」を抽出
-        private static string ExtractTempDirFromLog(string logPath)
-        {
-            try
-            {
-                var bytes = File.ReadAllBytes(logPath);
-                var content = Util.AmatsukazeDefaultEncoding.GetString(bytes);
-                var lines = content.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
-
-                string rootedPathFallback = null;
-                foreach (var line in lines)
-                {
-                    var match = TempDirRegex.Match(line);
-                    if (match.Success)
-                    {
-                        var dir = match.Groups[1].Value.Trim().Trim('"');
-                        if (string.IsNullOrEmpty(dir))
-                        {
-                            continue;
-                        }
-                        if (Directory.Exists(dir))
-                        {
-                            return dir;
-                        }
-                        if (Path.IsPathRooted(dir))
-                        {
-                            rootedPathFallback = dir;
-                        }
-                    }
-                }
-
-                if (!string.IsNullOrEmpty(rootedPathFallback))
-                {
-                    return rootedPathFallback;
-                }
-            }
-            catch
-            {
-                // ファイル読み込み失敗は無視
-            }
-            return null;
         }
 
         // Trim AVSを読み込み: {srcPath}.trim.avs 優先、なければ {tempDir}/trim0.avs

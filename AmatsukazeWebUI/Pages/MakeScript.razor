@@ -62,6 +62,17 @@ else
                     </label>
                 </td>
             </tr>
+            @if (_serverEnvLoaded && _serverIsWindows && IsBatSelected)
+            {
+                <tr>
+                    <th title="PC名\ユーザー名、ドメイン\ユーザー名、またはSIDを指定します。空欄では指定しません。バッチファイル作成時は&quot;S-1-&quot;ではじまるSIDに変換します。">起動ユーザー</th>
+                    <td>
+                        <input value="@_edit.LaunchUser" @onchange="OnLaunchUserChanged" placeholder="PC名\ユーザー名またはSID"
+                               title="PC名\ユーザー名、ドメイン\ユーザー名、またはSIDを指定します。空欄では指定しません。バッチファイル作成時は&quot;S-1-&quot;ではじまるSIDに変換します。" />
+                        <div class="text-muted">サーバー未起動時に使用。空欄ではAddTaskと同じアカウントで起動します。</div>
+                    </td>
+                </tr>
+            }
             <tr>
                 <th>プロファイル</th>
                 <td>
@@ -157,12 +168,15 @@ else
                     </td>
                 </tr>
             }
-            <tr>
-                <th>_EDCBX_DIRECT_</th>
-                <td>
-                    <input type="checkbox" checked="@_edit.IsDirect" @onchange="OnDirectChanged" />
-                </td>
-            </tr>
+            @if (!IsShSelected)
+            {
+                <tr>
+                    <th>_EDCBX_DIRECT_</th>
+                    <td>
+                        <input type="checkbox" checked="@_edit.IsDirect" @onchange="OnDirectChanged" />
+                    </td>
+                </tr>
+            }
         </table>
     }
 
@@ -184,6 +198,7 @@ else
     private string? _error;
     private bool _loading = true;
     private bool _updating;
+    private bool _updatePending;
     private readonly List<string> _profileNames = new();
     private readonly List<string> _addQueueBatFiles = new();
     private readonly List<int> _priorities = new() { 1, 2, 3, 4, 5 };
@@ -192,6 +207,8 @@ else
     private bool _isLocalHost;
     private string _scriptType = "bat";
     private bool _serverIsWindows = true;
+    // 起動ユーザー欄はWindows専用なので、サーバー環境の取得に成功したときだけ表示する。
+    private bool _serverEnvLoaded;
     private string? _remoteHost;
     private string? _wolSubnet;
     private string? _wolMac;
@@ -201,6 +218,8 @@ else
     private async Task ReloadAsync()
     {
         _loading = true;
+        _serverIsWindows = true;
+        _serverEnvLoaded = false;
         _error = null;
         _data = null;
         _edit = null;
@@ -262,6 +281,7 @@ else
         if (envRes.Ok && envRes.Data != null)
         {
             _serverIsWindows = !envRes.Data.IsServerLinux;
+            _serverEnvLoaded = true;
         }
         _scriptType = _serverIsWindows ? "bat" : "sh";
         _remoteHost = GetRemoteHost();
@@ -310,8 +330,16 @@ else
             WithRelated = src.WithRelated,
             IsDirect = src.IsDirect,
             Priority = src.Priority,
+            LaunchUser = src.LaunchUser,
             AddQueueBat = src.AddQueueBat
         };
+    }
+
+    private async Task OnLaunchUserChanged(ChangeEventArgs e)
+    {
+        if (_edit == null) return;
+        _edit.LaunchUser = e.Value?.ToString() ?? "";
+        await UpdatePreviewAsync();
     }
 
     private async Task OnProfileChanged(ChangeEventArgs e)
@@ -408,22 +436,38 @@ else
 
     private async Task UpdatePreviewAsync()
     {
-        if (_edit == null || _updating)
-        {
-            return;
-        }
+        if (_edit == null) return;
+        _updatePending = true;
+        if (_updating) return;
         _updating = true;
+        try
+        {
+            // 通信中に確定した入力も、最後の保存とプレビューに反映する。
+            while (_updatePending)
+            {
+                _updatePending = false;
+                await UpdatePreviewCoreAsync();
+            }
+        }
+        finally { _updating = false; }
+    }
+
+    private async Task UpdatePreviewCoreAsync()
+    {
         _error = null;
-        var updateRes = await Api.UpdateMakeScriptAsync(_edit);
+        _preview = null;
+        _downloadUrl = null;
+        var edit = Clone(_edit);
+        if (edit == null) return;
+        var updateRes = await Api.UpdateMakeScriptAsync(edit);
         if (!updateRes.Ok)
         {
             _error = updateRes.Error ?? "Failed to update makescript.";
-            _updating = false;
             return;
         }
         var req = new MakeScriptGenerateRequest
         {
-            MakeScriptData = _edit,
+            MakeScriptData = edit,
             TargetHost = _isLocalHost ? "local" : "remote",
             ScriptType = _scriptType,
             RemoteHost = _isLocalHost ? null : _remoteHost,
@@ -440,7 +484,6 @@ else
             _preview = previewRes.Data;
             UpdateDownload();
         }
-        _updating = false;
     }
 
     private void UpdateDownload()

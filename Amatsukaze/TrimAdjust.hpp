@@ -9,6 +9,8 @@
 
 #include "AMTSource.h"
 #include "JpegCompress.h"
+#include "TrimAdjustAudio.h"
+#include "PreviewColor.h"
 
 #include <mutex>
 
@@ -22,13 +24,15 @@ class GUITrimAdjust : public AMTObject {
 
     // AviSynth環境
     IScriptEnvironment2* env;
-    PClip yuvClip; // ConvertToYV16適用済みクリップ (planar YUV422P)
+    PClip yuvClip; // インタレはYUV422、プログレはYUV420
+    PreviewColorConverter colorConverter;
     int width, height;
     int numFrames;
 
     // amts0.datから読み込んだ音声データ（波形表示用）
     std::vector<FilterAudioFrame> audioFrames;
     AudioFormat afmt;
+    std::vector<uint8_t> primaryAudioFrames;
     tstring audioFilePath; // waveファイルパス
     int audioSamplesPerFrame; // 通常1024(AAC)
 
@@ -49,6 +53,8 @@ class GUITrimAdjust : public AMTObject {
     std::vector<uint8_t> waveformJpegBuffer;
 
     std::mutex mutex;
+    std::mutex audioMutex;
+    std::vector<int16_t> audioPcmBuffer;
 
     // AviSynth環境を作成しAMTSourceプラグイン経由でクリップを構築
     void initAviSynth(const tstring& datFilePath, int scaleMode) {
@@ -81,11 +87,13 @@ class GUITrimAdjust : public AMTObject {
             width = srcVi.width;
             height = srcVi.height;
 
-            // インタレース判定に基づきConvertToYV16 (planar YUV422P) を適用
+            // インタレは従来の422経路を維持。プログレはAMTSourceの420をそのまま利用する。
             const bool interlaced = !vfmt.progressive;
             AVSValue convertArgs[] = { amtClip, interlaced };
             const char* convertNames[] = { nullptr, "interlaced" };
-            AVSValue yuvResult = env->Invoke("ConvertToYV16", AVSValue(convertArgs, 2), convertNames);
+            AVSValue yuvResult = interlaced
+                ? env->Invoke("ConvertToYUV422", AVSValue(convertArgs, 2), convertNames)
+                : (srcVi.Is420() ? amtClip : env->Invoke("ConvertToYUV420", AVSValue(convertArgs, 2), convertNames));
             PClip convertedClip = yuvResult.AsClip();
 
             // scaleMode!=0: 縮小プレビュー
@@ -100,8 +108,10 @@ class GUITrimAdjust : public AMTObject {
             }
 
             if (scaleDen > 1) {
-                const int resizeWidth = std::max(1, (width * scaleNum) / scaleDen);
-                const int resizeHeight = std::max(1, (height * scaleNum) / scaleDen);
+                const int resizeWidth = interlaced ? std::max(1, (width * scaleNum) / scaleDen)
+                    : std::max(2, ((width * scaleNum) / scaleDen) & ~1);
+                const int resizeHeight = interlaced ? std::max(1, (height * scaleNum) / scaleDen)
+                    : std::max(2, ((height * scaleNum) / scaleDen) & ~1);
                 if (interlaced) {
                     // interlaced=true: SeparateFields -> BilinearResize -> Weave
                     AVSValue sepArgs[] = { yuvResult };
@@ -124,6 +134,7 @@ class GUITrimAdjust : public AMTObject {
                 yuvClip = convertedClip;
             }
 
+            // 高ビット深度は保持し、最後の色変換と同時にJPEGの8bitへ丸める。
             // 最終的なサイズを取得
             const VideoInfo& finalVi = yuvClip->GetVideoInfo();
             width = finalVi.width;
@@ -157,6 +168,14 @@ public:
         frames = file.readArray<FilterSourceFrame>();
         audioFrames = file.readArray<FilterAudioFrame>();
         file.readValue<DecoderSetting>();
+        if (!readAudioPrimaryFlags(file.size() - file.pos(), audioFrames.size(),
+            [&](void* dest, size_t bytes) {
+                if (file.read(MemoryChunk(static_cast<uint8_t*>(dest), bytes)) != bytes) {
+                    THROW(FormatException, "音声再生用メタデータが不足しています");
+                }
+            }, primaryAudioFrames)) {
+            THROW(FormatException, "音声再生用メタデータが不正です");
+        }
 
         // audioSamplesPerFrameを算出 (AMTSource.cppと同じロジック)
         if (!audioFrames.empty()) {
@@ -211,18 +230,46 @@ public:
         }
         try {
             PVideoFrame frame = yuvClip->GetFrame(frameNumber, env);
-            // YV16 (planar YUV422P) の各プレーンを取得
+            // 422/420を維持してJPEGの行列・レンジへ変換する。
             const uint8_t* planes[3] = {
                 frame->GetReadPtr(PLANAR_Y),
                 frame->GetReadPtr(PLANAR_U),
                 frame->GetReadPtr(PLANAR_V),
             };
-            const int strides[3] = {
+            int strides[3] = {
                 frame->GetPitch(PLANAR_Y),
                 frame->GetPitch(PLANAR_U),
                 frame->GetPitch(PLANAR_V),
             };
-            if (!jpeg_utils::compressYUV422PToJpeg(planes, strides, width, height, JPEG_QUALITY, jpegBuffer)) {
+            const bool progressive = vfmt.progressive;
+            const bool bt2020 = vfmt.colorSpace == AVCOL_SPC_BT2020_NCL || vfmt.colorSpace == AVCOL_SPC_BT2020_CL;
+            const bool constantLuminance = vfmt.colorSpace == AVCOL_SPC_BT2020_CL;
+            const bool hlg = progressive && bt2020 && vfmt.transferCharacteristics == AVCOL_TRC_ARIB_STD_B67;
+            PreviewMatrix matrix;
+            switch (vfmt.colorSpace) {
+            case AVCOL_SPC_BT709: matrix = PreviewMatrix::BT709; break;
+            case AVCOL_SPC_BT470BG: case AVCOL_SPC_SMPTE170M: matrix = PreviewMatrix::BT601; break;
+            case AVCOL_SPC_BT2020_NCL: matrix = PreviewMatrix::BT2020; break;
+            case AVCOL_SPC_FCC: matrix = PreviewMatrix::FCC; break;
+            case AVCOL_SPC_SMPTE240M: matrix = PreviewMatrix::SMPTE240M; break;
+            default: matrix = vfmt.height > 576 ? PreviewMatrix::BT709 : PreviewMatrix::BT601; break;
+            }
+            // HLGと非線形な一定輝度BT.2020だけ浮動小数点経路を使う。
+            const auto& converted = hlg || constantLuminance
+                ? colorConverter.convert(planes, strides, width, height, yuvClip->GetVideoInfo().BitsPerComponent(),
+                    hlg, constantLuminance, !progressive)
+                : colorConverter.convertInteger(planes, strides, width, height, yuvClip->GetVideoInfo().BitsPerComponent(),
+                    matrix, !progressive);
+            const size_t ySize = size_t(width) * height;
+            planes[0] = converted.data();
+            planes[1] = planes[0] + ySize;
+            planes[2] = planes[1] + ySize / (progressive ? 4 : 2);
+            strides[0] = width;
+            strides[1] = strides[2] = width / 2;
+            const bool success = progressive
+                ? jpeg_utils::compressYUV420PToJpeg(planes, strides, width, height, JPEG_QUALITY, jpegBuffer)
+                : jpeg_utils::compressYUV422PToJpeg(planes, strides, width, height, JPEG_QUALITY, jpegBuffer);
+            if (!success) {
                 return false;
             }
             *jpegData = jpegBuffer.data();
@@ -258,10 +305,40 @@ public:
         return true;
     }
 
+    // 戻り値:1=成功、0=音声なし、-1=範囲不正、-2=読込失敗。
+    // バッファは次の音声取得まで有効。呼出側でコピー完了まで音声要求を直列化する。
+    int getAudioPcm(int startFrame, int endFrame, const int16_t** data,
+        int* sampleCount, int* sampleRate, int* channels) {
+        std::lock_guard<std::mutex> lock(audioMutex);
+        *data = nullptr;
+        *sampleCount = *sampleRate = *channels = 0;
+        double startSec, endSec;
+        if (!audioPlaybackRange(frames, startFrame, endFrame, startSec, endSec)) return -1;
+        if (audioFrames.empty() || afmt.sampleRate <= 0 || audioFilePath.empty()) return 0;
+        try {
+            File waveFile(audioFilePath, _T("rb"));
+            if (!readAudioPcm(audioFrames, audioSamplesPerFrame, afmt.sampleRate, startSec, endSec,
+                [&](size_t index) { return audioPrimaryOnly(primaryAudioFrames, index, afmt.channels == AUDIO_2LANG); },
+                [&](int64_t offset, int16_t* dest, size_t bytes) {
+                    waveFile.seek(offset, SEEK_SET);
+                    if (waveFile.read(MemoryChunk(reinterpret_cast<uint8_t*>(dest), bytes)) != bytes) {
+                        THROW(IOException, "音声PCMデータが不足しています");
+                    }
+                }, audioPcmBuffer)) return 0;
+            *data = audioPcmBuffer.data();
+            *sampleCount = static_cast<int>(audioPcmBuffer.size());
+            *sampleRate = afmt.sampleRate;
+            *channels = 2;
+            return 1;
+        } catch (...) {
+            return -2;
+        }
+    }
+
     // フレームnに対応する音声波形をJPEG画像として取得
     // 前後WAVEFORM_WINDOW_HALF秒の範囲をレンダリングし、中央にセンターラインを描画
     bool getWaveformJpeg(int frameNumber, const uint8_t** jpegData, int* jpegSize) {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::lock_guard<std::mutex> lock(audioMutex);
         if (audioFrames.empty() || afmt.sampleRate == 0 || audioFilePath.empty()) {
             return false; // 音声データなし
         }
@@ -269,65 +346,25 @@ public:
             return false;
         }
 
-        // 1. フレームnの時間位置（秒）を算出
-        const double basePts = (!frames.empty()) ? (double)frames[0].framePTS : 0.0;
-        const double frameSec = ((double)frames[frameNumber].framePTS - basePts) / 90000.0;
-        double frameDurSec;
-        if (frameNumber + 1 < (int)frames.size()) {
-            frameDurSec = ((double)frames[frameNumber + 1].framePTS
-                         - (double)frames[frameNumber].framePTS) / 90000.0;
-        } else {
-            frameDurSec = (frameNumber > 0)
-                ? ((double)frames[frameNumber].framePTS
-                 - (double)frames[frameNumber - 1].framePTS) / 90000.0
-                : 1.0 / 30.0;
-        }
-
-        // 2. 表示範囲: 前後WAVEFORM_WINDOW_HALF秒、フレーム中心
+        const double frameSec = audioFrameStartSeconds(frames, frameNumber);
+        const double frameDurSec = audioFrameDurationSeconds(frames, frameNumber);
         const double centerSec = frameSec + frameDurSec * 0.5;
         const double startSec = std::max(0.0, centerSec - WAVEFORM_WINDOW_HALF);
         const double endSec = centerSec + WAVEFORM_WINDOW_HALF;
 
-        // 3. サンプル範囲を算出
-        const int totalAudioSamples = audioSamplesPerFrame * (int)audioFrames.size();
-        int sampleStart = clamp((int)(startSec * afmt.sampleRate), 0, totalAudioSamples);
-        int sampleEnd   = clamp((int)(endSec   * afmt.sampleRate), 0, totalAudioSamples);
-        if (sampleStart >= sampleEnd) return false;
-        const int sampleCount = sampleEnd - sampleStart;
-
-        // 4. waveファイルからPCMサンプルを読み込み（audioFrame単位でまとめて読む）
-        const int sampleBytes = 4; // 16bitステレオ: int16_t L + int16_t R
-        std::vector<int16_t> monoSamples(sampleCount, 0);
-        {
-            File waveFile(audioFilePath, _T("rb"));
-            const int afIdxStart = sampleStart / audioSamplesPerFrame;
-            const int afIdxEnd = std::min((sampleEnd - 1) / audioSamplesPerFrame + 1,
-                                          (int)audioFrames.size());
-            // audioFrame単位でバッファに読み込み
-            std::vector<int16_t> frameBuf(audioSamplesPerFrame * 2); // L,R交互
-            for (int afIdx = afIdxStart; afIdx < afIdxEnd; afIdx++) {
-                const auto& af = audioFrames[afIdx];
-                const int afSampleStart = afIdx * audioSamplesPerFrame;
-                const int afSampleEnd = afSampleStart + audioSamplesPerFrame;
-                // 表示範囲とaudioFrameの重複部分
-                const int overlapStart = std::max(sampleStart, afSampleStart);
-                const int overlapEnd   = std::min(sampleEnd, afSampleEnd);
-                if (overlapStart >= overlapEnd) continue;
-
-                if (af.waveLength != 0) {
-                    const int ofsInFrame = overlapStart - afSampleStart;
-                    const int readSamples = overlapEnd - overlapStart;
-                    waveFile.seek(af.waveOffset + ofsInFrame * sampleBytes, SEEK_SET);
-                    waveFile.read(MemoryChunk(
-                        (uint8_t*)frameBuf.data(), readSamples * sampleBytes));
-                    // L+R → mono
-                    for (int i = 0; i < readSamples; i++) {
-                        monoSamples[overlapStart - sampleStart + i] =
-                            (int16_t)(((int)frameBuf[i * 2] + (int)frameBuf[i * 2 + 1]) / 2);
-                    }
+        std::vector<int16_t> stereoSamples;
+        File waveFile(audioFilePath, _T("rb"));
+        if (!readAudioPcm(audioFrames, audioSamplesPerFrame, afmt.sampleRate, startSec, endSec,
+            [&](size_t index) { return audioPrimaryOnly(primaryAudioFrames, index, afmt.channels == AUDIO_2LANG); },
+            [&](int64_t offset, int16_t* dest, size_t bytes) {
+                waveFile.seek(offset, SEEK_SET);
+                if (waveFile.read(MemoryChunk(reinterpret_cast<uint8_t*>(dest), bytes)) != bytes) {
+                    THROW(IOException, "音声PCMデータが不足しています");
                 }
-                // waveLength==0 のフレームは無音(0のまま)
-            }
+            }, stereoSamples)) return false;
+        std::vector<int16_t> monoSamples(stereoSamples.size() / 2);
+        for (size_t i = 0; i < monoSamples.size(); i++) {
+            monoSamples[i] = static_cast<int16_t>((static_cast<int>(stereoSamples[i * 2]) + stereoSamples[i * 2 + 1]) / 2);
         }
 
         // 5. YUV444平面バッファに波形を描画
@@ -458,4 +495,12 @@ extern "C" AMATSUKAZE_API int TrimAdjust_GetFrameInfo(void* ptr, int frameNumber
 extern "C" AMATSUKAZE_API int TrimAdjust_GetWaveformJpeg(void* ptr, int frameNumber,
     const uint8_t** jpegData, int* jpegSize) {
     return static_cast<trimadjust::GUITrimAdjust*>(ptr)->getWaveformJpeg(frameNumber, jpegData, jpegSize) ? 1 : 0;
+}
+
+// sampleCountは左右チャンネルを合わせたint16_t要素数。
+extern "C" AMATSUKAZE_API int TrimAdjust_GetAudioPcm(void* ptr, int startFrame, int endFrame,
+    const int16_t** data, int* sampleCount, int* sampleRate, int* channels) {
+    if (!ptr || !data || !sampleCount || !sampleRate || !channels) return -1;
+    return static_cast<trimadjust::GUITrimAdjust*>(ptr)->getAudioPcm(
+        startFrame, endFrame, data, sampleCount, sampleRate, channels);
 }

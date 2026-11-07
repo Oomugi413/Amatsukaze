@@ -307,6 +307,9 @@ namespace Amatsukaze.Server
         public EncoderFilterAfsPreset AfsPreset;
         [DataMember]
         public EncoderFilterKfmMode KfmMode;
+        // vpp-kfm の ucf。既定は off
+        [DataMember]
+        public bool KfmEnableUcf;
         [DataMember]
         public EncoderFilterDeintMode NnediMode;
         [DataMember]
@@ -572,6 +575,8 @@ namespace Amatsukaze.Server
         public string AdditionalEraseLogo { get; set; }
 
         [DataMember]
+        public bool IgnoreVideoDisplayChanges { get; set; }
+        [DataMember]
         public bool EnableAudioEncode { get; set; }
         [DataMember]
         public int AudioFormatChangeMode { get; set; }
@@ -597,7 +602,7 @@ namespace Amatsukaze.Server
             get
             {
                 int mask = 0;
-                for (int i = NicoJKFormats.Length - 1; i >= 0; --i)
+                for (int i = NicoJKFormats.Length - 1; i >= 0; i--)
                 {
                     mask <<= 1;
                     mask |= NicoJKFormats[i] ? 1 : 0;
@@ -849,7 +854,9 @@ namespace Amatsukaze.Server
                             case EncoderFilterKfmMode.Fps24: kfmMode = "24"; break;
                             default: kfmMode = "vfr"; break;
                         }
-                        options.Add("--vpp-kfm mode=" + kfmMode);
+                        // チェックで ucf=on、未チェックで ucf=off（既定はoff）
+                        options.Add("--vpp-kfm mode=" + kfmMode +
+                            ",ucf=" + (s.KfmEnableUcf ? "on" : "off"));
                         break;
                     case EncoderFilterDeinterlace.NNEDI:
                         options.Add("--vpp-nnedi field=" +
@@ -1194,6 +1201,7 @@ namespace Amatsukaze.Server
             keyValueBool("エンコードアフィニティを無視する", profile.IgnoreEncodeAffinity);
             keyValue("エンコードバッファフレーム数", profile.NumEncodeBufferFrames.ToString());
             keyValue("追加ロゴ消去", profile.AdditionalEraseLogo ?? "なし");
+            keyValueBool("表示領域・SARの変更では分割しない", profile.IgnoreVideoDisplayChanges);
             keyValue("音声フォーマット変更", profile.GetAudioFormatChangeModeDisplayName());
             keyValueBool("音声エンコードを有効にする", profile.EnableAudioEncode);
             if (profile.EnableAudioEncode)
@@ -1550,6 +1558,7 @@ namespace Amatsukaze.Server
         Test,
         DrcsCheck,
         CMCheck,
+        TrimAdjust,
     }
 
     [DataContract]
@@ -1598,7 +1607,7 @@ namespace Amatsukaze.Server
         public List<string> Tags { get; set; }
 
         public bool IsBatch { get { return Mode == ProcMode.Batch || Mode == ProcMode.AutoBatch; } }
-        public bool IsCheck { get { return Mode == ProcMode.DrcsCheck || Mode == ProcMode.CMCheck; } }
+        public bool IsCheck { get { return Mode == ProcMode.DrcsCheck || (Mode == ProcMode.CMCheck || Mode == ProcMode.TrimAdjust); } }
     }
 
     public enum QueueState
@@ -1745,7 +1754,7 @@ namespace Amatsukaze.Server
         }
 
         public bool IsBatch { get { return Mode == ProcMode.Batch || Mode == ProcMode.AutoBatch; } }
-        public bool IsCheck { get { return Mode == ProcMode.DrcsCheck || Mode == ProcMode.CMCheck; } }
+        public bool IsCheck { get { return Mode == ProcMode.DrcsCheck || (Mode == ProcMode.CMCheck || Mode == ProcMode.TrimAdjust); } }
         public bool IsTest { get { return Mode == ProcMode.Test; } }
 
         /// <summary>
@@ -2418,6 +2427,9 @@ namespace Amatsukaze.Server
         public int Priority { get; set; }
         [DataMember]
         public string AddQueueBat { get; set; }
+        // nullは初期値未設定、空文字列は起動ユーザーを指定しない。
+        [DataMember]
+        public string LaunchUser { get; set; }
     }
 
     [DataContract]

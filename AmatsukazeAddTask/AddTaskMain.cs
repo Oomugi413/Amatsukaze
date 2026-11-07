@@ -1,4 +1,5 @@
 ﻿using Amatsukaze.Server;
+using Amatsukaze.Lib;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -7,6 +8,8 @@ using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
+using System.Security.Principal;
 using System.Threading.Tasks;
 
 namespace Amatsukaze.AddTask
@@ -16,6 +19,7 @@ namespace Amatsukaze.AddTask
         public int ServerPort = ServerSupport.DEFAULT_PORT;
         public string ServerIP = "127.0.0.1";
         public string AmatsukazeRoot;
+        public string LaunchUser;
         public ProcMode ProcMode = ProcMode.AutoBatch;
 
         public string FilePath;
@@ -81,6 +85,8 @@ namespace Amatsukaze.AddTask
                 "  -ip|--ip <IPアドレス>   AmatsukazeServerアドレス\r\n" +
                 "  -p|--port <ポート番号>  AmatsukazeServerポート番号\r\n" +
                 "  -r|--amt-root <パス>    Amatsukazeのルートディレクトリ（サーバ起動用）\r\n" +
+                "  --launch-user <SID|ドメイン\\ユーザー名> Windowsのローカルサーバーの起動ユーザー\r\n" +
+                "                          未ログオン・権限不足時は現在のアカウントで起動。NASコピーの権限は変わりません\r\n" +
                 "  --subnet <サブネットマスク>  Wake On Lan用サブネットマスク\r\n" +
                 "  --mac <MACアドレス>  Wake On Lan用MACアドレス\r\n";
             Console.WriteLine(help);
@@ -133,6 +139,24 @@ namespace Amatsukaze.AddTask
             }
         }
 
+        // 存在しないユーザー名はサーバー起動時まで持ち越さず、引数エラーとして終了する。
+        [SupportedOSPlatform("windows")]
+        private static void ValidateLaunchUser(string value)
+        {
+            try
+            {
+                LaunchUserIdentity.ResolveSid(value);
+            }
+            catch (IdentityNotMappedException)
+            {
+                throw new ArgumentException($"--launch-userのユーザー「{value}」が見つかりません。PC名\\ユーザー名、ドメイン\\ユーザー名、またはSIDを確認してください。");
+            }
+            catch (SystemException e) when (e is not ArgumentException)
+            {
+                throw new ArgumentException($"--launch-userのユーザー「{value}」を確認できません: {e.Message}");
+            }
+        }
+
         public GUIOPtion(string[] args)
         {
             // デフォルトはexeのあるディレクトリの１つ上
@@ -150,6 +174,12 @@ namespace Amatsukaze.AddTask
                 {
                     ServerIP = args[i + 1];
                     i++;
+                }
+                else if (arg == "--launch-user")
+                {
+                    if (++i >= args.Length) throw new ArgumentException("--launch-userの値がありません");
+                    LaunchUser = args[i];
+                    if (OperatingSystem.IsWindows()) ValidateLaunchUser(LaunchUser);
                 }
                 else if (arg == "--proc-mode")
                 {
@@ -268,6 +298,8 @@ namespace Amatsukaze.AddTask
                 }
             }
 
+            if (ServerPort < 1 || ServerPort > 65535) throw new ArgumentException("ポート番号が不正です");
+            AmatsukazeRoot = Path.GetFullPath(AmatsukazeRoot);
             if(ItemID < 0 && string.IsNullOrEmpty(FilePath))
             {
                 throw new Exception("入力ファイルパスを入力してください");
@@ -341,6 +373,28 @@ namespace Amatsukaze.AddTask
         }
 
         public async Task Exec()
+        {
+            try
+            {
+                await ExecCore();
+            }
+            catch (Exception e)
+            {
+                if (okReceived) Console.WriteLine("[AddTask] タスクは受理済みですが後処理に失敗しました。再投入前にキューを確認してください。");
+                if (e is IOException || e is UnauthorizedAccessException)
+                {
+                    string hint = ServerSupport.GetServiceContextPathHintForProcess("AmatsukazeAddTask", option.FilePath, option.NasDir);
+                    if (hint != null) Console.WriteLine(hint);
+                }
+                throw;
+            }
+            finally
+            {
+                server?.Finish();
+            }
+        }
+
+        private async Task ExecCore()
         {
             // 実行コンテキストをログに残す（EDCB録画後バッチ等から起動された場合の環境切り分け用）
             Console.WriteLine("[AddTask] 実行コンテキスト: " + ServerSupport.GetExecutionContextSummary());
@@ -461,6 +515,12 @@ namespace Amatsukaze.AddTask
             server = new CUIServerConnection(this);
             bool isLocal = !IsRunningOnMono() && ServerSupport.IsLocalIP(option.ServerIP);
             int maxRetry = isLocal ? 3 : 5;
+            bool windowsLocal = OperatingSystem.IsWindows() && isLocal;
+            if (!OperatingSystem.IsWindows() && !string.IsNullOrEmpty(option.LaunchUser))
+                Console.WriteLine("[AddTask] --launch-userはWindowsでのみ有効なため無視します。");
+            else if (!isLocal && !string.IsNullOrEmpty(option.LaunchUser))
+                Console.WriteLine("[AddTask] リモート接続では--launch-userを使用しません。");
+            if (windowsLocal) await ConnectLocalServer();
 
             for (int i = 0; i < maxRetry; i++)
             {
@@ -473,18 +533,24 @@ namespace Amatsukaze.AddTask
                 {
                     // サーバに接続
                     var connectIp = option.ServerIP;
-                    if (string.Equals(connectIp, "localhost", StringComparison.OrdinalIgnoreCase))
+                    // WindowsのローカルはConnectLocalServerと同じくloopbackへ接続する。
+                    if (windowsLocal || string.Equals(connectIp, "localhost", StringComparison.OrdinalIgnoreCase))
                     {
                         connectIp = "127.0.0.1";
                     }
                     Console.WriteLine("[AddTask] Try connect: {0}:{1}", connectIp, option.ServerPort);
-                    server.Connect(connectIp, option.ServerPort);
+                    if (windowsLocal)
+                    {
+                        if (i > 0) await server.ConnectAsync(connectIp, option.ServerPort, TimeSpan.FromSeconds(5));
+                    }
+                    else server.Connect(connectIp, option.ServerPort);
                     Console.WriteLine("[AddTask] Connect succeeded");
                 }
                 catch(Exception e0)
                 {
                     Console.WriteLine("[AddTask] Connect failed: {0}: {1}", e0.GetType().Name, e0.Message);
                     Console.WriteLine(e0.StackTrace);
+                    if (windowsLocal) throw;
                     // サーバに繋がらなかった
 
                     // ローカルの場合は、起動を試みる
@@ -499,12 +565,10 @@ namespace Amatsukaze.AddTask
                             Console.WriteLine("[AddTask] 回避するには、AmatsukazeServerをユーザーセッションで事前に起動しておいてください。");
                         }
                         Console.WriteLine("[AddTask] Local: attempt launch. Root='{0}', Port={1}", option.AmatsukazeRoot, option.ServerPort);
-                        await ServerSupport.TerminateStandalone(option.AmatsukazeRoot);
-                        Console.WriteLine("[AddTask] TerminateStandalone completed.");
                         // 既に起動中（起動処理中を含む）なら二重起動を避ける
                         if (ServerSupport.IsServerProcessRunning(option.AmatsukazeRoot) == false)
                         {
-                            ServerSupport.LaunchLocalServer(option.ServerPort, option.AmatsukazeRoot);
+                            using var launched = ServerSupport.LaunchLocalServer(option.ServerPort, option.AmatsukazeRoot, option.LaunchUser);
                         }
                         else
                         {
@@ -561,8 +625,9 @@ namespace Amatsukaze.AddTask
                         if(await Task.WhenAny(recv, timeout) == timeout)
                         {
                             Console.WriteLine("サーバのリクエスト受理を確認できませんでした。");
-                            throw new Exception();
+                            throw new TimeoutException("受理未確認です。再実行前にサーバーのキューを確認してください。");
                         }
+                        await recv;
                     }
                 }
                 catch (Exception e1)
@@ -611,7 +676,57 @@ namespace Amatsukaze.AddTask
 
                 break;
             }
-            server.Finish();
+            if (!okReceived)
+                throw new IOException("サーバーへの要求の受理を確認できませんでした。再実行前にキューを確認してください。");
+        }
+
+        private async Task ConnectLocalServer()
+        {
+            const int startupTimeoutSeconds = 120;
+            var timer = Stopwatch.StartNew();
+            // ローカルのサーバーは127.0.0.1でも接続でき、スタンドアロン版は127.0.0.1だけで待ち受けるため、常にloopbackへ接続する。
+            const string host = "127.0.0.1";
+            async Task<bool> TryConnect()
+            {
+                var remaining = TimeSpan.FromSeconds(startupTimeoutSeconds) - timer.Elapsed;
+                if (remaining <= TimeSpan.Zero) return false;
+                try
+                {
+                    await server.ConnectAsync(host, option.ServerPort,
+                        remaining < TimeSpan.FromSeconds(1) ? remaining : TimeSpan.FromSeconds(1));
+                    return true;
+                }
+                catch (Exception e) when (e is SocketException || e is OperationCanceledException || e is IOException)
+                {
+                    return false;
+                }
+            }
+            if (await TryConnect()) return;
+            // ロック状態を確認できない場合はIsServerProcessRunningが例外を投げるので、起動せずに終了する。
+            // スタンドアロン版もloopbackで受け付けるので、ロックが保持されていれば起動せずに接続を待つ。
+            using var launched = ServerSupport.IsServerProcessRunning(option.AmatsukazeRoot)
+                ? null : ServerSupport.LaunchLocalServer(option.ServerPort, option.AmatsukazeRoot, option.LaunchUser);
+            if (launched != null) Console.WriteLine("[AddTask] 作成PID={0}。サーバーへの接続を待ちます。", launched.ProcessId);
+            while (timer.Elapsed < TimeSpan.FromSeconds(startupTimeoutSeconds))
+            {
+                if (await TryConnect()) return;
+                if (ServerSupport.TryGetRunningServerInfo(option.AmatsukazeRoot, out var info) &&
+                    info.Port != option.ServerPort)
+                    throw new IOException("起動中のAmatsukazeのポートが異なります。" + ServerSupport.GetRunningServerDescription(option.AmatsukazeRoot));
+                if (launched != null && launched.HasExited && !ServerSupport.IsServerProcessRunning(option.AmatsukazeRoot))
+                    throw new IOException("サーバープロセスが接続前に終了しました。PID=" + launched.ProcessId + "。サーバーログを確認してください。");
+                var remaining = TimeSpan.FromSeconds(startupTimeoutSeconds) - timer.Elapsed;
+                // 期限直前に最後の短い接続試行を残す。
+                var delay = remaining - TimeSpan.FromMilliseconds(100);
+                if (delay <= TimeSpan.Zero)
+                {
+                    if (await TryConnect()) return;
+                    break;
+                }
+                await Task.Delay(delay < TimeSpan.FromSeconds(1) ? delay : TimeSpan.FromSeconds(1));
+            }
+            throw new TimeoutException($"サーバーの起動待ちが120秒の期限に達しました。Root={option.AmatsukazeRoot}、Port={option.ServerPort}、PID={launched?.ProcessId}。" +
+                ServerSupport.GetRunningServerDescription(option.AmatsukazeRoot));
         }
 
         private string UniqueId()
@@ -663,6 +778,7 @@ namespace Amatsukaze.AddTask
             {
                 Console.WriteLine(e.Message);
                 GUIOPtion.PrintHelp();
+                Environment.ExitCode = 2;
                 return;
             }
         }
@@ -676,8 +792,12 @@ namespace Amatsukaze.AddTask
             catch(Exception e)
             {
                 Console.WriteLine(e.Message);
+                Environment.ExitCode = 1;
             }
-            TaskSupport.Finish();
+            finally
+            {
+                TaskSupport.Finish();
+            }
         }
     }
 }

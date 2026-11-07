@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Text;
+using Amatsukaze.Lib;
 
 namespace Amatsukaze.Server.Rest
 {
@@ -79,6 +80,36 @@ namespace Amatsukaze.Server.Rest
             var lineBreak = isBat ? "\r\n" : "\n";
             var comment = isBat ? "rem" : "#";
 
+            // 起動ユーザーは設定値（初期値はサーバー側で決める）だけを使う。
+            // nullは初期値未設定（サービス用アカウントのサーバーなど）、空文字列は指定しない。
+            string launchUser = null;
+            if (isServerWindows && isBat && data.LaunchUser != null)
+            {
+                launchUser = data.LaunchUser.Trim();
+                if (launchUser.Length > 0 && (OperatingSystem.IsWindows() || !System.Text.RegularExpressions.Regex.IsMatch(launchUser, @"\AS-1-(?:[0-9]+-)+[0-9]+\z")))
+                {
+                    if (!OperatingSystem.IsWindows())
+                    {
+                        error = "起動ユーザーの名前解決はWindowsでのみ使用できます";
+                        return false;
+                    }
+                    try { launchUser = LaunchUserIdentity.ResolveSid(launchUser); }
+                    catch (SystemException e)
+                    {
+                        error = "起動ユーザーを確認できません: " + e.Message;
+                        return false;
+                    }
+                }
+            }
+
+            // batへ埋め込む値はSIDだけに限定し、コマンド展開文字を受け付けない。
+            if (isBat && !string.IsNullOrEmpty(launchUser) &&
+                !System.Text.RegularExpressions.Regex.IsMatch(launchUser, @"\AS-1-(?:[0-9]+-)+[0-9]+\z"))
+            {
+                error = "起動ユーザーのSIDが不正です";
+                return false;
+            }
+
             var sb = new StringBuilder();
             if (!isBat)
             {
@@ -88,9 +119,18 @@ namespace Amatsukaze.Server.Rest
             {
                 sb.Append(comment).Append(" _EDCBX_DIRECT_").Append(lineBreak);
             }
-            var filePathToken = data.IsDirect
-                ? (isBat ? "%FilePath%" : "${FilePath}")
-                : "$FilePath$";
+            if (isBat && isServerWindows && data.LaunchUser != null && string.IsNullOrEmpty(launchUser))
+            {
+                sb.Append("rem 起動ユーザーは指定しません。サーバー未起動時はAddTaskと同じアカウントで起動します。").Append(lineBreak);
+            }
+            else if (isBat && isServerWindows && string.IsNullOrEmpty(launchUser))
+            {
+                sb.Append("rem 起動ユーザーを自動指定できませんでした。サーバーがサービス用アカウントで動いているか、初期値を取得できませんでした。").Append(lineBreak);
+                sb.Append("rem 起動ユーザー欄にPC名\\ユーザー名またはSIDを指定して再生成してください。").Append(lineBreak);
+                sb.Append("rem または末尾へ --launch-user \"MYPC\\user\" を手動追加してください。起動済みサーバーのアカウントとAddTaskのコピー権限は変わりません。").Append(lineBreak);
+                Util.AddLog("[バッチ生成] 起動ユーザーを自動指定できませんでした。生成したbatの案内に従って再生成または手動指定してください。", null);
+            }
+            var filePathToken = isBat ? (data.IsDirect ? "%FilePath%" : "$FilePath$") : "${FilePath}";
             sb.AppendFormat("\"{0}\"", addTaskPath)
                 .AppendFormat(" -r \"{0}\"", currentDirectory)
                 .AppendFormat(" -f \"{0}\" -ip \"{1}\"", filePathToken, ip)
@@ -98,6 +138,10 @@ namespace Amatsukaze.Server.Rest
                 .AppendFormat(" -o \"{0}\"", dst)
                 .AppendFormat(" -s \"{0}\"", prof)
                 .AppendFormat(" --priority {0}", data.Priority);
+            if (isBat && !string.IsNullOrEmpty(launchUser))
+            {
+                sb.AppendFormat(" --launch-user \"{0}\"", launchUser);
+            }
             if (!string.IsNullOrEmpty(nas))
             {
                 sb.AppendFormat(" -d \"{0}\"", nas);
