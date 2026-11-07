@@ -1,0 +1,10 @@
+[project]
+name = "amatsukaze-linux-gui"
+version = "0.1.0"
+description = "Native GTK 4 task-add GUI for Amatsukaze Linux"
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["Tests"]
+

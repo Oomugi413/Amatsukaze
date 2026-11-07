@@ -31,7 +31,7 @@ services:
           # setup.shはEDCB-LinuxのCommon.iniから録画フォルダを検出する
           - /mnt/recorded:/mnt/recorded  # amatsukaze-setup:recorded
           - /mnt/encoded:/mnt/encoded
-          - /tmp:/tmp
+          - /tmp:/app/tmp
         # QSVEncC/VCEEncCを使うための設定
         # /dev/driが環境にない場合は無効化が必要
         devices:
@@ -53,4 +53,4 @@ services:
               devices:
                 - driver: nvidia
                   count: all
-                  capabilities: [compute, utility, video]
+                  capabilities: [compute, utility, video, graphics]

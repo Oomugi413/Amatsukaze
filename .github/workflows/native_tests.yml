@@ -20,10 +20,14 @@ jobs:
           submodules: true
           fetch-depth: 0
       - name: Build test image
+        shell: bash
         run: |
-          docker pull ghcr.io/${{ github.repository_owner }}/amatsukaze-builder:ubuntu2404 || true
+          ghcr_owner="$(printf '%s' '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+
+          docker pull "ghcr.io/${ghcr_owner}/amatsukaze-builder:ubuntu2404" || true
+
           docker build \
-            --build-arg GHCR_OWNER=${{ github.repository_owner }} \
+            --build-arg GHCR_OWNER="${ghcr_owner}" \
             --tag amatsukaze-native-tests \
             --file docker/docker_ubuntu2404 .
       - name: Build and run

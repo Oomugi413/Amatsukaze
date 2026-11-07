@@ -1,0 +1,106 @@
+/app/exe_files/AmatsukazeCLI  --loadv2 -i "/mnt/recording/20260625_test2.ts" -s 101 --drcs "/app/drcs/drcs_map.txt" -w "/app/tmp" --chapter-exe "chapter_exe" --jls "join_logo_scp" --cmoutmask 1 -o "/mnt/recording/20260625_test2.ts" -et NVEnc -e "nvencc" -j "/mnt/recording/20260625_test2-enc.json" --mp4box "MP4Box" -t "timelineeditor" -eo "-c hevc --profile main10 --output-depth 10 --qvbr 32 --multipass 2pass-full --ref 5 -b 5 --bref-mode middle --nonrefp --aq --aq-temporal --aq-strength 12 --lookahead 32 --audio-copy --colorrange limited --colormatrix bt709 --colorprim bt709 --transfer bt709 --vpp-colorspace matrix=bt2020nc:bt709,colorprim=bt2020:bt709,transfer=bt2020-10:bt709,range=limited:limited" -fmt tsreplace -m "tsreplace" -bcm 0.5 -eb 16 -f "/app/avscache/3E179804.avs" --subtitles --whisper-model "large-v3-turbo" --jls-cmd "/app/JL/JL_標準.txt"  --mpeg2decoder CUVID  --h264decoder CUVID  --hevcdecoder CUVID --ignore-no-logo --no-delogo --auto-logo-detect 1 --parallel-logo-analysis auto --pmt-cut 0.02:0.02
+Amatsukaze - Automated MPEG2-TS Transcoder 1.0.8.1 (Jun 25 2026 12:22:58)
+Copyright (c) 2017-2019 Nekopanda
+AMT [info] [設定]
+AMT [info] 入力: /mnt/recording/20260625_test2.ts
+AMT [info] 出力: /mnt/recording/20260625_test2
+AMT [info] 一時フォルダ: /app/tmp/amt4044694
+AMT [info] 出力フォーマット: TS (replace)
+AMT [info] エンコーダ: /usr/bin/nvencc (NVEnc)
+AMT [info] エンコーダオプション: -c hevc --profile main10 --output-depth 10 --qvbr 32 --multipass 2pass-full --ref 5 -b 5 --bref-mode middle --nonrefp --aq --aq-temporal --aq-strength 12 --lookahead 32 --audio-copy --colorrange limited --colormatrix bt709 --colorprim bt709 --transfer bt709 --vpp-colorspace matrix=bt2020nc:bt709,colorprim=bt2020:bt709,transfer=bt2020-10:bt709,range=limited:limited
+AMT [info] 自動ビットレート: 無効
+AMT [info] エンコード/出力: 1パス/通常
+AMT [info] エンコード分割並列: 1
+AMT [info] チャプター解析: 無効（ロゴ必須）
+AMT [info] ロゴ消し: しない
+AMT [info] 並列ロゴ解析: オン
+AMT [info] 字幕: 有効
+AMT [info] WebVTT出力: 無効
+AMT [info] DRCSマッピング: /app/drcs/drcs_map.txt
+AMT [info] サービスID: 101
+AMT [info] デコーダ: MPEG2:CUVID H264:CUVID HEVC:CUVID
+AMT [info] エンコーダでのインタレ解除: なし
+AMT [info] [PAT更新]
+AMT [info] サービス 101 を選択
+AMT [info] [PMT更新]
+AMT [info] PID: 0x0100 TYPE: H.265/HEVC TAG: 映像(0x00)
+AMT [info] PID: 0x0101 TYPE: H.265/HEVC TAG: 映像(0x01)
+AMT [info] PID: 0x0110 TYPE: ADTS AAC TAG: AAC 音声(0x10)
+AMT [info] PID: 0x0111 TYPE: ADTS AAC TAG: AAC 音声(0x11)
+AMT [info] PID: 0x0114 TYPE: ADTS AAC TAG: AAC 音声(0x14)
+AMT [info] PID: 0x0138 TYPE: 字幕 TAG: 文字スーパー(0x38)
+AMT [info] PID: 0x01ff TYPE: PCR
+AMT [debug] 必要な情報は取得したのでTSを最初から読み直します
+AMT [info] 開始Clock: 2147372644651
+AMT [info] 音声パーサ 0 を追加
+AMT [info] 音声パーサ 1 を追加
+AMT [info] 音声パーサ 2 を追加
+AMT [info] [音声2フォーマット変更]
+AMT [info] チャンネル: ステレオ サンプルレート: 48000
+AMT [info] [音声0フォーマット変更]
+AMT [info] チャンネル: 5.1ch サンプルレート: 48000
+AMT [info] [音声1フォーマット変更]
+AMT [info] チャンネル: ステレオ サンプルレート: 48000
+AMT [info] [映像フォーマット変更]
+AMT [info] サイズ: 3840x2160 (16:9) FPS: 60000/1001
+AMT [info] [映像フレーム統計情報]
+AMT [info] 時間: 3分6.720秒
+AMT [info] FRAME=11200 DBL=0 TLP=0 TFF=0 BFF=0 TFF_RFF=0 BFF_RFF=0
+AMT [info] (PTS_Diff,Cnt)=(1500,1422)
+AMT [info] (PTS_Diff,Cnt)=(1501,3448)
+AMT [info] (PTS_Diff,Cnt)=(1502,5636)
+AMT [info] (PTS_Diff,Cnt)=(1503,693)
+AMT [info] TS解析完了: 2.52秒
+AMT [info] [ファイル分割/timestamp計算]
+AMT [info] [フォーマット切り替え解析]
+AMT [info] 0.00 -> 0
+AMT [info] frameSectionId生成
+AMT [info] frameFormatId_生成
+AMT [info] フィルタ用入力フレームリスト生成
+AMT [info] indexAudioFrameList_生成
+AMT [info] audioFileOffsets_生成
+AMT [info] 時間情報生成
+AMT [info] [CM判定用音声構築]
+AMT [info] ソースファイル読み込み用データ保存[1/1]: /app/tmp/amt4044694/amts0.dat
+AMT [info] ソースファイル読み込み用データ保存完了[1/1]
+AMT [info] [ロゴ・CM解析]
+AMT [info] [字幕構築]
+AMT [debug] 音声0-0は39フレーム目から開始
+AMT [debug] 音声0-1は41フレーム目から開始
+AMT [debug] 音声0-2は35フレーム目から開始
+AMT [info] 出力音声フレーム: 26210（うち水増しフレーム0）
+AMT [info] 未出力フレーム: 115（0.437%）
+AMT [info] 音ズレ: 平均 1.80ms 最大 5.03ms
+AMT [info] 最大音ズレ位置: 入力最初の映像フレームから0分0.138秒後
+AMT [info] [チャプター生成]
+AMT [info] [字幕ファイル生成]
+AMT [info] 字幕ファイル生成完了: 0.00秒
+AMT [info] フィルタ入力: 11193フレーム 60000/1001fps (プログレッシブ)
+AMT [info] フィルタ出力: 11193フレーム 60000/1001fps (プログレッシブ)
+AMT [info] [エンコード開始] 1/1 
+AMT [info] 入力映像ビットレート: 19423 kbps
+AMT [info] バッファリングフレーム数: 16
+AMT [info] 1/1パス エンコード開始 予定フレーム数: 11193
+AMT [info] [エンコーダ起動]
+AMT [info] "/usr/bin/nvencc" --colorprim bt2020 --transfer arib-std-b67 --colormatrix bt2020nc -c hevc --profile main10 --output-depth 10 --qvbr 32 --multipass 2pass-full --ref 5 -b 5 --bref-mode middle --nonrefp --aq --aq-temporal --aq-strength 12 --lookahead 32 --audio-copy --colorrange limited --colormatrix bt709 --colorprim bt709 --transfer bt709 --vpp-colorspace matrix=bt2020nc:bt709,colorprim=bt2020:bt709,transfer=bt2020-10:bt709,range=limited:limited --frames 11193 -o "/app/tmp/amt4044694/v0-0-0.raw" --output-format mp4 --y4m -i -
+AMT [info] y4m format: YUV420p10 progressive 1920x1080 SAR 1:1 60000/1001fps
+--------------------------------------------------------------------------------
+/app/tmp/amt4044694/v0-0-0.raw
+--------------------------------------------------------------------------------
+Failed to get device count from Vulkan interface.
+AMT [error] Avisynthフィルタでエラーが発生: not supported conversion.
+y4m: failed to parse y4m header: .
+failed to initialize file reader(s).
+AMT [error] ↓↓↓↓↓↓エンコーダ最後の出力↓↓↓↓↓↓
+AMT [error] /app/tmp/amt4044694/v0-0-0.raw
+AMT [error] --------------------------------------------------------------------------------
+AMT [error] Failed to get device count from Vulkan interface.
+AMT [error] y4m: failed to parse y4m header: .
+AMT [error] failed to initialize file reader(s).
+AMT [error] 
+AMT [error] ↑↑↑↑↑↑エンコーダ最後の出力↑↑↑↑↑↑
+AMT [error] Exception thrown at Encoder.cpp:215
+Message: エンコーダ終了コード: 0x1
+AMT [error] Exception thrown at ProcessThread.h:67
+Message: call join() before destroy object ...
+terminate called after throwing an instance of 'InvalidOperationException'
